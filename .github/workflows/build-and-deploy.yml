@@ -63,6 +63,8 @@ jobs:
             libxrandr-dev \
             libxkbcommon-dev \
             file \
+            clang \
+            libclang-dev \
           && rm -rf /var/lib/apt/lists/*
 
       # Checks out YOUR fork at $KOHARU_REF (no separate git clone needed,
