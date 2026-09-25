@@ -120,11 +120,31 @@ jobs:
             -exec cp {} "$RUNNER_TEMP/staged/koharu" \;
           test -x "$RUNNER_TEMP/staged/koharu" || { echo "::error::binary not found, see target/release listing below"; ls -la target/release; exit 1; }
 
-      - name: Upload binary artifact
+      # This app links tauri-runtime-cef, which needs the actual CEF
+      # (Chromium Embedded Framework) binary distribution at runtime -
+      # not just a system webkit/gtk. `cef-dll-sys`'s build script already
+      # downloaded it for us under target/release/build/, we just never
+      # copied it out. CEF's own docs (github.com/tauri-apps/cef-rs) point
+      # LD_LIBRARY_PATH at one merged directory containing libcef.so +
+      # Resources/*.pak/icudtl.dat etc, so we replicate that layout here.
+      - name: Locate & stage CEF runtime files
+        run: |
+          mkdir -p "$RUNNER_TEMP/staged/cef"
+          libcef="$(find target/release/build -name 'libcef.so' | head -1)"
+          test -n "$libcef" || { echo "::error::libcef.so not found under target/release/build - see listing"; find target/release/build -maxdepth 3; exit 1; }
+          cef_release_dir="$(dirname "$libcef")"
+          cef_root="$(dirname "$cef_release_dir")"
+          cp -a "$cef_release_dir"/. "$RUNNER_TEMP/staged/cef/"
+          if [ -d "$cef_root/Resources" ]; then
+            cp -a "$cef_root/Resources/." "$RUNNER_TEMP/staged/cef/"
+          fi
+          ls -la "$RUNNER_TEMP/staged/cef"
+
+      - name: Upload binary + CEF runtime artifact
         uses: actions/upload-artifact@v4
         with:
           name: koharu-binary
-          path: ${{ runner.temp }}/staged/koharu
+          path: ${{ runner.temp }}/staged
           retention-days: 7
 
   deploy:
@@ -157,7 +177,11 @@ jobs:
           cd hf-space-runtime
           git init -q
           git lfs install
-          git lfs track "koharu"
+          # koharu itself + everything under cef/ (libcef.so, *.pak, *.bin,
+          # *.dat, locales/) - the CEF distribution is large and mixed
+          # binary/text, so track the whole directory rather than picking
+          # extensions one by one.
+          git lfs track "koharu" "cef/**"
           git add -A
           git -c user.name="github-actions" -c user.email="actions@github.com" \
             commit -q -m "Deploy koharu binary ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
