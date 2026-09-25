@@ -3,11 +3,19 @@
 #
 # The heavy work (cargo build --release of the Tauri app, wasm-pack,
 # Next.js build) happens in GitHub Actions, NOT here - see
-# .github/workflows/build-and-deploy.yml in the source repo. That
-# workflow pushes this Dockerfile + the compiled `koharu` binary here
-# together, so the Space just has to COPY the binary in and install
-# runtime shared libraries. This build should finish in well under a
-# minute, even on a free CPU-basic Space.
+# .github/workflows/build-and-deploy.yml in the source repo.
+#
+# The compiled `koharu` binary + CEF (Chromium Embedded Framework)
+# runtime files are NOT committed to this repo: libcef.so alone is
+# ~1.3GB, which blows through the HF Space free tier's 1GB git/LFS
+# storage cap on its own. Instead they're published as a GitHub Release
+# asset by that workflow, and downloaded here at Docker-build time -
+# this repo (and its git history) stays tiny, only the release tarball
+# needs the bigger transfer, and that happens fresh on every build.
+#
+# __RUNTIME_TARBALL_URL__ below is filled in automatically by the
+# deploy job with this repo's own GitHub Release URL - no manual edit
+# needed.
 ########################################################################
 FROM debian:trixie-slim
 
@@ -36,16 +44,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Pushed alongside this Dockerfile by the GitHub Actions deploy job.
-COPY koharu /usr/local/bin/koharu
-RUN chmod +x /usr/local/bin/koharu
-
-# The CEF (Chromium Embedded Framework) runtime files koharu links against
-# (libcef.so, icudtl.dat, *.pak resources, locales/) - also pushed
-# alongside this Dockerfile by the deploy job. Without these, koharu fails
-# to start with "error while loading shared libraries: libcef.so: cannot
-# open shared object file".
-COPY cef /opt/cef
+# Downloads koharu-runtime.tar.gz (koharu binary + cef/ directory) from
+# this fork's GitHub Release and unpacks it - see header comment above.
+RUN curl -fsSL "__RUNTIME_TARBALL_URL__" -o /tmp/koharu-runtime.tar.gz \
+    && mkdir -p /opt/koharu-runtime \
+    && tar xzf /tmp/koharu-runtime.tar.gz -C /opt/koharu-runtime \
+    && mv /opt/koharu-runtime/koharu /usr/local/bin/koharu \
+    && chmod +x /usr/local/bin/koharu \
+    && mv /opt/koharu-runtime/cef /opt/cef \
+    && rm -rf /opt/koharu-runtime /tmp/koharu-runtime.tar.gz
 
 RUN useradd -m -u 1001 user \
     && mkdir -p /home/user/.local/share /home/user/.cache \
