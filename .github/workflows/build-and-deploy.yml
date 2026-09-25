@@ -38,6 +38,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     # Build in Debian trixie to match the runtime image (hf-space-runtime/Dockerfile)
     # so glibc / gtk4 / webkitgtk-6.0 ABI versions line up.
     container:
@@ -156,16 +158,34 @@ jobs:
           echo "After locale trim:  $(du -sh "$RUNNER_TEMP/staged/cef" | cut -f1)"
           ls -la "$RUNNER_TEMP/staged/cef"
 
-      - name: Upload binary + CEF runtime artifact
-        uses: actions/upload-artifact@v4
+      # libcef.so alone is ~1.3GB - the full Chromium engine CEF embeds.
+      # That blows straight through the HF Space free tier's 1GB git/LFS
+      # repository storage cap, no matter how clean the repo is. So this
+      # never goes into the Space's git repo at all: package it as a
+      # tarball and publish it as a GitHub Release asset instead (GitHub
+      # Releases have no comparable size cap for a file this size), and
+      # have the Space's Dockerfile download it at Docker-build time
+      # instead of it being committed anywhere.
+      - name: Package runtime tarball
+        run: |
+          cd "$RUNNER_TEMP/staged"
+          tar czf "$RUNNER_TEMP/koharu-runtime.tar.gz" koharu cef
+          ls -lh "$RUNNER_TEMP/koharu-runtime.tar.gz"
+
+      - name: Publish runtime tarball as a GitHub Release asset
+        uses: softprops/action-gh-release@v2
         with:
-          name: koharu-binary
-          path: ${{ runner.temp }}/staged
-          retention-days: 7
+          tag_name: koharu-runtime
+          name: koharu-runtime (latest build)
+          body: Auto-published by build-and-deploy.yml. Overwritten on every successful build - not meant to be browsed by hand.
+          files: ${{ runner.temp }}/koharu-runtime.tar.gz
+          make_latest: false
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout runtime deploy files
         uses: actions/checkout@v4
@@ -174,32 +194,29 @@ jobs:
             hf-space-runtime
           sparse-checkout-cone-mode: false
 
-      - name: Download binary artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: koharu-binary
-          path: hf-space-runtime
-
+      # No binary/CEF files here anymore - the Space's Dockerfile downloads
+      # koharu-runtime.tar.gz straight from this repo's GitHub Release at
+      # Docker-build time instead (see the "Publish runtime tarball" step
+      # in the build job), so this push is tiny and never touches the
+      # 1GB HF Space git/LFS storage cap.
+      #
       # Requires two repo secrets:
       #   HF_TOKEN      - HF access token with "write" scope to the Space
       #   HF_SPACE_REPO - e.g. https://huggingface.co/spaces/<user>/<space>
-      - name: Push binary + runtime Dockerfile to HF Space
+      - name: Push runtime Dockerfile to HF Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_SPACE_REPO: ${{ secrets.HF_SPACE_REPO }}
         run: |
           set -eu
-          chmod +x hf-space-runtime/koharu
           cd hf-space-runtime
+          # Fill in the release download URL for THIS repo/fork - avoids
+          # anyone having to hand-edit the Dockerfile with their own
+          # GitHub username.
+          sed -i "s#__RUNTIME_TARBALL_URL__#https://github.com/${GITHUB_REPOSITORY}/releases/download/koharu-runtime/koharu-runtime.tar.gz#" Dockerfile
           git init -q
-          git lfs install
-          # koharu itself + everything under cef/ (libcef.so, *.pak, *.bin,
-          # *.dat, locales/) - the CEF distribution is large and mixed
-          # binary/text, so track the whole directory rather than picking
-          # extensions one by one.
-          git lfs track "koharu" "cef/**"
           git add -A
           git -c user.name="github-actions" -c user.email="actions@github.com" \
-            commit -q -m "Deploy koharu binary ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            commit -q -m "Deploy koharu runtime Dockerfile ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
           remote="https://user:${HF_TOKEN}@$(echo "$HF_SPACE_REPO" | sed -e 's#https://##')"
           git push "$remote" HEAD:main --force
