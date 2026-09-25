@@ -13,7 +13,9 @@ FROM debian:trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/home/user \
-    RUST_LOG=info
+    RUST_LOG=info \
+    CEF_PATH=/opt/cef \
+    LD_LIBRARY_PATH=/opt/cef
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl socat \
@@ -38,9 +40,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY koharu /usr/local/bin/koharu
 RUN chmod +x /usr/local/bin/koharu
 
+# The CEF (Chromium Embedded Framework) runtime files koharu links against
+# (libcef.so, icudtl.dat, *.pak resources, locales/) - also pushed
+# alongside this Dockerfile by the deploy job. Without these, koharu fails
+# to start with "error while loading shared libraries: libcef.so: cannot
+# open shared object file".
+COPY cef /opt/cef
+
 RUN useradd -m -u 1001 user \
     && mkdir -p /home/user/.local/share /home/user/.cache \
-    && chown -R user:user /home/user
+    && chown -R user:user /home/user /opt/cef
 USER user
 WORKDIR /home/user
 
