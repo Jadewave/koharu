@@ -119,6 +119,12 @@ jobs:
           find target/release -maxdepth 1 -type f -executable -name 'koharu*' \
             -exec cp {} "$RUNNER_TEMP/staged/koharu" \;
           test -x "$RUNNER_TEMP/staged/koharu" || { echo "::error::binary not found, see target/release listing below"; ls -la target/release; exit 1; }
+          # Strip debug symbols - HF Space free tier caps repo storage at
+          # 1GB, and an unstripped release binary of an app this size
+          # (webkit+gtk4+cef+llama.cpp) can be very large.
+          echo "Before strip: $(du -h "$RUNNER_TEMP/staged/koharu" | cut -f1)"
+          strip "$RUNNER_TEMP/staged/koharu" || echo "::warning::strip failed, continuing with unstripped binary"
+          echo "After strip:  $(du -h "$RUNNER_TEMP/staged/koharu" | cut -f1)"
 
       # This app links tauri-runtime-cef, which needs the actual CEF
       # (Chromium Embedded Framework) binary distribution at runtime -
@@ -138,6 +144,16 @@ jobs:
           if [ -d "$cef_root/Resources" ]; then
             cp -a "$cef_root/Resources/." "$RUNNER_TEMP/staged/cef/"
           fi
+          echo "Before locale trim: $(du -sh "$RUNNER_TEMP/staged/cef" | cut -f1)"
+          # CEF ships ~50 locale .pak files (one per language); the app
+          # only needs one to start. Keep en-US, drop the rest - this is
+          # by far the biggest single win against the 1GB HF Space
+          # storage cap. If you need a different UI language, change
+          # en-US.pak below.
+          if [ -d "$RUNNER_TEMP/staged/cef/locales" ]; then
+            find "$RUNNER_TEMP/staged/cef/locales" -name '*.pak' ! -name 'en-US.pak' -delete
+          fi
+          echo "After locale trim:  $(du -sh "$RUNNER_TEMP/staged/cef" | cut -f1)"
           ls -la "$RUNNER_TEMP/staged/cef"
 
       - name: Upload binary + CEF runtime artifact
