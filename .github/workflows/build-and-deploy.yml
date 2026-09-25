@@ -1,0 +1,163 @@
+name: Build koharu binary and deploy to HF Space
+
+# This workflow does the HEAVY lifting (cargo build --release of a
+# Tauri v3-alpha app against GTK4/WebKitGTK-6.0, wasm-pack, Next.js
+# build) on a GitHub-hosted runner, which has more CPU/RAM and a much
+# longer timeout than a free Hugging Face CPU-basic Space build.
+#
+# It then pushes ONLY the compiled binary + a lightweight runtime-only
+# Dockerfile to the HF Space's git repo, so the Space itself only ever
+# builds a thin "COPY the binary in" image, which finishes in seconds.
+
+on:
+  push:
+    # Trigger from a branch where you commit the workflow/hf-space-runtime
+    # files, e.g. "deploy". Building itself is pinned to KOHARU_REF below,
+    # independent of which branch you push this workflow file to.
+    branches: [deploy]
+  workflow_dispatch: {}
+
+env:
+  # Pin to a specific commit SHA on feat/headless, NOT the branch name.
+  # feat/headless is a live PR branch that keeps getting rebased/merged
+  # with main - checking out its tip means every build can silently pick
+  # up unrelated upstream changes (e.g. a newer koharu version than the
+  # one actually verified to build).
+  #
+  # This is the last commit of PR #1112 (koharu-rs/koharu) as of
+  # 2026-09-17 21:41 UTC ("feat: serve desktop and headless over HTTP"),
+  # whose PR description states it was validated on main / version 0.83.3
+  # with Rust 1.96: https://github.com/koharu-rs/koharu/pull/1112
+  # If fffonion force-pushes feat/headless again later, this SHA still
+  # points at this exact snapshot (it exists in your fork's history too,
+  # since forking copies all commits reachable at fork time).
+  # Check https://github.com/<your-user>/koharu/commits/feat/headless
+  # if you want to deliberately move to a newer commit later.
+  KOHARU_REF: 4d68e22b92c3368af343362413673623cacfe8a0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Build in Debian trixie to match the runtime image (hf-space-runtime/Dockerfile)
+    # so glibc / gtk4 / webkitgtk-6.0 ABI versions line up.
+    container:
+      image: rust:trixie
+    steps:
+      # git must exist before actions/checkout can run inside this container.
+      - name: Install system build deps
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends \
+            git curl ca-certificates pkg-config build-essential \
+            libwebkit2gtk-4.1-dev \
+            libwebkitgtk-6.0-dev \
+            libgtk-3-dev \
+            libgtk-4-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libnss3-dev \
+            libasound2-dev \
+            libx11-xcb-dev \
+            libxcomposite-dev \
+            libxdamage-dev \
+            libxrandr-dev \
+            libxkbcommon-dev \
+            file \
+          && rm -rf /var/lib/apt/lists/*
+
+      # Checks out YOUR fork at $KOHARU_REF (no separate git clone needed,
+      # since the workflow now lives inside the koharu repo itself).
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KOHARU_REF }}
+
+      - name: Install bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      # Same fix as before: the JS build scripts assume the repo was
+      # cloned into "/", so symlink the checked-out workspace root there.
+      - name: Symlink workspace root to /
+        run: |
+          ln -s "$GITHUB_WORKSPACE/crates" /crates
+          ln -s "$GITHUB_WORKSPACE/Cargo.toml" /Cargo.toml
+          ln -s "$GITHUB_WORKSPACE/Cargo.lock" /Cargo.lock
+
+      - name: bun install
+        run: bun install
+
+      - name: Build bridge TS bindings
+        run: bun run --filter @koharu/bridge build
+
+      # "bridge build" only regenerates TS bindings; the actual WASM module
+      # is normally produced by the "bun dev" watcher. Build it explicitly.
+      - name: Build koharu-canvas WASM module
+        run: |
+          cargo install wasm-pack --locked
+          wasm-pack build crates/koharu-canvas \
+            --target web \
+            --out-dir "$GITHUB_WORKSPACE/packages/bridge/src/wasm" \
+            --out-name koharu_canvas
+
+      - name: Build frontend (Next.js static export)
+        run: bun run --filter @koharu/app build
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      # NOTE: exact binary name/crate is unconfirmed (workspace may split
+      # into koharu-app etc). This picks the first executable named
+      # "koharu*" in target/release/. If the build errors here, list
+      # target/release/ in the logs and adjust the pattern.
+      - name: Locate & stage binary
+        run: |
+          mkdir -p "$RUNNER_TEMP/staged"
+          find target/release -maxdepth 1 -type f -executable -name 'koharu*' \
+            -exec cp {} "$RUNNER_TEMP/staged/koharu" \;
+          test -x "$RUNNER_TEMP/staged/koharu" || { echo "::error::binary not found, see target/release listing below"; ls -la target/release; exit 1; }
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: koharu-binary
+          path: ${{ runner.temp }}/staged/koharu
+          retention-days: 7
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout runtime deploy files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            hf-space-runtime
+          sparse-checkout-cone-mode: false
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: koharu-binary
+          path: hf-space-runtime
+
+      # Requires two repo secrets:
+      #   HF_TOKEN      - HF access token with "write" scope to the Space
+      #   HF_SPACE_REPO - e.g. https://huggingface.co/spaces/<user>/<space>
+      - name: Push binary + runtime Dockerfile to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_REPO: ${{ secrets.HF_SPACE_REPO }}
+        run: |
+          set -eu
+          chmod +x hf-space-runtime/koharu
+          cd hf-space-runtime
+          git init -q
+          git lfs install
+          git lfs track "koharu"
+          git add -A
+          git -c user.name="github-actions" -c user.email="actions@github.com" \
+            commit -q -m "Deploy koharu binary ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          remote="https://user:${HF_TOKEN}@$(echo "$HF_SPACE_REPO" | sed -e 's#https://##')"
+          git push "$remote" HEAD:main --force
