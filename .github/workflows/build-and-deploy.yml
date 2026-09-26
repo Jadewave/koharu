@@ -108,6 +108,20 @@ jobs:
       - name: Build frontend (Next.js static export)
         run: bun run --filter @koharu/app build
 
+      # DEBUG: the headless server currently returns 404 on GET / when
+      # deployed. Trying to confirm whether the Rust side actually finds
+      # and embeds the Next.js export (via tauri-build reading
+      # `frontendDist` from tauri.conf.json) or expects it on disk at
+      # runtime instead. Remove once root-caused.
+      - name: DEBUG - inspect frontend build output and tauri config
+        run: |
+          echo "--- tauri.conf.json (frontendDist / distDir) ---"
+          find . -maxdepth 4 -name 'tauri.conf.json' -exec sh -c 'echo "== {} =="; cat {}' \;
+          echo "--- looking for Next.js export output dirs ---"
+          find . -maxdepth 6 -type d \( -name 'out' -o -name '.next' -o -name 'dist' \) -not -path '*/node_modules/*'
+          echo "--- contents of any 'out' dirs found ---"
+          find . -maxdepth 6 -type d -name 'out' -not -path '*/node_modules/*' -exec sh -c 'echo "== {} =="; ls -la {}' \;
+
       - name: cargo build --release
         run: cargo build --release
 
