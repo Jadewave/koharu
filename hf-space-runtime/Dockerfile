@@ -42,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 \
     libxkbcommon0 \
     xdg-utils \
+    xdg-user-dirs \
     && rm -rf /var/lib/apt/lists/*
 
 # Downloads koharu-runtime.tar.gz (koharu binary + cef/ directory) from
@@ -59,6 +60,15 @@ RUN useradd -m -u 1001 user \
     && chown -R user:user /home/user /opt/cef
 USER user
 WORKDIR /home/user
+
+# koharu looks up the user's "Documents" directory via the `dirs` crate
+# (XDG user dirs) and refuses to start ("failed to construct the headless
+# host: the Documents directory is unavailable") if it can't be resolved.
+# A bare container has no xdg-user-dirs config or folders at all, so
+# generate both explicitly.
+RUN xdg-user-dirs-update \
+    && mkdir -p /home/user/Documents /home/user/Downloads /home/user/Pictures \
+               /home/user/Music /home/user/Videos /home/user/Desktop /home/user/Public /home/user/Templates
 
 EXPOSE 7860
 
