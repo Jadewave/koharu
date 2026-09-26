@@ -21,7 +21,11 @@ FROM debian:trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/home/user \
-    RUST_LOG=info \
+    # Bumped verbosity while chasing a 404-on-"/" issue in the headless
+    # server (unreleased PR #1112 code) - shows per-request routing/tracing
+    # so we can see why "/" doesn't resolve to the embedded frontend.
+    # Dial back to "info" once this is root-caused.
+    RUST_LOG=koharu=trace,tower_http=trace,axum=trace,info \
     CEF_PATH=/opt/cef \
     LD_LIBRARY_PATH=/opt/cef
 
