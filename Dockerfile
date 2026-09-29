@@ -11,6 +11,7 @@ ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:/root/.bun/bin:$PATH
 
+# Native build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
@@ -32,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20.x + npm
+# Next.js requires Node.js >= 20.9.0
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -50,6 +52,7 @@ COPY . .
 # Tauri CLI
 RUN cargo install tauri-cli --version '=3.0.0-alpha.1' --locked
 
+# libclang used by native Rust dependencies
 ENV LIBCLANG_PATH=/usr/lib/llvm-18/lib
 
 # JavaScript dependencies
@@ -67,7 +70,21 @@ FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime dependencies for GTK / CEF / Chromium / X11
+# Make the runtime user environment explicit.
+ENV HOME=/root
+ENV XDG_CONFIG_HOME=/root/.config
+ENV XDG_DATA_HOME=/root/.local/share
+ENV XDG_CACHE_HOME=/root/.cache
+
+# Runtime dependencies for:
+# - GTK
+# - CEF / Chromium
+# - X11
+# - graphics
+# - fonts
+# - audio
+# - DBus
+# - XDG user directories
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libasound2t64 \
@@ -106,11 +123,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     libxshmfence1 \
     libxtst6 \
+    xdg-user-dirs \
     && rm -rf /var/lib/apt/lists/*
+
+# Create standard XDG directories.
+RUN mkdir -p \
+    /root/Documents \
+    /root/Desktop \
+    /root/Downloads \
+    /root/Pictures \
+    /root/Music \
+    /root/Videos \
+    /root/.config \
+    /root/.local/share \
+    /root/.cache
+
+# Initialize XDG user directories.
+RUN xdg-user-dirs-update
 
 WORKDIR /app
 
-# Koharu
+# Koharu executable
 COPY --from=builder /src/target/release/koharu /app/koharu
 
 # CEF runtime
@@ -120,9 +153,10 @@ COPY --from=builder /src/target/release/resources.pak /app/resources.pak
 COPY --from=builder /src/target/release/locales /app/locales
 COPY --from=builder /src/target/release/chrome-sandbox /app/chrome-sandbox
 
-# CEF sandbox
+# CEF sandbox requires setuid root
 RUN chmod 4755 /app/chrome-sandbox
 
+# Make CEF's libcef.so discoverable
 ENV LD_LIBRARY_PATH=/app
 
 EXPOSE 7860
