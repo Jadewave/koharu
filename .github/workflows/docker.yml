@@ -1,58 +1,82 @@
-name: Build Koharu Docker
+name: Build and Deploy Koharu
 
 on:
-  push:
-    branches:
-      - hf-headless
-      - main
-  pull_request:
-    branches:
-      - hf-headless
-      - main
-  workflow_dispatch:
+push:
+branches:
+- hf-headless
+- main
+pull_request:
+branches:
+- hf-headless
+- main
+workflow_dispatch:
 
 jobs:
-  docker:
-    runs-on: ubuntu-latest
+docker:
+name: Build and Test Docker
+runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+```
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: |
-          docker build \
-            --tag koharu-headless:test \
-            .
+  - name: Build Docker image
+    run: |
+      docker build \
+        --tag koharu-headless:test \
+        .
 
-      - name: Start container
-        run: |
-          docker run \
-            --detach \
-            --name koharu-headless \
-            --publish 7860:7860 \
-            koharu-headless:test
+  - name: Start container
+    run: |
+      docker run \
+        --detach \
+        --name koharu-headless \
+        --publish 7860:7860 \
+        koharu-headless:test
 
-      - name: Wait for Koharu
-        run: |
-          for i in {1..60}; do
-            if curl --silent --fail \
-              http://127.0.0.1:7860/ > /tmp/koharu.html; then
-              exit 0
-            fi
-            sleep 2
-          done
+  - name: Wait for Koharu
+    run: |
+      for i in {1..60}; do
+        if curl --silent --fail \
+          http://127.0.0.1:7860/ > /tmp/koharu.html; then
+          exit 0
+        fi
+        sleep 2
+      done
 
-          docker logs koharu-headless
-          exit 1
+      docker logs koharu-headless
+      exit 1
 
-      - name: Test RPC
-        run: |
-          curl --fail \
-            --request POST \
-            http://127.0.0.1:7860/rpc/get_project
+  - name: Test RPC
+    run: |
+      curl --fail \
+        --request POST \
+        http://127.0.0.1:7860/rpc/get_project
 
-      - name: Show logs
-        if: always()
-        run: |
-          docker logs koharu-headless || true
+  - name: Show logs
+    if: always()
+    run: |
+      docker logs koharu-headless || true
+```
+
+deploy:
+name: Deploy to Hugging Face Space
+needs: docker
+if: github.event_name == 'push' && github.ref == 'refs/heads/hf-headless'
+runs-on: ubuntu-latest
+
+```
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
+
+  - name: Sync to Hugging Face Space
+    uses: huggingface/hub-sync@v0.3.0
+    with:
+      github_repo_id: ${{ github.repository }}
+      huggingface_repo_id: Jadewave/koharu-headless
+      hf_token: ${{ secrets.HF_TOKEN }}
+      repo_type: space
+      space_sdk: docker
+```
