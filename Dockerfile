@@ -22,6 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango1.0-dev \
     libssl-dev \
     llvm-dev \
+    nodejs \
+    npm \
     pkg-config \
     python3 \
     unzip \
