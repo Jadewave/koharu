@@ -22,29 +22,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango1.0-dev \
     libssl-dev \
     llvm-dev \
-    nodejs \
-    npm \
     pkg-config \
     python3 \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust
+# Install Node.js 20.x and npm
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable
 
-# Bun
+# Install Bun
 RUN curl -fsSL https://bun.sh/install | bash
 
 WORKDIR /src
+
 COPY . .
 
+# Install Tauri CLI required by the project
 RUN cargo install tauri-cli --version '=3.0.0-alpha.1' --locked
 
 ENV LIBCLANG_PATH=/usr/lib/llvm-18/lib
 
+# Install JavaScript dependencies
 RUN bun install --frozen-lockfile
 
+# Build WASM, frontend and Koharu
 RUN bun run build
 
 
@@ -89,13 +96,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Koharu executable
 COPY --from=builder /src/target/release/koharu /app/koharu
+
+# CEF runtime
 COPY --from=builder /src/target/release/libcef.so /app/libcef.so
 COPY --from=builder /src/target/release/icudtl.dat /app/icudtl.dat
 COPY --from=builder /src/target/release/resources.pak /app/resources.pak
 COPY --from=builder /src/target/release/locales /app/locales
 COPY --from=builder /src/target/release/chrome-sandbox /app/chrome-sandbox
 
+# CEF sandbox requires the setuid bit
 RUN chmod 4755 /app/chrome-sandbox
 
 ENV LD_LIBRARY_PATH=/app
@@ -103,4 +114,5 @@ ENV LD_LIBRARY_PATH=/app
 EXPOSE 7860
 
 ENTRYPOINT ["/app/koharu"]
+
 CMD ["--headless", "--host", "0.0.0.0", "--port", "7860", "--cpu"]
