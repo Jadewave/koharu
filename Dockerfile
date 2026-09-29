@@ -11,7 +11,6 @@ ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:/root/.bun/bin:$PATH
 
-# Native build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
@@ -33,7 +32,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20.x + npm
-# Next.js requires Node.js >= 20.9.0
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -49,19 +47,15 @@ WORKDIR /src
 
 COPY . .
 
-# Tauri CLI required by the project
+# Tauri CLI
 RUN cargo install tauri-cli --version '=3.0.0-alpha.1' --locked
 
-# libclang used by native Rust dependencies
 ENV LIBCLANG_PATH=/usr/lib/llvm-18/lib
 
 # JavaScript dependencies
 RUN bun install --frozen-lockfile
 
-# Build:
-# - WASM bridge
-# - Next.js frontend
-# - Koharu release binary
+# Build WASM, frontend and Koharu
 RUN bun run build
 
 
@@ -73,14 +67,7 @@ FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime dependencies for:
-# - GTK
-# - CEF / Chromium
-# - X11
-# - graphics
-# - fonts
-# - audio
-# - DBus
+# Runtime dependencies for GTK / CEF / Chromium / X11
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libasound2t64 \
@@ -123,29 +110,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Koharu executable
+# Koharu
 COPY --from=builder /src/target/release/koharu /app/koharu
 
-# CEF runtime files
+# CEF runtime
 COPY --from=builder /src/target/release/libcef.so /app/libcef.so
 COPY --from=builder /src/target/release/icudtl.dat /app/icudtl.dat
 COPY --from=builder /src/target/release/resources.pak /app/resources.pak
 COPY --from=builder /src/target/release/locales /app/locales
 COPY --from=builder /src/target/release/chrome-sandbox /app/chrome-sandbox
 
-# CEF sandbox requires setuid root
+# CEF sandbox
 RUN chmod 4755 /app/chrome-sandbox
 
-# Make CEF's libcef.so discoverable
 ENV LD_LIBRARY_PATH=/app
 
 EXPOSE 7860
 
 ENTRYPOINT ["/app/koharu"]
 
-CMD [
-    "--headless",
-    "--host", "0.0.0.0",
-    "--port", "7860",
-    "--cpu"
-]
+CMD ["--headless", "--host", "0.0.0.0", "--port", "7860", "--cpu"]
