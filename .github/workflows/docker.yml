@@ -72,7 +72,7 @@ jobs:
         uses: huggingface/hub-sync@v0.3.0
         with:
           github_repo_id: ${{ github.repository }}
-          huggingface_repo_id: Jadewave/koharu-headless
+          huggingface_repo_id: Jadewave/trans5
           hf_token: ${{ secrets.HF_TOKEN }}
           repo_type: space
           space_sdk: docker
