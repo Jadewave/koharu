@@ -1,9 +1,5 @@
 # syntax=docker/dockerfile:1
 
-# ============================================================
-# Builder
-# ============================================================
-
 FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -11,7 +7,6 @@ ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:/root/.bun/bin:$PATH
 
-# Native build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
@@ -32,59 +27,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Node.js 20.x + npm
-# Next.js requires Node.js >= 20.9.0
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable
 
-# Bun
 RUN curl -fsSL https://bun.sh/install | bash
 
 WORKDIR /src
-
 COPY . .
 
-# Tauri CLI
 RUN cargo install tauri-cli --version '=3.0.0-alpha.1' --locked
 
-# libclang used by native Rust dependencies
 ENV LIBCLANG_PATH=/usr/lib/llvm-18/lib
 
-# JavaScript dependencies
 RUN bun install --frozen-lockfile
-
-# Build WASM, frontend and Koharu
 RUN bun run build
 
-
-# ============================================================
-# Runtime
-# ============================================================
 
 FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Make the runtime user environment explicit.
-ENV HOME=/root
-ENV XDG_CONFIG_HOME=/root/.config
-ENV XDG_DATA_HOME=/root/.local/share
-ENV XDG_CACHE_HOME=/root/.cache
+# Hugging Face Docker Spaces run the application as UID 1000.
+# Use a matching home directory instead of /root.
+ENV HOME=/home/user
+ENV XDG_CONFIG_HOME=/home/user/.config
+ENV XDG_DATA_HOME=/home/user/.local/share
+ENV XDG_CACHE_HOME=/home/user/.cache
 
-# Runtime dependencies for:
-# - GTK
-# - CEF / Chromium
-# - X11
-# - graphics
-# - fonts
-# - audio
-# - DBus
-# - XDG user directories
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libasound2t64 \
@@ -126,37 +99,46 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xdg-user-dirs \
     && rm -rf /var/lib/apt/lists/*
 
-# Create standard XDG directories.
-RUN mkdir -p \
-    /root/Documents \
-    /root/Desktop \
-    /root/Downloads \
-    /root/Pictures \
-    /root/Music \
-    /root/Videos \
-    /root/.config \
-    /root/.local/share \
-    /root/.cache
+# Create the user expected by Hugging Face Spaces.
+RUN useradd \
+    --uid 1000 \
+    --create-home \
+    --shell /bin/bash \
+    user
 
-# Initialize XDG user directories.
-RUN xdg-user-dirs-update
+RUN mkdir -p \
+    /home/user/Documents \
+    /home/user/Desktop \
+    /home/user/Downloads \
+    /home/user/Pictures \
+    /home/user/Music \
+    /home/user/Videos \
+    /home/user/.config \
+    /home/user/.local/share \
+    /home/user/.cache
+
+RUN chown -R 1000:1000 /home/user
+
+RUN su - user -c 'xdg-user-dirs-update'
 
 WORKDIR /app
 
-# Koharu executable
 COPY --from=builder /src/target/release/koharu /app/koharu
-
-# CEF runtime
 COPY --from=builder /src/target/release/libcef.so /app/libcef.so
 COPY --from=builder /src/target/release/icudtl.dat /app/icudtl.dat
 COPY --from=builder /src/target/release/resources.pak /app/resources.pak
 COPY --from=builder /src/target/release/locales /app/locales
 COPY --from=builder /src/target/release/chrome-sandbox /app/chrome-sandbox
 
-# CEF sandbox requires setuid root
-RUN chmod 4755 /app/chrome-sandbox
+# Chromium's sandbox helper must remain owned by root with setuid enabled.
+RUN chown root:root /app/chrome-sandbox \
+    && chmod 4755 /app/chrome-sandbox
 
-# Make CEF's libcef.so discoverable
+# The application itself must be readable/executable by UID 1000.
+RUN chown -R 1000:1000 /app \
+    && chown root:root /app/chrome-sandbox \
+    && chmod 4755 /app/chrome-sandbox
+
 ENV LD_LIBRARY_PATH=/app
 
 EXPOSE 7860
