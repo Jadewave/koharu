@@ -65,24 +65,27 @@ static CREDENTIAL_STORE: LazyLock<Result<(), String>> = LazyLock::new(|| {
             .map(|store| keyring_core::set_default_store(store))
             .map_err(|error| error.to_string())
     }
+
     #[cfg(not(target_os = "linux"))]
     Ok(())
 });
 
 /// Load a Koharu secret by key.
 ///
-/// When the platform credential store is unavailable, treat it as an
-/// empty credential store. This allows headless/container deployments
-/// that only use local models to run without Linux Keyutils access.
+/// In container/headless environments the platform credential store may not
+/// be available. Treat any credential-store read failure as "no credential".
+/// This allows deployments that only use local translation models to run
+/// without a platform keyring.
 pub fn get(key: &str) -> anyhow::Result<Option<SecretString>> {
-    let Ok(entry) = entry(key) else {
-        return Ok(None);
+    let entry = match entry(key) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(None),
     };
 
     match entry.get_password() {
         Ok(value) => Ok(Some(SecretString::from(value))),
         Err(keyring_core::Error::NoEntry) => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(_) => Ok(None),
     }
 }
 
