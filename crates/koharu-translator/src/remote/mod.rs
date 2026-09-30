@@ -47,6 +47,7 @@ pub(crate) async fn translate(
             .as_deref()
             .with_context(|| format!("{} requires a selected model", selection.provider))
     };
+
     match selection.provider {
         Provider::OpenAi => {
             openai::translate(client, &providers.openai, model()?, generation, request).await
@@ -81,7 +82,8 @@ pub(crate) async fn translate(
                 .await
         }
         Provider::LmStudio => {
-            lm_studio::translate(client, &providers.lm_studio, model()?, generation, request).await
+            lm_studio::translate(client, &providers.lm_studio, model()?, generation, request)
+                .await
         }
         Provider::DeepL => deepl::translate(client, &providers.deepl, request).await,
         Provider::GoogleCloudTranslation => {
@@ -93,39 +95,71 @@ pub(crate) async fn translate(
 }
 
 pub(crate) async fn models(client: &Client, providers: &ProvidersConfig) -> Vec<Model> {
-    let mut models = Vec::new();
-    let pending: Vec<BoxFuture<'_, Result<Vec<Model>>>> = vec![
-        openai::models(client).boxed(),
-        gemini::models(client).boxed(),
-        claude::models(client).boxed(),
-        grok::models(client).boxed(),
-        minimax::models(client).boxed(),
-        deepseek::models(client).boxed(),
-        openai_compatible::models(client, &providers.openai_compatible).boxed(),
-        openrouter::models(client).boxed(),
-        lm_studio::models(client, &providers.lm_studio).boxed(),
-        deepl::models().boxed(),
-        google_cloud::models().boxed(),
-        caiyun::models().boxed(),
+    let pending: Vec<(&'static str, BoxFuture<'_, Result<Vec<Model>>>)> = vec![
+        ("openai", openai::models(client).boxed()),
+        ("gemini", gemini::models(client).boxed()),
+        ("claude", claude::models(client).boxed()),
+        ("grok", grok::models(client).boxed()),
+        ("minimax", minimax::models(client).boxed()),
+        ("deepseek", deepseek::models(client).boxed()),
+        (
+            "openai-compatible",
+            openai_compatible::models(client, &providers.openai_compatible).boxed(),
+        ),
+        ("openrouter", openrouter::models(client).boxed()),
+        (
+            "lm-studio",
+            lm_studio::models(client, &providers.lm_studio).boxed(),
+        ),
+        ("deepl", deepl::models().boxed()),
+        (
+            "google-cloud-translation",
+            google_cloud::models().boxed(),
+        ),
+        ("caiyun", caiyun::models().boxed()),
     ];
-    for result in join_all(pending).await {
-        append_models(&mut models, result);
+
+    let results = join_all(
+        pending
+            .into_iter()
+            .map(|(provider, future)| async move { (provider, future.await) }),
+    )
+    .await;
+
+    let mut models = Vec::new();
+
+    for (provider, result) in results {
+        match result {
+            Ok(mut provider_models) => {
+                tracing::debug!(
+                    provider,
+                    count = provider_models.len(),
+                    "translation models discovered"
+                );
+                models.append(&mut provider_models);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    provider,
+                    %error,
+                    "failed to list translation models"
+                );
+            }
+        }
     }
+
     models.sort_by(|left, right| {
         left.provider
             .to_string()
             .cmp(&right.provider.to_string())
             .then_with(|| left.model.cmp(&right.model))
     });
-    models.dedup_by(|left, right| left.provider == right.provider && left.model == right.model);
-    models
-}
 
-fn append_models(models: &mut Vec<Model>, result: Result<Vec<Model>>) {
-    match result {
-        Ok(mut provider_models) => models.append(&mut provider_models),
-        Err(error) => tracing::warn!(%error, "failed to list translation models"),
-    }
+    models.dedup_by(|left, right| {
+        left.provider == right.provider && left.model == right.model
+    });
+
+    models
 }
 
 pub(super) async fn send_json<T: DeserializeOwned>(
@@ -136,7 +170,9 @@ pub(super) async fn send_json<T: DeserializeOwned>(
         .send()
         .await
         .with_context(|| format!("{provider} request failed"))?;
+
     let status = response.status();
+
     let text = response
         .text()
         .await
@@ -144,6 +180,7 @@ pub(super) async fn send_json<T: DeserializeOwned>(
 
     if !status.is_success() {
         let lower = text.to_ascii_lowercase();
+
         if status == StatusCode::TOO_MANY_REQUESTS
             || lower.contains("insufficient_quota")
             || lower.contains("resource_exhausted")
@@ -152,6 +189,7 @@ pub(super) async fn send_json<T: DeserializeOwned>(
         {
             return Err(Error::QuotaExceeded { provider });
         }
+
         return Err(Error::Api {
             provider,
             status: status.as_u16(),
