@@ -69,9 +69,16 @@ static CREDENTIAL_STORE: LazyLock<Result<(), String>> = LazyLock::new(|| {
     Ok(())
 });
 
-/// Load a Koharu secret by key, returning `None` when no credential exists.
+/// Load a Koharu secret by key.
+///
+/// When the platform credential store is unavailable, treat it as an
+/// empty credential store. This allows headless/container deployments
+/// that only use local models to run without Linux Keyutils access.
 pub fn get(key: &str) -> anyhow::Result<Option<SecretString>> {
-    let entry = entry(key)?;
+    let Ok(entry) = entry(key) else {
+        return Ok(None);
+    };
+
     match entry.get_password() {
         Ok(value) => Ok(Some(SecretString::from(value))),
         Err(keyring_core::Error::NoEntry) => Ok(None),
@@ -98,9 +105,12 @@ fn entry(key: &str) -> anyhow::Result<Entry> {
         Ok(()) => {}
         Err(error) => anyhow::bail!("failed to initialize Linux Keyutils: {error}"),
     }
+
     #[cfg(target_os = "linux")]
     let entry = Entry::new(SERVICE, key)?;
+
     #[cfg(not(target_os = "linux"))]
     let entry = keyring::Entry::new(SERVICE, key)?.inner;
+
     Ok(entry)
 }
