@@ -16,6 +16,10 @@ const resizeHandles = [
   { direction: 'SouthWest', className: 'bottom-0 left-0 size-2 cursor-sw-resize' },
 ] as const
 
+function isTauriRuntime() {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+}
+
 export function useMacOS() {
   const [macOS, setMacOS] = useState(false)
 
@@ -33,23 +37,34 @@ export function WindowControls() {
   const { t } = useTranslation()
   const [maximized, setMaximized] = useState(false)
 
+  // Headless HTTP mode runs in a normal browser, not a Tauri WebView.
+  // Tauri's getCurrentWindow() requires window.__TAURI_INTERNALS__.
+  if (!isTauriRuntime()) {
+    return null
+  }
+
   useEffect(() => {
     const window = getCurrentWindow()
     let disposed = false
     let unlisten: (() => void) | undefined
+
     const synchronize = () => {
       void window.isMaximized().then((value) => {
         if (!disposed) setMaximized(value)
       })
     }
+
     synchronize()
+
     queueMicrotask(() => {
       if (disposed) return
+
       void window.onResized(synchronize).then((stop) => {
         if (disposed) void Promise.resolve(stop()).catch(() => undefined)
         else unlisten = stop
       })
     })
+
     return () => {
       disposed = true
       if (unlisten) void Promise.resolve(unlisten()).catch(() => undefined)
@@ -65,6 +80,7 @@ export function WindowControls() {
   return (
     <>
       {!maximized && <WindowResizeHandles />}
+
       <div className='flex h-full shrink-0'>
         <WindowButton
           label={t('window.minimize')}
@@ -72,12 +88,14 @@ export function WindowControls() {
         >
           <Minus />
         </WindowButton>
+
         <WindowButton
           label={t(maximized ? 'window.restore' : 'window.maximize')}
           onClick={() => void toggleMaximize()}
         >
           {maximized ? <Copy /> : <Square />}
         </WindowButton>
+
         <WindowButton
           label={t('window.close')}
           className='hover:text-destructive-foreground hover:bg-destructive'
@@ -95,8 +113,10 @@ function WindowResizeHandles() {
     (direction: (typeof resizeHandles)[number]['direction']) =>
     (event: ReactPointerEvent<HTMLDivElement>) => {
       if (event.button !== 0) return
+
       event.preventDefault()
       event.stopPropagation()
+
       void getCurrentWindow()
         .startResizeDragging(direction)
         .catch(() => undefined)
