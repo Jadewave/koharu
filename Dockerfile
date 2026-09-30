@@ -8,23 +8,10 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:/root/.bun/bin:$PATH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    ca-certificates \
-    clang \
-    cmake \
-    curl \
-    git \
-    libclang-dev \
-    libclang-18-dev \
-    libcairo2-dev \
-    libgdk-pixbuf-2.0-dev \
-    libgtk-4-dev \
-    libpango1.0-dev \
-    libssl-dev \
-    llvm-dev \
-    pkg-config \
-    python3 \
-    unzip \
+    build-essential ca-certificates clang cmake curl git \
+    libclang-dev libclang-18-dev libcairo2-dev libgdk-pixbuf-2.0-dev \
+    libgtk-4-dev libpango1.0-dev libssl-dev llvm-dev pkg-config \
+    python3 unzip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -50,13 +37,6 @@ RUN bun run build
 FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
-
-# Hugging Face Docker Spaces run the application as UID 1000.
-# Use a matching home directory instead of /root.
-ENV HOME=/home/user
-ENV XDG_CONFIG_HOME=/home/user/.config
-ENV XDG_DATA_HOME=/home/user/.local/share
-ENV XDG_CACHE_HOME=/home/user/.cache
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -99,13 +79,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xdg-user-dirs \
     && rm -rf /var/lib/apt/lists/*
 
-# Create the user expected by Hugging Face Spaces.
-RUN useradd \
-    --uid 1000 \
-    --create-home \
-    --shell /bin/bash \
-    user
-
+# Writable home for the HF UID 1000 runtime.
 RUN mkdir -p \
     /home/user/Documents \
     /home/user/Desktop \
@@ -115,11 +89,16 @@ RUN mkdir -p \
     /home/user/Videos \
     /home/user/.config \
     /home/user/.local/share \
-    /home/user/.cache
+    /home/user/.cache \
+    && chown -R 1000:1000 /home/user
 
-RUN chown -R 1000:1000 /home/user
+ENV HOME=/home/user
+ENV XDG_CONFIG_HOME=/home/user/.config
+ENV XDG_DATA_HOME=/home/user/.local/share
+ENV XDG_CACHE_HOME=/home/user/.cache
 
-RUN su - user -c 'xdg-user-dirs-update'
+RUN chown -R 1000:1000 /home/user \
+    && su -s /bin/sh -c 'xdg-user-dirs-update' "$(getent passwd 1000 | cut -d: -f1)"
 
 WORKDIR /app
 
@@ -130,11 +109,6 @@ COPY --from=builder /src/target/release/resources.pak /app/resources.pak
 COPY --from=builder /src/target/release/locales /app/locales
 COPY --from=builder /src/target/release/chrome-sandbox /app/chrome-sandbox
 
-# Chromium's sandbox helper must remain owned by root with setuid enabled.
-RUN chown root:root /app/chrome-sandbox \
-    && chmod 4755 /app/chrome-sandbox
-
-# The application itself must be readable/executable by UID 1000.
 RUN chown -R 1000:1000 /app \
     && chown root:root /app/chrome-sandbox \
     && chmod 4755 /app/chrome-sandbox
