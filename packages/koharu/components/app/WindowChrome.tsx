@@ -36,40 +36,49 @@ export function useMacOS() {
 export function WindowControls() {
   const { t } = useTranslation()
   const [maximized, setMaximized] = useState(false)
-
-  // Headless HTTP mode runs in a normal browser, not a Tauri WebView.
-  // Tauri's getCurrentWindow() requires window.__TAURI_INTERNALS__.
-  if (!isTauriRuntime()) {
-    return null
-  }
+  const [tauri, setTauri] = useState(false)
 
   useEffect(() => {
+    if (!isTauriRuntime()) {
+      return
+    }
+
+    setTauri(true)
+
     const window = getCurrentWindow()
     let disposed = false
     let unlisten: (() => void) | undefined
 
     const synchronize = () => {
       void window.isMaximized().then((value) => {
-        if (!disposed) setMaximized(value)
+        if (!disposed) {
+          setMaximized(value)
+        }
       })
     }
 
     synchronize()
 
-    queueMicrotask(() => {
-      if (disposed) return
-
-      void window.onResized(synchronize).then((stop) => {
-        if (disposed) void Promise.resolve(stop()).catch(() => undefined)
-        else unlisten = stop
-      })
+    void window.onResized(synchronize).then((stop) => {
+      if (disposed) {
+        void Promise.resolve(stop()).catch(() => undefined)
+      } else {
+        unlisten = stop
+      }
     })
 
     return () => {
       disposed = true
-      if (unlisten) void Promise.resolve(unlisten()).catch(() => undefined)
+
+      if (unlisten) {
+        void Promise.resolve(unlisten()).catch(() => undefined)
+      }
     }
   }, [])
+
+  if (!tauri) {
+    return null
+  }
 
   const toggleMaximize = async () => {
     const window = getCurrentWindow()
