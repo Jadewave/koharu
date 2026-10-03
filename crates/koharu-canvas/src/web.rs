@@ -1102,13 +1102,16 @@ pub async fn create_canvas(element: HtmlCanvasElement) -> Result<WebCanvas, JsVa
         .create_surface(wgpu::SurfaceTarget::Canvas(element.clone()))
         .map_err(js_error)?;
     let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: Some(&surface),
-        })
-        .await
-        .map_err(js_error)?;
+    .request_adapter(&wgpu::RequestAdapterOptions {
+        // Do not require a high-performance adapter in browser/headless mode.
+        // Hugging Face may run the app in a cross-origin iframe, and the
+        // browser may reject a high-performance adapter there.
+        power_preference: wgpu::PowerPreference::default(),
+        force_fallback_adapter: false,
+        compatible_surface: Some(&surface),
+    })
+    .await
+    .map_err(js_error)?;
     if !adapter
         .get_downlevel_capabilities()
         .flags
