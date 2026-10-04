@@ -57,11 +57,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
-    libvulkan1 \
     libwayland-client0 \
     libwayland-cursor0 \
     libwayland-egl1 \
-    libwayland1 \
     libx11-6 \
     libx11-xcb1 \
     libxcb1 \
@@ -78,10 +76,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     libxshmfence1 \
     libxtst6 \
-    mesa-vulkan-drivers \
     xdg-user-dirs \
     && rm -rf /var/lib/apt/lists/*
 
+# Writable home for the HF UID 1000 runtime.
 RUN mkdir -p \
     /home/user/Documents \
     /home/user/Desktop \
@@ -98,8 +96,6 @@ ENV HOME=/home/user
 ENV XDG_CONFIG_HOME=/home/user/.config
 ENV XDG_DATA_HOME=/home/user/.local/share
 ENV XDG_CACHE_HOME=/home/user/.cache
-
-ENV WGPU_BACKEND=vulkan
 
 RUN chown -R 1000:1000 /home/user \
     && su -s /bin/sh -c 'xdg-user-dirs-update' "$(getent passwd 1000 | cut -d: -f1)"
