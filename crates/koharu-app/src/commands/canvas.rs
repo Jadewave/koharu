@@ -4,6 +4,11 @@ use anyhow::{Context as _, anyhow, bail};
 use image::{GrayImage, ImageEncoder as _, codecs::png::PngEncoder};
 use koharu_desktop::{CanvasState, Desktop, Frame, TransformFrame};
 use koharu_rasterizer::{RasterOptions, ResourceId};
+use image::{
+    ExtendedColorType,
+    ImageEncoder as _,
+    codecs::png::{CompressionType, FilterType, PngEncoder},
+};
 use koharu_scene::{EntityId, Revision};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
