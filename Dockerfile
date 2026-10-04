@@ -77,9 +77,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxshmfence1 \
     libxtst6 \
     xdg-user-dirs \
+    libvulkan1 \
+    mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 
-# Writable home for the HF UID 1000 runtime.
 RUN mkdir -p \
     /home/user/Documents \
     /home/user/Desktop \
@@ -114,6 +115,7 @@ RUN chown -R 1000:1000 /app \
     && chmod 4755 /app/chrome-sandbox
 
 ENV LD_LIBRARY_PATH=/app
+ENV WGPU_BACKEND=vulkan
 
 EXPOSE 7860
 
