@@ -105,7 +105,6 @@ macro_rules! command_list {
             preferences::get_translation_models,
             canvas::get_canvas_manifest,
             canvas::get_canvas_resource,
-            canvas::get_canvas_preview,
             canvas::prepare_canvas_page,
             canvas::get_canvas_page_manifest,
             canvas::get_canvas_page_resource,
