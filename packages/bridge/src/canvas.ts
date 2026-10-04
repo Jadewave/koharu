@@ -93,376 +93,91 @@ export async function createCanvas(
   element: HTMLCanvasElement,
   onDeviceLost: (reason: string) => void,
 ): Promise<Canvas> {
-  if (!(await browserWebGpuAvailable())) {
-    console.warn('WebGPU adapter unavailable; using server-rendered software canvas.')
-    return createSoftwareCanvas(element)
-  }
-
-  try {
-    const module = await loadCanvasModule()
-    const canvas = await module.createCanvas(element)
-
-    let transformSequence = 0
-    let disposed = false
-    let stagedManifest: { token: number; bytes: Uint8Array } | null = null
-    let activeManifest: Uint8Array | null = null
-    const cachedManifests = new Map<string, Uint8Array>()
-
-    canvas.setDeviceLostCallback(onDeviceLost)
-
-    return {
-      resize: (width, height, dpr, background) =>
-        canvas.resize(width, height, dpr, new Uint8Array([...background, 255])),
-
-      setView: (zoom, translation) =>
-        canvas.setView(zoom, translation[0], translation[1]),
-
-      stageManifest: (manifest) => {
-        const staged = canvas.stageManifest(manifest)
-        stagedManifest = {
-          token: staged.token,
-          bytes: manifest.slice(),
-        }
-        return staged
-      },
-
-      installResource: (resource, packet) =>
-        canvas.installResource(resource, packet),
-
-      hasActiveManifest: (manifest) =>
-        activeManifest !== null && equalBytes(activeManifest, manifest),
-
-      activateFrame: (token) => {
-        const activated = canvas.activateFrame(token)
-
-        if (activated && stagedManifest?.token === token) {
-          activeManifest = stagedManifest.bytes
-          stagedManifest = null
-        }
-
-        return activated
-      },
-
-      activatePage: (page, expectedRevision) => {
-        const activated = canvas.activatePage(page, BigInt(expectedRevision))
-
-        if (activated) {
-          activeManifest = cachedManifests.get(page) ?? null
-        }
-
-        return activated
-      },
-
-      cacheFrame: (token, page) => {
-        const cached = canvas.cacheFrame(token)
-
-        if (stagedManifest?.token === token) {
-          if (cached) {
-            cachedManifests.set(page, stagedManifest.bytes)
-          }
-          stagedManifest = null
-        }
-
-        return cached
-      },
-
-      clear: () => {
-        canvas.clear()
-        stagedManifest = null
-        activeManifest = null
-        cachedManifests.clear()
-      },
-
-      previewOpacity: (element, opacity) =>
-        canvas.previewOpacity(element, opacity),
-
-      beginTransform: (elements) => {
-        transformSequence = 0
-        canvas.beginTransform(canvasTransformFrames(elements))
-      },
-
-      updateTransform: (elements) =>
-        canvas.updateTransform(
-          ++transformSequence,
-          canvasTransformFrames(elements),
-        ),
-
-      finishTransform: () => void canvas.finishTransform(),
-
-      cancelTransform: () => canvas.cancelTransform(),
-
-      beginStroke: (stroke) =>
-        canvas.beginStroke(
-          stroke.kind,
-          stroke.layer,
-          stroke.point,
-          stroke.diameter,
-          new Uint8Array(stroke.color ?? [0, 0, 0, 0]),
-        ),
-
-      extendStroke: (points) => canvas.extendStroke(points),
-
-      finishStroke: () => void canvas.finishStroke(),
-
-      cancelStroke: () => canvas.cancelStroke(),
-
-      sampleColor: async (point) => {
-        const color = await canvas.sampleColor(point.x, point.y)
-
-        if (color.length !== 4) {
-          throw new Error('The WebGPU canvas returned an invalid color.')
-        }
-
-        return [color[0], color[1], color[2], color[3]]
-      },
-
-      dispose: () => {
-        if (disposed) return
-
-        disposed = true
-
-        try {
-          canvas.setDeviceLostCallback(null)
-        } finally {
-          try {
-            canvas.dispose()
-          } finally {
-            canvas.free()
-          }
-        }
-      },
-    }
-  } catch (error) {
-    console.warn(
-      'WebGPU canvas initialization failed; using server-rendered software canvas.',
-      error,
-    )
-
-    return createSoftwareCanvas(element)
-  }
-}
-
-async function browserWebGpuAvailable(): Promise<boolean> {
-  if (typeof navigator === 'undefined') {
-    return false
-  }
-
-  const gpu = (
-    navigator as Navigator & {
-      gpu?: {
-        requestAdapter?: (options?: {
-          powerPreference?: 'low-power' | 'high-performance'
-        }) => Promise<unknown>
-      }
-    }
-  ).gpu
-
-  if (!gpu?.requestAdapter) {
-    return false
-  }
-
-  try {
-    const adapter = await gpu.requestAdapter({
-      powerPreference: 'low-power',
-    })
-
-    return adapter !== null && adapter !== undefined
-  } catch {
-    return false
-  }
-}
-
-function createSoftwareCanvas(element: HTMLCanvasElement): Canvas {
-  const context = element.getContext('2d')
-
-  if (!context) {
-    throw new Error('Canvas 2D context unavailable.')
-  }
-
+  const module = await loadCanvasModule()
+  const canvas = await module.createCanvas(element)
+  let transformSequence = 0
   let disposed = false
-  let zoom = 1
-  let translation: [number, number] = [0, 0]
-  let dpr = 1
-  let background: WorkspaceColor = [245, 245, 245]
-  let image: ImageBitmap | null = null
-  let requestId = 0
-  let token = 0
-
-  const redraw = () => {
-    if (disposed) return
-
-    const width = element.width / dpr
-    const height = element.height / dpr
-
-    context.setTransform(dpr, 0, 0, dpr, 0, 0)
-    context.clearRect(0, 0, width, height)
-
-    context.fillStyle = `rgb(${background[0]}, ${background[1]}, ${background[2]})`
-    context.fillRect(0, 0, width, height)
-
-    if (!image) {
-      return
-    }
-
-    context.save()
-    context.translate(translation[0], translation[1])
-    context.scale(zoom, zoom)
-    context.drawImage(image, 0, 0)
-    context.restore()
-  }
-
-  const loadPage = async (page: string, revision: number) => {
-    const currentRequest = ++requestId
-
-    try {
-      const response = await fetch('/rpc/get_canvas_preview', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          page,
-          revision,
-        }),
-      })
-
-      if (!response.ok) {
-        throw new Error(
-          `Canvas preview request failed with HTTP ${response.status}`,
-        )
-      }
-
-      const blob = await response.blob()
-      const nextImage = await createImageBitmap(blob)
-
-      if (disposed || currentRequest !== requestId) {
-        nextImage.close()
-        return
-      }
-
-      image?.close()
-      image = nextImage
-      redraw()
-    } catch (error) {
-      console.error('Failed to load server-rendered canvas preview.', error)
-    }
-  }
-
-  const nextToken = () => {
-    token = token >= 0x7fffffff ? 1 : token + 1
-    return token
-  }
+  let stagedManifest: { token: number; bytes: Uint8Array } | null = null
+  let activeManifest: Uint8Array | null = null
+  const cachedManifests = new Map<string, Uint8Array>()
+  canvas.setDeviceLostCallback(onDeviceLost)
 
   return {
-    resize: (width, height, nextDpr, nextBackground) => {
-      dpr = Math.max(1, nextDpr)
-      background = [
-        nextBackground[0] ?? 245,
-        nextBackground[1] ?? 245,
-        nextBackground[2] ?? 245,
-      ]
-
-      element.width = Math.max(1, Math.round(width * dpr))
-      element.height = Math.max(1, Math.round(height * dpr))
-
-      redraw()
+    resize: (width, height, dpr, background) =>
+      canvas.resize(width, height, dpr, new Uint8Array([...background, 255])),
+    setView: (zoom, translation) => canvas.setView(zoom, translation[0], translation[1]),
+    stageManifest: (manifest) => {
+      const staged = canvas.stageManifest(manifest)
+      stagedManifest = { token: staged.token, bytes: manifest.slice() }
+      return staged
     },
-
-    setView: (nextZoom, translationTuple) => {
-      zoom = Number.isFinite(nextZoom) && nextZoom > 0 ? nextZoom : 1
-      translation = [translationTuple[0], translationTuple[1]]
-      redraw()
-    },
-
-    stageManifest: (_manifest) => ({
-      token: nextToken(),
-      missing: [] as string[],
-    }),
-
-    installResource: async (_resource, _packet) => {
-      // Resources are already composed server-side into the preview image.
-    },
-
-    hasActiveManifest: (_manifest) => false,
-
-    activateFrame: (_token) => {
-      redraw()
-      return true
-    },
-
-    activatePage: (page, expectedRevision) => {
-      const revision = Number(expectedRevision)
-
-      if (Number.isFinite(revision)) {
-        void loadPage(page, revision)
+    installResource: (resource, packet) => canvas.installResource(resource, packet),
+    hasActiveManifest: (manifest) =>
+      activeManifest !== null && equalBytes(activeManifest, manifest),
+    activateFrame: (token) => {
+      const activated = canvas.activateFrame(token)
+      if (activated && stagedManifest?.token === token) {
+        activeManifest = stagedManifest.bytes
+        stagedManifest = null
       }
-
-      return true
+      return activated
     },
-
-    cacheFrame: (_token, _page) => true,
-
+    activatePage: (page, expectedRevision) => {
+      const activated = canvas.activatePage(page, BigInt(expectedRevision))
+      if (activated) activeManifest = cachedManifests.get(page) ?? null
+      return activated
+    },
+    cacheFrame: (token, page) => {
+      const cached = canvas.cacheFrame(token)
+      if (stagedManifest?.token === token) {
+        if (cached) cachedManifests.set(page, stagedManifest.bytes)
+        stagedManifest = null
+      }
+      return cached
+    },
     clear: () => {
-      image?.close()
-      image = null
-      redraw()
+      canvas.clear()
+      stagedManifest = null
+      activeManifest = null
+      cachedManifests.clear()
     },
-
-    previewOpacity: (_element, _opacity) => {
-      // The complete frame is server-rendered in software mode.
+    previewOpacity: (element, opacity) => canvas.previewOpacity(element, opacity),
+    beginTransform: (elements) => {
+      transformSequence = 0
+      canvas.beginTransform(canvasTransformFrames(elements))
     },
-
-    beginTransform: (_elements) => {
-      // Backend commit remains functional; live GPU preview is unavailable.
-    },
-
-    updateTransform: (_elements) => {
-      // Backend commit remains functional; live GPU preview is unavailable.
-    },
-
-    finishTransform: () => undefined,
-
-    cancelTransform: () => undefined,
-
-    beginStroke: (_stroke) => {
-      // Backend commit remains functional; live GPU preview is unavailable.
-    },
-
-    extendStroke: (_points) => undefined,
-
-    finishStroke: () => undefined,
-
-    cancelStroke: () => undefined,
-
+    updateTransform: (elements) =>
+      canvas.updateTransform(++transformSequence, canvasTransformFrames(elements)),
+    finishTransform: () => void canvas.finishTransform(),
+    cancelTransform: () => canvas.cancelTransform(),
+    beginStroke: (stroke) =>
+      canvas.beginStroke(
+        stroke.kind,
+        stroke.layer,
+        stroke.point,
+        stroke.diameter,
+        new Uint8Array(stroke.color ?? [0, 0, 0, 0]),
+      ),
+    extendStroke: (points) => canvas.extendStroke(points),
+    finishStroke: () => void canvas.finishStroke(),
+    cancelStroke: () => canvas.cancelStroke(),
     sampleColor: async (point) => {
-      const x = Math.max(
-        0,
-        Math.min(
-          element.width - 1,
-          Math.floor(point.x * dpr),
-        ),
-      )
-
-      const y = Math.max(
-        0,
-        Math.min(
-          element.height - 1,
-          Math.floor(point.y * dpr),
-        ),
-      )
-
-      const data = context.getImageData(x, y, 1, 1).data
-      return [data[0], data[1], data[2], data[3]]
+      const color = await canvas.sampleColor(point.x, point.y)
+      if (color.length !== 4) throw new Error('The WebGPU canvas returned an invalid color.')
+      return [color[0], color[1], color[2], color[3]]
     },
-
     dispose: () => {
       if (disposed) return
-
       disposed = true
-      requestId++
-
-      image?.close()
-      image = null
+      try {
+        canvas.setDeviceLostCallback(null)
+      } finally {
+        try {
+          canvas.dispose()
+        } finally {
+          canvas.free()
+        }
+      }
     },
   }
 }
