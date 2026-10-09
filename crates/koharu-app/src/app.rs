@@ -11,7 +11,7 @@ pub fn http_router(host: Host, frontend: axum::Router) -> axum::Router {
         .fallback_service(frontend)
         // Image/project imports use multipart/form-data. The default Axum
         // request body limit is too small for importing multiple images.
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(650 * 1024 * 1024))
 }
 
 pub fn run(
