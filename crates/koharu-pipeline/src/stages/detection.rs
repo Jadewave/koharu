@@ -410,10 +410,10 @@ fn write_region<'a>(
             size: None,
             auto_fit: true,
             color: inferred.map(|value| [value.color[0], value.color[1], value.color[2], u8::MAX]),
-            stroke_color: inferred
-                .and_then(|value| value.stroke_color)
-                .map(|color| [color[0], color[1], color[2], u8::MAX]),
-            stroke_width: inferred.and_then(|value| value.stroke_width),
+            // Auto-detected outlines are unreliable on artwork backgrounds; leave stroke off
+            // and let the user enable it per block in the Inspector.
+            stroke_color: None,
+            stroke_width: None,
             alignment: None,
             writing_mode: inferred.map(|value| value.writing_mode),
             extensions: Default::default(),
