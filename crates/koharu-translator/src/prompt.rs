@@ -28,6 +28,16 @@ pub(crate) fn translations(
     text: &str,
     source_segments: &[String],
 ) -> anyhow::Result<Vec<String>> {
+    parse_translations(provider, text, source_segments).map(|(translations, _)| translations)
+}
+
+/// Parses a model response and also reports which segment indices the model never
+/// returned. Those entries still hold their source text in the first element.
+pub(crate) fn parse_translations(
+    provider: &str,
+    text: &str,
+    source_segments: &[String],
+) -> anyhow::Result<(Vec<String>, Vec<usize>)> {
     let output = serde_json::from_str::<TranslationOutput>(text).with_context(|| {
         format!(
             "{provider} returned invalid translation JSON for {} segments; response was: {}",
@@ -45,7 +55,12 @@ pub(crate) fn translations(
         }
     }
 
-    Ok(translations)
+    let missing = translated
+        .iter()
+        .enumerate()
+        .filter_map(|(index, done)| (!done).then_some(index))
+        .collect();
+    Ok((translations, missing))
 }
 
 /// Keeps a model response readable in a log line without truncating so hard
@@ -375,5 +390,16 @@ mod tests {
         let prompt = translation_system_prompt(&request);
         assert!(prompt.contains("attached original page image"));
         assert!(prompt.contains("Translate only the supplied segments"));
+    }
+
+    #[test]
+    fn parse_translations_reports_missing_and_duplicate_ids() {
+        let sources = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let text = r#"{"translations":[{"id":0,"text":"A"},{"id":0,"text":"dup"},{"id":2,"text":"C"}]}"#;
+
+        let (translations, missing) = parse_translations("test", text, &sources).unwrap();
+
+        assert_eq!(translations, ["A", "b", "C"]);
+        assert_eq!(missing, [1]);
     }
 }
