@@ -84,7 +84,7 @@ impl StageProcessor for Processor {
             let text = if source.trim() == "\u{2026}" {
                 "\u{2026}".to_owned()
             } else {
-                clean_translation(&source, &text)
+                text
             };
             edit.set(
                 entity,
@@ -95,61 +95,5 @@ impl StageProcessor for Processor {
             )?;
         }
         finish(edit)
-    }
-}
-
-/// Vertical-bar look-alikes that models emit as line separators.
-const SEPARATOR_CHARACTERS: [char; 5] = ['|', '\u{ff5c}', '\u{2502}', '\u{00a6}', '\u{2016}'];
-
-/// Removes artifacts local models leave in translations: separator bars used in place of
-/// line breaks, control and zero-width characters, and replacement glyphs. Line breaks are
-/// kept. A separator that already appears in the source text is left alone.
-fn clean_translation(source: &str, text: &str) -> String {
-    let strip_separators = !source.contains(SEPARATOR_CHARACTERS);
-    let cleaned = text
-        .chars()
-        .filter_map(|character| match character {
-            '\n' => Some('\n'),
-            '\r' => None,
-            character if strip_separators && SEPARATOR_CHARACTERS.contains(&character) => {
-                Some(' ')
-            }
-            '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}' | '\u{fffd}' => None,
-            character if character.is_control() => Some(' '),
-            character => Some(character),
-        })
-        .collect::<String>();
-    let lines = cleaned
-        .lines()
-        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        text.to_owned()
-    } else {
-        lines.join("\n")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::clean_translation;
-
-    #[test]
-    fn separator_bars_become_spaces_and_line_breaks_survive() {
-        assert_eq!(
-            clean_translation("a\nb", "Tối từng\n| cô ấy | lạ"),
-            "Tối từng\ncô ấy lạ"
-        );
-    }
-
-    #[test]
-    fn separators_in_the_source_are_preserved() {
-        assert_eq!(clean_translation("a | b", "x | y"), "x | y");
-    }
-
-    #[test]
-    fn empty_result_falls_back_to_the_original_text() {
-        assert_eq!(clean_translation("a", "|"), "|");
     }
 }
