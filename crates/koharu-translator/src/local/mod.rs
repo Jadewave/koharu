@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use koharu_ml::llm::{
-    ChatMessage, ChatTemplateOptions, Input, Llm, LoadOptions, MtmdOptions, media_marker,
+    ChatMessage, ChatTemplateOptions, GenerationOptions, Input, Llm, LoadOptions, MtmdOptions,
+    media_marker,
 };
 
 mod catalog;
@@ -15,6 +16,9 @@ use crate::{
     Device, Error, GenerationConfig, Model, ModelSelection, Provider, Quantization, Result,
     TranslationRequest, prompt,
 };
+
+/// How many times segments the model skipped (missing or duplicated IDs) are translated again.
+const MAX_MISSING_RETRIES: u32 = 2;
 
 #[derive(Debug)]
 pub struct LocalTranslator {
@@ -73,24 +77,75 @@ impl LocalTranslator {
             });
         }
 
+        let reasoning = generation.reasoning.unwrap_or(false) && self.descriptor.reasoning;
+        let options = self.descriptor.generation.options(generation);
+
+        let (mut translations, mut missing) = self.generate(&request, reasoning, &options).await?;
+        for attempt in 1..=MAX_MISSING_RETRIES {
+            if missing.is_empty() {
+                break;
+            }
+            tracing::warn!(
+                missing = missing.len(),
+                total = expected,
+                attempt,
+                "local translation skipped segments; translating them again"
+            );
+            let mut retry = request.clone();
+            retry.segments = missing
+                .iter()
+                .map(|&index| request.segments[index].clone())
+                .collect();
+            let mut retry_options = options.clone();
+            retry_options.seed = retry_options.seed.wrapping_add(attempt);
+            let (retried, still_missing) = self.generate(&retry, reasoning, &retry_options).await?;
+            for (position, &index) in missing.iter().enumerate() {
+                if !still_missing.contains(&position) {
+                    translations[index] = retried[position].clone();
+                }
+            }
+            let remaining: Vec<usize> = still_missing
+                .into_iter()
+                .map(|position| missing[position])
+                .collect();
+            missing = remaining;
+        }
+        if !missing.is_empty() {
+            tracing::warn!(
+                missing = missing.len(),
+                total = expected,
+                "local translation still skipped segments after retries; keeping source text"
+            );
+        }
+        Ok(translations)
+    }
+
+    /// Runs one constrained generation and returns the parsed translations plus the
+    /// indices of segments the model did not return.
+    async fn generate(
+        &self,
+        request: &TranslationRequest,
+        reasoning: bool,
+        options: &GenerationOptions,
+    ) -> Result<(Vec<String>, Vec<usize>)> {
         let image = request.image.clone();
-        let prompt = self.render_prompt(
-            &request,
-            generation.reasoning.unwrap_or(false) && self.descriptor.reasoning,
-        )?;
-        let schema = prompt::output_schema(expected);
+        let prompt = self.render_prompt(request, reasoning)?;
+        let schema = prompt::output_schema(request.segments.len());
         let llm = Arc::clone(&self.llm);
-        let generation = self.descriptor.generation.options(generation);
+        let options = options.clone();
         let output = tokio_rayon::spawn(move || {
             let input = image.as_deref().map_or_else(
                 || Input::new(&prompt),
                 |image| Input::new(&prompt).with_image(image),
             );
-            llm.inference_with_json_schema(&input, &generation, &schema)
+            llm.inference_with_json_schema(&input, &options, &schema)
         })
         .await?;
-        let segments = prompt::translations("local", &output.text, &request.segments)?;
-        Ok(segments)
+        Ok(prompt::parse_translations(
+            "local",
+            &output.text,
+            &request.segments,
+        )?)
     }
 
     fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
