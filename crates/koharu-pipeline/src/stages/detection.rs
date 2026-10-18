@@ -409,9 +409,11 @@ fn write_region<'a>(
             font_style: None,
             size: None,
             auto_fit: true,
-            color: inferred.map(|value| [value.color[0], value.color[1], value.color[2], u8::MAX]),
-            // Auto-detected outlines are unreliable on artwork backgrounds; leave stroke off
-            // and let the user enable it per block in the Inspector.
+            // Outlines are never generated. Text that originally had a dark outline (usually
+            // light text) falls back to the default color so it stays readable without one.
+            color: inferred
+                .filter(|value| !had_dark_outline(value))
+                .map(|value| [value.color[0], value.color[1], value.color[2], u8::MAX]),
             stroke_color: None,
             stroke_width: None,
             alignment: None,
@@ -1263,6 +1265,12 @@ fn median_color(colors: &[[u8; 3]]) -> [u8; 3] {
         }
     }
     std::array::from_fn(|channel| histogram_median(&histograms[channel], colors.len()))
+}
+
+fn had_dark_outline(inferred: &InferredTypography) -> bool {
+    inferred
+        .stroke_color
+        .is_some_and(|stroke| color_luminance(stroke) < color_luminance(inferred.color))
 }
 
 fn color_distance_squared(left: [u8; 3], right: [u8; 3]) -> u32 {
@@ -2261,8 +2269,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(typography.color, Some([0, 0, 0, 255]));
-        assert_eq!(typography.stroke_color, Some([255, 255, 255, 255]));
-        assert_eq!(typography.stroke_width, Some(3.0));
+        assert_eq!(typography.stroke_color, None);
+        assert_eq!(typography.stroke_width, None);
     }
 
     #[test]
