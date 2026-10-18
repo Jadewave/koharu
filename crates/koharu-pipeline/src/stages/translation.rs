@@ -98,6 +98,29 @@ impl StageProcessor for Processor {
     }
 }
 
+const PARENTHESES: [char; 4] = ['(', ')', '\u{ff08}', '\u{ff09}'];
+
+/// Drops `(...)` notes such as "(SFX name/action)" that models append. Only applies when the
+/// source has no parentheses of its own, so genuine parenthesized dialogue is kept. Unbalanced
+/// parentheses leave the text untouched.
+fn strip_parenthetical(source: &str, text: &str) -> String {
+    if source.contains(PARENTHESES) {
+        return text.to_owned();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for character in text.chars() {
+        match character {
+            '(' | '\u{ff08}' => depth += 1,
+            ')' | '\u{ff09}' if depth > 0 => depth -= 1,
+            ')' | '\u{ff09}' => return text.to_owned(),
+            _ if depth == 0 => result.push(character),
+            _ => {}
+        }
+    }
+    if depth == 0 { result } else { text.to_owned() }
+}
+
 /// Vertical-bar look-alikes that models emit as line separators.
 const SEPARATOR_CHARACTERS: [char; 5] = ['|', '\u{ff5c}', '\u{2502}', '\u{00a6}', '\u{2016}'];
 
@@ -105,6 +128,12 @@ const SEPARATOR_CHARACTERS: [char; 5] = ['|', '\u{ff5c}', '\u{2502}', '\u{00a6}'
 /// line breaks, control and zero-width characters, and replacement glyphs. Line breaks are
 /// kept. A separator that already appears in the source text is left alone.
 fn clean_translation(source: &str, text: &str) -> String {
+    let stripped = strip_parenthetical(source, text);
+    let text = if stripped.trim().is_empty() {
+        text
+    } else {
+        stripped.as_str()
+    };
     let strip_separators = !source.contains(SEPARATOR_CHARACTERS);
     let cleaned = text
         .chars()
@@ -141,6 +170,14 @@ mod tests {
             clean_translation("a\nb", "Tối từng\n| cô ấy | lạ"),
             "Tối từng\ncô ấy lạ"
         );
+    }
+
+    #[test]
+    fn parenthetical_notes_are_removed_unless_the_source_has_parentheses() {
+        assert_eq!(clean_translation("ポイ", "Vứt\n(tên SFX/hành động-thả)"), "Vứt");
+        assert_eq!(clean_translation("（笑）", "(cười)"), "(cười)");
+        assert_eq!(clean_translation("ポイ", "(ghi chú)"), "(ghi chú)");
+        assert_eq!(clean_translation("ポイ", "Vứt (chưa đóng"), "Vứt (chưa đóng");
     }
 
     #[test]
