@@ -17,26 +17,6 @@ use crate::{
     script::is_chinese_or_japanese_text,
 };
 
-/// Applies the shared language, hyphenation and auto-fit settings to a fallback layout
-/// builder that has no balloon contour.
-fn finish_rectangular<'a>(
-    builder: TextLayout<'a>,
-    descriptor: &TextNodeDescriptor,
-    maximum: f32,
-    minimum: f32,
-) -> TextLayout<'a> {
-    let mut builder = builder;
-    if let Some(language) = &descriptor.language {
-        builder = builder.with_hyphenation_language_tag(language.as_str());
-    }
-    if descriptor.writing_mode == WritingMode::Horizontal {
-        builder = builder.with_hyphenation_policy(HyphenationPolicy::LastResort);
-    }
-    builder
-        .with_max_font_size(maximum)
-        .with_min_font_size(minimum)
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextNodeDescriptor {
     pub(crate) entity: koharu_scene::EntityId,
@@ -225,14 +205,10 @@ impl TextRenderer {
                         .is_some_and(|language| is_chinese_or_japanese_language(language.as_str())),
             );
         if !descriptor.point_text {
-            layout = layout.with_max_width(bounds.width);
+            layout = layout
+                .with_max_width(bounds.width)
+                .with_max_height(bounds.height);
         }
-        // Fallback layouts used when the balloon-contour layout cannot fit the text.
-        let width_only = layout.clone();
-        if !descriptor.point_text {
-            layout = layout.with_max_height(bounds.height);
-        }
-        let rectangular = layout.clone();
         if let Some(contour) = &descriptor.balloon_contour {
             let [top, _, _, left] = descriptor.text_inset;
             let contour = contour.iter().map(|&(x, y)| (x - left, y - top)).collect();
@@ -262,29 +238,6 @@ impl TextRenderer {
                 entity: descriptor.entity,
                 source,
             })?;
-        // A balloon share can be too small or too narrow for its text (for example a stray
-        // fragment sharing a balloon with the main dialogue). Instead of keeping the
-        // overflowing layout, retry against the plain cell rectangle, then against the cell
-        // width alone so the text stays readable and never piles up on itself.
-        let layout = if is_bubble_text
-            && descriptor.auto_fit
-            && !descriptor.point_text
-            && layout.overflowed()
-        {
-            let mut fallback = None;
-            for base in [rectangular, width_only] {
-                let builder = finish_rectangular(base, descriptor, maximum, minimum);
-                if let Ok(run) = self.layout(&builder, &descriptor.text)
-                    && !run.overflowed()
-                {
-                    fallback = Some(run);
-                    break;
-                }
-            }
-            fallback.unwrap_or(layout)
-        } else {
-            layout
-        };
         let (mut x, mut y) = if descriptor.point_text {
             (bounds.x, bounds.y)
         } else {
