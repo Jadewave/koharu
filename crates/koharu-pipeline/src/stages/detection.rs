@@ -48,6 +48,9 @@ const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
+// Bubble confidence threshold used when settings do not store one; lower than the model's
+// recommended value so faint or stylized bubbles are still detected.
+const DEFAULT_BUBBLE_THRESHOLD: f32 = 0.35;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default)]
@@ -145,7 +148,7 @@ impl Model {
         let network = KoharuLayoutRFDetrSeg2XL::load(device).await?;
         let mut thresholds = network.recommended_thresholds();
         thresholds.text = config.text_threshold.unwrap_or(thresholds.text);
-        thresholds.bubble = config.bubble_threshold.unwrap_or(thresholds.bubble);
+        thresholds.bubble = config.bubble_threshold.unwrap_or(DEFAULT_BUBBLE_THRESHOLD);
         thresholds.panel = config.panel_threshold.unwrap_or(thresholds.panel);
         Ok(Self {
             network: Arc::new(Mutex::new(network)),
@@ -409,8 +412,8 @@ fn write_region<'a>(
             font_style: None,
             size: None,
             auto_fit: true,
-            // Outlines are never generated. Text that originally had a dark outline (usually
-            // light text) falls back to the default color so it stays readable without one.
+            // Outlines are never generated. Light text that originally had a dark outline
+            // falls back to the default color so it stays readable without one.
             color: inferred
                 .filter(|value| !had_dark_outline(value))
                 .map(|value| [value.color[0], value.color[1], value.color[2], u8::MAX]),
@@ -1267,10 +1270,17 @@ fn median_color(colors: &[[u8; 3]]) -> [u8; 3] {
     std::array::from_fn(|channel| histogram_median(&histograms[channel], colors.len()))
 }
 
+/// Fill luminance (on `color_luminance`'s 0..=255*256 scale) from which text counts as
+/// light enough to need its outline to stay readable.
+const LIGHT_TEXT_LUMINANCE: u32 = 200 * 256;
+
+/// True for light text (white, pale yellow, ...) that had a darker outline. Colored text such
+/// as blue or red keeps its color even when it had an outline.
 fn had_dark_outline(inferred: &InferredTypography) -> bool {
-    inferred
-        .stroke_color
-        .is_some_and(|stroke| color_luminance(stroke) < color_luminance(inferred.color))
+    color_luminance(inferred.color) >= LIGHT_TEXT_LUMINANCE
+        && inferred
+            .stroke_color
+            .is_some_and(|stroke| color_luminance(stroke) < color_luminance(inferred.color))
 }
 
 fn color_distance_squared(left: [u8; 3], right: [u8; 3]) -> u32 {
@@ -2722,4 +2732,4 @@ mod tests {
 
         assert!(color_palette(&pixels).len() <= 16 * 16 * 16);
     }
-}
+            }
