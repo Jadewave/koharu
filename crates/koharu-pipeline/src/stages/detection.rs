@@ -48,11 +48,6 @@ const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
-// Bubble confidence threshold used when settings do not store one; lower than the model's
-// recommended value so faint or stylized bubbles are still detected.
-const DEFAULT_BUBBLE_THRESHOLD: f32 = 0.35;
-// A text box lying at least this far inside a larger text box is a fragment of the same text.
-const NESTED_TEXT_CONTAINMENT: f32 = 0.8;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default)]
@@ -150,7 +145,7 @@ impl Model {
         let network = KoharuLayoutRFDetrSeg2XL::load(device).await?;
         let mut thresholds = network.recommended_thresholds();
         thresholds.text = config.text_threshold.unwrap_or(thresholds.text);
-        thresholds.bubble = config.bubble_threshold.unwrap_or(DEFAULT_BUBBLE_THRESHOLD);
+        thresholds.bubble = config.bubble_threshold.unwrap_or(thresholds.bubble);
         thresholds.panel = config.panel_threshold.unwrap_or(thresholds.panel);
         Ok(Self {
             network: Arc::new(Mutex::new(network)),
@@ -281,7 +276,6 @@ async fn write_page(
         detections.retain(|detection| intersects(detection.bbox, region));
     }
     non_maximum_suppression(&mut detections, 0.5);
-    suppress_nested_text(&mut detections, NESTED_TEXT_CONTAINMENT);
     sort_by_layout(&mut detections);
 
     let image = image.to_rgb8();
@@ -415,8 +409,8 @@ fn write_region<'a>(
             font_style: None,
             size: None,
             auto_fit: true,
-            // Outlines are never generated. Light text that originally had a dark outline
-            // falls back to the default color so it stays readable without one.
+            // Outlines are never generated. Text that originally had a dark outline (usually
+            // light text) falls back to the default color so it stays readable without one.
             color: inferred
                 .filter(|value| !had_dark_outline(value))
                 .map(|value| [value.color[0], value.color[1], value.color[2], u8::MAX]),
@@ -1273,17 +1267,10 @@ fn median_color(colors: &[[u8; 3]]) -> [u8; 3] {
     std::array::from_fn(|channel| histogram_median(&histograms[channel], colors.len()))
 }
 
-/// Fill luminance (on `color_luminance`'s 0..=255*256 scale) from which text counts as
-/// light enough to need its outline to stay readable.
-const LIGHT_TEXT_LUMINANCE: u32 = 200 * 256;
-
-/// True for light text (white, pale yellow, ...) that had a darker outline. Colored text such
-/// as blue or red keeps its color even when it had an outline.
 fn had_dark_outline(inferred: &InferredTypography) -> bool {
-    color_luminance(inferred.color) >= LIGHT_TEXT_LUMINANCE
-        && inferred
-            .stroke_color
-            .is_some_and(|stroke| color_luminance(stroke) < color_luminance(inferred.color))
+    inferred
+        .stroke_color
+        .is_some_and(|stroke| color_luminance(stroke) < color_luminance(inferred.color))
 }
 
 fn color_distance_squared(left: [u8; 3], right: [u8; 3]) -> u32 {
@@ -1662,7 +1649,7 @@ fn non_maximum_suppression(detections: &mut Vec<KoharuLayoutDetection>, threshol
     for candidate in detections.drain(..) {
         let suppressed = kept.iter().any(|existing: &KoharuLayoutDetection| {
             existing.label == candidate.label
-                && intersection_over_union(existing.bbox, candidate.bbox) >= threshold
+                && suppression_overlap(existing, &candidate) >= threshold
         });
         if !suppressed {
             kept.push(candidate);
@@ -1671,31 +1658,58 @@ fn non_maximum_suppression(detections: &mut Vec<KoharuLayoutDetection>, threshol
     *detections = kept;
 }
 
-/// IoU-based suppression misses a small box lying inside a larger one. For text, such a box
-/// duplicates part of the larger box, so only the larger text box is kept.
-fn suppress_nested_text(detections: &mut Vec<KoharuLayoutDetection>, containment: f32) {
-    let boxes = detections
-        .iter()
-        .map(|detection| (detection.label == "text", detection.bbox))
-        .collect::<Vec<_>>();
-    let mut index = 0;
-    detections.retain(|detection| {
-        let current = index;
-        index += 1;
-        if detection.label != "text" {
-            return true;
+/// Bubble regions are instance-segmentation results, so rectangle IoU alone is
+/// not a reliable duplicate test: two neighboring/irregular bubbles can have
+/// heavily overlapping bounding boxes while their actual masks do not overlap.
+/// Keep bbox-based NMS for other labels and use mask IoU for valid bubble masks.
+fn suppression_overlap(left: &KoharuLayoutDetection, right: &KoharuLayoutDetection) -> f32 {
+    if left.label == "bubble" {
+        mask_intersection_over_union(&left.mask, &right.mask)
+            .unwrap_or_else(|| intersection_over_union(left.bbox, right.bbox))
+    } else {
+        intersection_over_union(left.bbox, right.bbox)
+    }
+}
+
+/// Returns `None` if either mask is malformed or empty, allowing NMS to fall
+/// back to bbox IoU instead of accidentally treating unusable masks as disjoint.
+fn mask_intersection_over_union(left: &KoharuLayoutMask, right: &KoharuLayoutMask) -> Option<f32> {
+    if !valid_mask(left) || !valid_mask(right) {
+        return None;
+    }
+
+    let left_area = left.pixels.iter().filter(|&&pixel| pixel != 0).count();
+    let right_area = right.pixels.iter().filter(|&&pixel| pixel != 0).count();
+    if left_area == 0 || right_area == 0 {
+        return None;
+    }
+
+    let left_right = left.x.saturating_add(left.width);
+    let right_right = right.x.saturating_add(right.width);
+    let left_bottom = left.y.saturating_add(left.height);
+    let right_bottom = right.y.saturating_add(right.height);
+    let x_start = left.x.max(right.x);
+    let y_start = left.y.max(right.y);
+    let x_end = left_right.min(right_right);
+    let y_end = left_bottom.min(right_bottom);
+
+    let mut intersection = 0usize;
+    if x_start < x_end && y_start < y_end {
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                if left.contains(x, y) && right.contains(x, y) {
+                    intersection += 1;
+                }
+            }
         }
-        let own = area(detection.bbox);
-        if own <= 0.0 {
-            return true;
-        }
-        !boxes.iter().enumerate().any(|(other, (is_text, bbox))| {
-            other != current
-                && *is_text
-                && area(*bbox) > own
-                && intersection_area(detection.bbox, *bbox) / own >= containment
-        })
-    });
+    }
+
+    let union = left_area + right_area - intersection;
+    if union == 0 {
+        None
+    } else {
+        Some(intersection as f32 / union as f32)
+    }
 }
 
 fn sort_by_layout(detections: &mut Vec<KoharuLayoutDetection>) {
@@ -1892,11 +1906,11 @@ mod tests {
     };
 
     use super::{
-        DIALOGUE_MASK_CONTAINMENT_THRESHOLD, NESTED_TEXT_CONTAINMENT, DetectedRegion, DetectedText, DetectionModel,
+        DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectedRegion, DetectedText, DetectionModel,
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
         StageInput, StageProcessor, closed_mask_for, color_palette, generation, infer_typography,
         layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
-        non_maximum_suppression, normalize_text_color, suppress_nested_text, write_region,
+        non_maximum_suppression, normalize_text_color, write_region,
     };
 
     #[test]
@@ -2339,22 +2353,54 @@ mod tests {
     }
 
     #[test]
-    fn nested_text_boxes_keep_only_the_larger_box() {
+    fn bubble_nms_uses_mask_iou_instead_of_overlapping_bounding_boxes() {
+        let make_bubble = |score: f32, x: u32, y: u32| KoharuLayoutDetection {
+            label_id: 2,
+            label: "bubble".to_owned(),
+            score,
+            // Deliberately overlapping model boxes; the instance masks are separate.
+            bbox: [0.0, 0.0, 100.0, 100.0],
+            area: 100,
+            mask: KoharuLayoutMask {
+                x,
+                y,
+                width: 10,
+                height: 10,
+                pixels: vec![u8::MAX; 100],
+            },
+        };
+        let mut detections = vec![make_bubble(0.9, 0, 0), make_bubble(0.8, 90, 90)];
+
+        non_maximum_suppression(&mut detections, 0.5);
+
+        assert_eq!(detections.len(), 2, "disjoint bubble masks must both survive NMS");
+    }
+
+    #[test]
+    fn bubble_nms_still_removes_duplicate_masks() {
+        let make_bubble = |score: f32, bbox: [f32; 4]| KoharuLayoutDetection {
+            label_id: 2,
+            label: "bubble".to_owned(),
+            score,
+            bbox,
+            area: 100,
+            mask: KoharuLayoutMask {
+                x: 10,
+                y: 10,
+                width: 10,
+                height: 10,
+                pixels: vec![u8::MAX; 100],
+            },
+        };
         let mut detections = vec![
-            detection("text", 0.9, [0.0, 0.0, 100.0, 100.0]),
-            detection("text", 0.5, [20.0, 20.0, 80.0, 80.0]),
-            detection("text", 0.8, [90.0, 10.0, 150.0, 60.0]),
-            detection("text", 0.7, [300.0, 0.0, 350.0, 50.0]),
-            detection("bubble", 0.6, [30.0, 30.0, 70.0, 70.0]),
+            make_bubble(0.9, [0.0, 0.0, 100.0, 100.0]),
+            make_bubble(0.8, [30.0, 30.0, 130.0, 130.0]),
         ];
 
-        suppress_nested_text(&mut detections, NESTED_TEXT_CONTAINMENT);
+        non_maximum_suppression(&mut detections, 0.5);
 
-        let scores = detections
-            .iter()
-            .map(|detection| detection.score)
-            .collect::<Vec<_>>();
-        assert_eq!(scores, [0.9, 0.8, 0.7, 0.6]);
+        assert_eq!(detections.len(), 1, "duplicate bubble masks should be suppressed");
+        assert_eq!(detections[0].score, 0.9);
     }
 
     #[test]
