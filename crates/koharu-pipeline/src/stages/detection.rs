@@ -51,6 +51,8 @@ const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
 // Bubble confidence threshold used when settings do not store one; lower than the model's
 // recommended value so faint or stylized bubbles are still detected.
 const DEFAULT_BUBBLE_THRESHOLD: f32 = 0.35;
+// A text box lying at least this far inside a larger text box is a fragment of the same text.
+const NESTED_TEXT_CONTAINMENT: f32 = 0.8;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default)]
@@ -279,6 +281,7 @@ async fn write_page(
         detections.retain(|detection| intersects(detection.bbox, region));
     }
     non_maximum_suppression(&mut detections, 0.5);
+    suppress_nested_text(&mut detections, NESTED_TEXT_CONTAINMENT);
     sort_by_layout(&mut detections);
 
     let image = image.to_rgb8();
@@ -1668,6 +1671,33 @@ fn non_maximum_suppression(detections: &mut Vec<KoharuLayoutDetection>, threshol
     *detections = kept;
 }
 
+/// IoU-based suppression misses a small box lying inside a larger one. For text, such a box
+/// duplicates part of the larger box, so only the larger text box is kept.
+fn suppress_nested_text(detections: &mut Vec<KoharuLayoutDetection>, containment: f32) {
+    let boxes = detections
+        .iter()
+        .map(|detection| (detection.label == "text", detection.bbox))
+        .collect::<Vec<_>>();
+    let mut index = 0;
+    detections.retain(|detection| {
+        let current = index;
+        index += 1;
+        if detection.label != "text" {
+            return true;
+        }
+        let own = area(detection.bbox);
+        if own <= 0.0 {
+            return true;
+        }
+        !boxes.iter().enumerate().any(|(other, (is_text, bbox))| {
+            other != current
+                && *is_text
+                && area(*bbox) > own
+                && intersection_area(detection.bbox, *bbox) / own >= containment
+        })
+    });
+}
+
 fn sort_by_layout(detections: &mut Vec<KoharuLayoutDetection>) {
     let order = layout_order(detections);
     let mut values = std::mem::take(detections)
@@ -1862,11 +1892,11 @@ mod tests {
     };
 
     use super::{
-        DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectedRegion, DetectedText, DetectionModel,
+        DIALOGUE_MASK_CONTAINMENT_THRESHOLD, NESTED_TEXT_CONTAINMENT, DetectedRegion, DetectedText, DetectionModel,
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
         StageInput, StageProcessor, closed_mask_for, color_palette, generation, infer_typography,
         layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
-        non_maximum_suppression, normalize_text_color, write_region,
+        non_maximum_suppression, normalize_text_color, suppress_nested_text, write_region,
     };
 
     #[test]
@@ -2309,6 +2339,25 @@ mod tests {
     }
 
     #[test]
+    fn nested_text_boxes_keep_only_the_larger_box() {
+        let mut detections = vec![
+            detection("text", 0.9, [0.0, 0.0, 100.0, 100.0]),
+            detection("text", 0.5, [20.0, 20.0, 80.0, 80.0]),
+            detection("text", 0.8, [90.0, 10.0, 150.0, 60.0]),
+            detection("text", 0.7, [300.0, 0.0, 350.0, 50.0]),
+            detection("bubble", 0.6, [30.0, 30.0, 70.0, 70.0]),
+        ];
+
+        suppress_nested_text(&mut detections, NESTED_TEXT_CONTAINMENT);
+
+        let scores = detections
+            .iter()
+            .map(|detection| detection.score)
+            .collect::<Vec<_>>();
+        assert_eq!(scores, [0.9, 0.8, 0.7, 0.6]);
+    }
+
+    #[test]
     fn text_mask_excludes_onomatopoeia() {
         let detection = |label: &str, x: u32, value: u8| KoharuLayoutDetection {
             label_id: 0,
@@ -2732,4 +2781,4 @@ mod tests {
 
         assert!(color_palette(&pixels).len() <= 16 * 16 * 16);
     }
-            }
+}
