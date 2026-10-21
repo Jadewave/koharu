@@ -409,13 +409,15 @@ fn write_region<'a>(
             font_style: None,
             size: None,
             auto_fit: true,
-            // Outlines are never generated. Text that originally had a dark outline (usually
-            // light text) falls back to the default color so it stays readable without one.
-            color: inferred
-                .filter(|value| !had_dark_outline(value))
-                .map(|value| [value.color[0], value.color[1], value.color[2], u8::MAX]),
-            stroke_color: None,
-            stroke_width: None,
+            // Keep the inferred fill and outline together. Dropping a fill merely because
+            // its outline is darker turns colored dialogue into the renderer's black default.
+            color: inferred.map(|value| {
+                [value.color[0], value.color[1], value.color[2], u8::MAX]
+            }),
+            stroke_color: inferred
+                .and_then(|value| value.stroke_color)
+                .map(|color| [color[0], color[1], color[2], u8::MAX]),
+            stroke_width: inferred.and_then(|value| value.stroke_width),
             alignment: None,
             writing_mode: inferred.map(|value| value.writing_mode),
             extensions: Default::default(),
@@ -1267,12 +1269,6 @@ fn median_color(colors: &[[u8; 3]]) -> [u8; 3] {
     std::array::from_fn(|channel| histogram_median(&histograms[channel], colors.len()))
 }
 
-fn had_dark_outline(inferred: &InferredTypography) -> bool {
-    inferred
-        .stroke_color
-        .is_some_and(|stroke| color_luminance(stroke) < color_luminance(inferred.color))
-}
-
 fn color_distance_squared(left: [u8; 3], right: [u8; 3]) -> u32 {
     left.into_iter()
         .zip(right)
@@ -1282,6 +1278,15 @@ fn color_distance_squared(left: [u8; 3], right: [u8; 3]) -> u32 {
 }
 
 fn normalize_text_color(color: [u8; 3]) -> [u8; 3] {
+    // Snap near-neutral dark/light antialiasing colors, but preserve saturated hues
+    // such as red and pink even when their computed luminance is low.
+    let darkest = color[0].min(color[1]).min(color[2]);
+    let brightest = color[0].max(color[1]).max(color[2]);
+    let is_neutral = u16::from(brightest) - u16::from(darkest) <= 32;
+    if !is_neutral {
+        return color;
+    }
+
     let luminance = color_luminance(color);
     if luminance <= COLOR_SNAP_DARK_LUMINANCE {
         [0, 0, 0]
@@ -2710,10 +2715,11 @@ mod tests {
     }
 
     #[test]
-    fn text_colors_snap_only_at_luminance_extremes() {
+    fn text_colors_preserve_hues_and_snap_neutral_tones_at_luminance_extremes() {
         assert_eq!(normalize_text_color([20, 31, 24]), [0, 0, 0]);
         assert_eq!(normalize_text_color([230, 240, 250]), [255, 255, 255]);
-        assert_eq!(normalize_text_color([255, 0, 0]), [0, 0, 0]);
+        assert_eq!(normalize_text_color([255, 0, 0]), [255, 0, 0]);
+        assert_eq!(normalize_text_color([245, 75, 165]), [245, 75, 165]);
         assert_eq!(normalize_text_color([0, 255, 0]), [0, 255, 0]);
         assert_eq!(normalize_text_color([20, 115, 235]), [20, 115, 235]);
         assert_eq!(normalize_text_color([40, 70, 40]), [0, 0, 0]);
