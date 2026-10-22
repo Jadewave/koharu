@@ -101,11 +101,12 @@ pub(crate) fn salvage_translations(
             if !rest.starts_with('{') {
                 break;
             }
-            let mut deserializer = serde_json::Deserializer::from_str(rest);
-            let Ok(segment) = TranslationOutputSegment::deserialize(&mut deserializer) else {
+            let mut stream =
+                serde_json::Deserializer::from_str(rest).into_iter::<TranslationOutputSegment>();
+            let Some(Ok(segment)) = stream.next() else {
                 break;
             };
-            let consumed = deserializer.byte_offset();
+            let consumed = stream.byte_offset();
             if segment.id < translations.len() && !translated[segment.id] {
                 translations[segment.id] = segment.text;
                 translated[segment.id] = true;
