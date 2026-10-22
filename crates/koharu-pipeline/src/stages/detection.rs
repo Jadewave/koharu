@@ -47,6 +47,11 @@ const COLOR_CLUSTER_MIN_DISTANCE_SQUARED: u32 = 32 * 32;
 const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
+// An outline's fill has to be clearly different from the background. A color close to it
+// (a dark halo or the gaps inside glyphs of bright text on dark artwork) cannot be told
+// apart from the background, and accepting it turns the bright glyph into an "outline"
+// around a dark "fill", which then becomes the text color.
+const OUTLINE_FILL_MIN_BACKGROUND_DISTANCE_SQUARED: u32 = 64 * 64;
 // An outline counts as black only when its measured colour is essentially #000000.
 // A merely dark halo (for example dark purple around pink text) must not qualify, and
 // normalize_text_color would snap such a halo to black.
@@ -828,7 +833,7 @@ fn infer_outline(
             let contrast = color_distance_squared(fill_color, stroke_color);
             if contrast < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
                 || color_distance_squared(fill_color, background)
-                    < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
+                    < OUTLINE_FILL_MIN_BACKGROUND_DISTANCE_SQUARED
                 || color_distance_squared(stroke_color, background)
                     < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
                 || color_lies_between(stroke_color, fill_color, background)
@@ -2789,6 +2794,20 @@ mod tests {
     }
 
     #[test]
+    fn a_fill_close_to_the_background_does_not_replace_a_bright_glyph_color() {
+        // Bright pink glyph strokes around dark gaps on a dark background: the dark gaps
+        // are not the paint.
+        let (image, detection) =
+            outlined_text_on_background(3, [44, 0, 34], [255, 105, 180], [20, 32, 45]);
+
+        let inferred = infer_typography(&image, &detection).unwrap();
+
+        assert_eq!(inferred.color, [255, 105, 180]);
+        assert_eq!(inferred.stroke_color, None);
+        assert_eq!(inferred.stroke_width, None);
+    }
+
+    #[test]
     fn outlined_text_is_separated_from_matching_dark_artwork() {
         let (image, detection) = outlined_text_on_textured_background();
 
@@ -2860,4 +2879,4 @@ mod tests {
 
         assert!(color_palette(&pixels).len() <= 16 * 16 * 16);
     }
-    }
+        }
