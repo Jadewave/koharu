@@ -47,6 +47,10 @@ const COLOR_CLUSTER_MIN_DISTANCE_SQUARED: u32 = 32 * 32;
 const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
+// An outline counts as black only when its measured colour is essentially #000000.
+// A merely dark halo (for example dark purple around pink text) must not qualify, and
+// normalize_text_color would snap such a halo to black.
+const BLACK_OUTLINE_MAX_CHANNEL: u8 = 10;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
 // Confidence thresholds used when the configuration leaves one unset.
 const DEFAULT_TEXT_THRESHOLD: f32 = 0.2;
@@ -724,7 +728,7 @@ fn infer_text_paint(
         // The original outline is never reproduced, so no stroke is returned.
         // Text whose original outline is pure black is rendered black; any other
         // outlined text keeps its inferred fill.
-        let color = if outline.stroke_color == [0, 0, 0] {
+        let color = if outline.black_stroke {
             [0, 0, 0]
         } else {
             outline.fill_color
@@ -765,7 +769,7 @@ fn infer_text_paint(
 #[derive(Clone, Copy)]
 struct OutlinePaint {
     fill_color: [u8; 3],
-    stroke_color: [u8; 3],
+    black_stroke: bool,
     score: u64,
 }
 
@@ -852,7 +856,9 @@ fn infer_outline(
             let evidence = enclosed_fill.len() + inside_fill;
             let candidate = OutlinePaint {
                 fill_color: normalized_fill,
-                stroke_color: normalized_stroke,
+                black_stroke: stroke_color
+                    .iter()
+                    .all(|channel| *channel <= BLACK_OUTLINE_MAX_CHANNEL),
                 score: u64::from(contrast) * evidence.min(4096) as u64,
             };
             if best.is_none_or(|current: OutlinePaint| candidate.score > current.score) {
@@ -2771,6 +2777,18 @@ mod tests {
     }
 
     #[test]
+    fn a_dark_but_not_black_outline_keeps_the_colored_fill() {
+        // Pink text with a dark purple halo, as in a pink dialogue line on dark artwork.
+        let (image, detection) = outlined_text(3, [255, 105, 180], [31, 18, 39]);
+
+        let inferred = infer_typography(&image, &detection).unwrap();
+
+        assert_eq!(inferred.color, [255, 105, 180]);
+        assert_eq!(inferred.stroke_color, None);
+        assert_eq!(inferred.stroke_width, None);
+    }
+
+    #[test]
     fn outlined_text_is_separated_from_matching_dark_artwork() {
         let (image, detection) = outlined_text_on_textured_background();
 
@@ -2842,4 +2860,4 @@ mod tests {
 
         assert!(color_palette(&pixels).len() <= 16 * 16 * 16);
     }
-}
+    }
