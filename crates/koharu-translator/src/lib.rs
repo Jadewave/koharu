@@ -4,6 +4,7 @@ mod backend;
 mod error;
 mod language;
 mod local;
+mod loop_guard;
 mod model;
 mod prompt;
 mod provider;
@@ -137,15 +138,9 @@ impl Translator {
         }
 
         let expected = request.segments.len();
-        let translated = if provider == Provider::Local {
-            self.local(selection)
-                .await?
-                .translate(request, generation)
-                .await?
-        } else {
-            let providers = self.providers.read()?.clone();
-            remote::translate(&self.client, &providers, selection, &generation, &request).await?
-        };
+        let translated = self
+            .translate_segments(selection, generation, &request)
+            .await?;
         if translated.len() != expected {
             return Err(Error::SegmentCount {
                 provider: provider_id,
@@ -156,6 +151,110 @@ impl Translator {
         }
         tracing::Span::current().record("outcome", "completed");
         Ok((provider_id, translated))
+    }
+
+    /// Translates every segment. With reasoning enabled the first pass runs with reasoning;
+    /// segments that come back looping (or never come back because the response was cut
+    /// off) are translated again with reasoning disabled, and only those segments.
+    async fn translate_segments(
+        &self,
+        selection: &ModelSelection,
+        generation: GenerationConfig,
+        request: &TranslationRequest,
+    ) -> anyhow::Result<Vec<String>> {
+        if generation.reasoning != Some(true) {
+            return self.dispatch(selection, generation, request).await;
+        }
+
+        let total = request.segments.len();
+        let (mut translated, redo) = match self.dispatch(selection, generation, request).await {
+            Ok(translated) => {
+                if translated.len() != total {
+                    return Ok(translated);
+                }
+                let redo = loop_guard::looping_segments(&request.segments, &translated);
+                (translated, redo)
+            }
+            Err(error) if retryable(&error) => {
+                let (translated, mut redo) = match invalid_output(&error) {
+                    Some(output) => {
+                        prompt::salvage_translations(&output.response, &request.segments)
+                    }
+                    None => (request.segments.clone(), (0..total).collect()),
+                };
+                for index in loop_guard::looping_segments(&request.segments, &translated) {
+                    if !redo.contains(&index) {
+                        redo.push(index);
+                    }
+                }
+                redo.sort_unstable();
+                tracing::warn!(
+                    %error,
+                    redo = redo.len(),
+                    total,
+                    "reasoning pass failed; translating unrecovered segments without reasoning"
+                );
+                (translated, redo)
+            }
+            Err(error) => return Err(error),
+        };
+        if redo.is_empty() {
+            return Ok(translated);
+        }
+
+        tracing::warn!(
+            looping = redo.len(),
+            total,
+            "reasoning pass produced looping segments; translating them again without reasoning"
+        );
+        let mut retry = request.clone();
+        retry.segments = redo
+            .iter()
+            .map(|&index| request.segments[index].clone())
+            .collect();
+        let without_reasoning = GenerationConfig {
+            reasoning: Some(false),
+            ..generation
+        };
+        let retried = self.dispatch(selection, without_reasoning, &retry).await?;
+        if retried.len() != redo.len() {
+            let provider: &'static str = selection.provider.into();
+            return Err(Error::SegmentCount {
+                provider,
+                expected: redo.len(),
+                actual: retried.len(),
+            }
+            .into());
+        }
+        for (&index, text) in redo.iter().zip(retried) {
+            translated[index] = text;
+        }
+        let remaining = loop_guard::looping_segments(&request.segments, &translated);
+        if !remaining.is_empty() {
+            tracing::warn!(
+                remaining = remaining.len(),
+                "segments still look like loops after retrying without reasoning"
+            );
+        }
+        Ok(translated)
+    }
+
+    async fn dispatch(
+        &self,
+        selection: &ModelSelection,
+        generation: GenerationConfig,
+        request: &TranslationRequest,
+    ) -> anyhow::Result<Vec<String>> {
+        if selection.provider == Provider::Local {
+            Ok(self
+                .local(selection)
+                .await?
+                .translate(request.clone(), generation)
+                .await?)
+        } else {
+            let providers = self.providers.read()?.clone();
+            Ok(remote::translate(&self.client, &providers, selection, &generation, request).await?)
+        }
     }
 
     #[tracing::instrument(skip_all)]
@@ -197,9 +296,46 @@ impl Translator {
     }
 }
 
+/// Finds the raw response of an unparsable translation, however the error was wrapped.
+fn invalid_output(error: &anyhow::Error) -> Option<&prompt::InvalidTranslationOutput> {
+    error
+        .downcast_ref::<prompt::InvalidTranslationOutput>()
+        .or_else(|| match error.downcast_ref::<Error>() {
+            Some(Error::Other(inner)) => inner.downcast_ref::<prompt::InvalidTranslationOutput>(),
+            _ => None,
+        })
+}
+
+/// Errors that retrying without reasoning cannot fix (quota, rejected request, language).
+fn retryable(error: &anyhow::Error) -> bool {
+    !matches!(
+        error.downcast_ref::<Error>(),
+        Some(
+            Error::QuotaExceeded { .. }
+                | Error::Api { .. }
+                | Error::UnsupportedLanguage { .. }
+                | Error::UnsupportedSourceLanguage { .. }
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_output_is_found_through_the_error_wrapper() {
+        let source = ["a".to_owned()];
+        let response = r#"{"translations":[{"id":0,"text":"x"#;
+        let failure = prompt::translations("test", response, &source).unwrap_err();
+        let error = anyhow::Error::from(Error::Other(failure));
+        assert!(invalid_output(&error).is_some());
+        assert!(retryable(&error));
+
+        let quota = anyhow::Error::from(Error::QuotaExceeded { provider: "test" });
+        assert!(invalid_output(&quota).is_none());
+        assert!(!retryable(&quota));
+    }
 
     fn local_selection(model: &str) -> ModelSelection {
         ModelSelection {
