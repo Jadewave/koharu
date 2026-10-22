@@ -39,11 +39,14 @@ pub(crate) fn parse_translations(
     source_segments: &[String],
 ) -> anyhow::Result<(Vec<String>, Vec<usize>)> {
     let output = serde_json::from_str::<TranslationOutput>(text).with_context(|| {
-        format!(
-            "{provider} returned invalid translation JSON for {} segments; response was: {}",
-            source_segments.len(),
-            snippet(text),
-        )
+        InvalidTranslationOutput {
+            message: format!(
+                "{provider} returned invalid translation JSON for {} segments; response was: {}",
+                source_segments.len(),
+                snippet(text),
+            ),
+            response: text.to_owned(),
+        }
     })?;
     let mut translations = source_segments.to_vec();
     let mut translated = vec![false; source_segments.len()];
@@ -61,6 +64,62 @@ pub(crate) fn parse_translations(
         .filter_map(|(index, done)| (!done).then_some(index))
         .collect();
     Ok((translations, missing))
+}
+
+/// Context attached to a response that is not valid translation JSON. It keeps the raw
+/// response so callers can still recover the segments written before the model was cut
+/// off (typically by a repetition loop that ran into the token limit).
+#[derive(Debug)]
+pub(crate) struct InvalidTranslationOutput {
+    message: String,
+    pub(crate) response: String,
+}
+
+impl std::fmt::Display for InvalidTranslationOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// Reads whatever complete `{"id", "text"}` objects a truncated or malformed response
+/// holds. Returns the translations (source text for anything not recovered) and the
+/// indices that were not recovered. Never fails: an unusable response recovers nothing.
+pub(crate) fn salvage_translations(
+    text: &str,
+    source_segments: &[String],
+) -> (Vec<String>, Vec<usize>) {
+    let mut translations = source_segments.to_vec();
+    let mut translated = vec![false; source_segments.len()];
+
+    let array = text
+        .find("\"translations\"")
+        .and_then(|key| text[key..].find('[').map(|offset| key + offset + 1));
+    if let Some(start) = array {
+        let mut rest = &text[start..];
+        loop {
+            rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+            if !rest.starts_with('{') {
+                break;
+            }
+            let mut deserializer = serde_json::Deserializer::from_str(rest);
+            let Ok(segment) = TranslationOutputSegment::deserialize(&mut deserializer) else {
+                break;
+            };
+            let consumed = deserializer.byte_offset();
+            if segment.id < translations.len() && !translated[segment.id] {
+                translations[segment.id] = segment.text;
+                translated[segment.id] = true;
+            }
+            rest = &rest[consumed..];
+        }
+    }
+
+    let missing = translated
+        .iter()
+        .enumerate()
+        .filter_map(|(index, done)| (!done).then_some(index))
+        .collect();
+    (translations, missing)
 }
 
 /// Keeps a model response readable in a log line without truncating so hard
@@ -390,6 +449,38 @@ mod tests {
         let prompt = translation_system_prompt(&request);
         assert!(prompt.contains("attached original page image"));
         assert!(prompt.contains("Translate only the supplied segments"));
+    }
+
+    #[test]
+    fn salvage_keeps_complete_segments_from_a_truncated_response() {
+        let sources = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let text = r#"{"translations":[{"id":0,"text":"Xin chào"},{"id":1,"text":"lặp lặp lặp lặp"#;
+
+        let (translations, missing) = salvage_translations(text, &sources);
+
+        assert_eq!(translations, ["Xin chào", "b", "c"]);
+        assert_eq!(missing, [1, 2]);
+    }
+
+    #[test]
+    fn salvage_recovers_nothing_from_unusable_text() {
+        let sources = vec!["a".to_owned(), "b".to_owned()];
+        for text in ["", "not json", r#"{"translations":"#, r#"{"translations":[{"id":0"#] {
+            let (translations, missing) = salvage_translations(text, &sources);
+            assert_eq!(translations, ["a", "b"], "{text}");
+            assert_eq!(missing, [0, 1], "{text}");
+        }
+    }
+
+    #[test]
+    fn invalid_output_keeps_the_raw_response() {
+        let sources = vec!["a".to_owned()];
+        let response = r#"{"translations":[{"id":0,"text":"cut"#;
+        let error = translations("test", response, &sources).unwrap_err();
+        let invalid = error
+            .downcast_ref::<InvalidTranslationOutput>()
+            .expect("typed context");
+        assert_eq!(invalid.response, response);
     }
 
     #[test]
