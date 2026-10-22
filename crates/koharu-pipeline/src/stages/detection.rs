@@ -47,7 +47,20 @@ const COLOR_CLUSTER_MIN_DISTANCE_SQUARED: u32 = 32 * 32;
 const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
+// An outline's fill has to be clearly different from the background. A color close to it
+// (a dark halo or the gaps inside glyphs of bright text on dark artwork) cannot be told
+// apart from the background, and accepting it turns the bright glyph into an "outline"
+// around a dark "fill", which then becomes the text color.
+const OUTLINE_FILL_MIN_BACKGROUND_DISTANCE_SQUARED: u32 = 64 * 64;
+// An outline counts as black only when its measured colour is essentially #000000.
+// A merely dark halo (for example dark purple around pink text) must not qualify, and
+// normalize_text_color would snap such a halo to black.
+const BLACK_OUTLINE_MAX_CHANNEL: u8 = 10;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
+// Confidence thresholds used when the configuration leaves one unset.
+const DEFAULT_TEXT_THRESHOLD: f32 = 0.2;
+const DEFAULT_BUBBLE_THRESHOLD: f32 = 0.35;
+const DEFAULT_PANEL_THRESHOLD: f32 = 0.55;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default)]
@@ -144,9 +157,9 @@ impl Model {
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(config) = config;
         let network = KoharuLayoutRFDetrSeg2XL::load(device).await?;
         let mut thresholds = network.recommended_thresholds();
-        thresholds.text = config.text_threshold.unwrap_or(thresholds.text);
-        thresholds.bubble = config.bubble_threshold.unwrap_or(thresholds.bubble);
-        thresholds.panel = config.panel_threshold.unwrap_or(thresholds.panel);
+        thresholds.text = config.text_threshold.unwrap_or(DEFAULT_TEXT_THRESHOLD);
+        thresholds.bubble = config.bubble_threshold.unwrap_or(DEFAULT_BUBBLE_THRESHOLD);
+        thresholds.panel = config.panel_threshold.unwrap_or(DEFAULT_PANEL_THRESHOLD);
         Ok(Self {
             network: Arc::new(Mutex::new(network)),
             thresholds,
@@ -409,7 +422,12 @@ fn write_region<'a>(
             font_style: None,
             size: None,
             auto_fit: true,
-            color: inferred.map(|value| [value.color[0], value.color[1], value.color[2], u8::MAX]),
+            // The inferred fill is kept even when the source had an outline, because dropping
+            // it would turn colored dialogue into the renderer's black default. No stroke is
+            // inferred, so none is written.
+            color: inferred.map(|value| {
+                [value.color[0], value.color[1], value.color[2], u8::MAX]
+            }),
             stroke_color: inferred
                 .and_then(|value| value.stroke_color)
                 .map(|color| [color[0], color[1], color[2], u8::MAX]),
@@ -712,11 +730,15 @@ fn infer_text_paint(
 ) -> ([u8; 3], Option<[u8; 3]>, Option<f32>) {
     let clusters = color_clusters(pixels, background_seed);
     if let Some(outline) = infer_outline(&clusters, background_seed, width, height) {
-        return (
-            outline.fill_color,
-            Some(outline.stroke_color),
-            Some(outline.stroke_width),
-        );
+        // The original outline is never reproduced, so no stroke is returned.
+        // Text whose original outline is pure black is rendered black; any other
+        // outlined text keeps its inferred fill.
+        let color = if outline.black_stroke {
+            [0, 0, 0]
+        } else {
+            outline.fill_color
+        };
+        return (color, None, None);
     }
 
     let nonempty = clusters
@@ -752,8 +774,7 @@ fn infer_text_paint(
 #[derive(Clone, Copy)]
 struct OutlinePaint {
     fill_color: [u8; 3],
-    stroke_color: [u8; 3],
-    stroke_width: f32,
+    black_stroke: bool,
     score: u64,
 }
 
@@ -812,7 +833,7 @@ fn infer_outline(
             let contrast = color_distance_squared(fill_color, stroke_color);
             if contrast < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
                 || color_distance_squared(fill_color, background)
-                    < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
+                    < OUTLINE_FILL_MIN_BACKGROUND_DISTANCE_SQUARED
                 || color_distance_squared(stroke_color, background)
                     < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
                 || color_lies_between(stroke_color, fill_color, background)
@@ -826,11 +847,13 @@ fn infer_outline(
                 continue;
             }
 
-            let Some(stroke_width) =
-                measured_stroke_width(&stroke_pixels, &enclosed_fill, &outside, width, height)
-            else {
+            // The width itself is no longer used, but an outline still has to be
+            // measurable to count as one.
+            if measured_stroke_width(&stroke_pixels, &enclosed_fill, &outside, width, height)
+                .is_none()
+            {
                 continue;
-            };
+            }
             let inside_fill = enclosed_fill
                 .iter()
                 .filter(|pixel| pixel.inside_mask)
@@ -838,8 +861,9 @@ fn infer_outline(
             let evidence = enclosed_fill.len() + inside_fill;
             let candidate = OutlinePaint {
                 fill_color: normalized_fill,
-                stroke_color: normalized_stroke,
-                stroke_width,
+                black_stroke: stroke_color
+                    .iter()
+                    .all(|channel| *channel <= BLACK_OUTLINE_MAX_CHANNEL),
                 score: u64::from(contrast) * evidence.min(4096) as u64,
             };
             if best.is_none_or(|current: OutlinePaint| candidate.score > current.score) {
@@ -1274,6 +1298,15 @@ fn color_distance_squared(left: [u8; 3], right: [u8; 3]) -> u32 {
 }
 
 fn normalize_text_color(color: [u8; 3]) -> [u8; 3] {
+    // Snap near-neutral dark/light antialiasing colors, but preserve saturated hues
+    // such as red and pink even when their computed luminance is low.
+    let darkest = color[0].min(color[1]).min(color[2]);
+    let brightest = color[0].max(color[1]).max(color[2]);
+    let is_neutral = u16::from(brightest) - u16::from(darkest) <= 32;
+    if !is_neutral {
+        return color;
+    }
+
     let luminance = color_luminance(color);
     if luminance <= COLOR_SNAP_DARK_LUMINANCE {
         [0, 0, 0]
@@ -1641,13 +1674,67 @@ fn non_maximum_suppression(detections: &mut Vec<KoharuLayoutDetection>, threshol
     for candidate in detections.drain(..) {
         let suppressed = kept.iter().any(|existing: &KoharuLayoutDetection| {
             existing.label == candidate.label
-                && intersection_over_union(existing.bbox, candidate.bbox) >= threshold
+                && suppression_overlap(existing, &candidate) >= threshold
         });
         if !suppressed {
             kept.push(candidate);
         }
     }
     *detections = kept;
+}
+
+/// Bubble regions are instance-segmentation results, so rectangle IoU alone is
+/// not a reliable duplicate test: two neighboring/irregular bubbles can have
+/// heavily overlapping bounding boxes while their actual masks do not overlap.
+/// Keep bbox-based NMS for other labels and use mask IoU for valid bubble masks.
+fn suppression_overlap(left: &KoharuLayoutDetection, right: &KoharuLayoutDetection) -> f32 {
+    if left.label == "bubble" {
+        mask_intersection_over_union(&left.mask, &right.mask)
+            .unwrap_or_else(|| intersection_over_union(left.bbox, right.bbox))
+    } else {
+        intersection_over_union(left.bbox, right.bbox)
+    }
+}
+
+/// Returns `None` if either mask is malformed or empty, allowing NMS to fall
+/// back to bbox IoU instead of accidentally treating unusable masks as disjoint.
+fn mask_intersection_over_union(left: &KoharuLayoutMask, right: &KoharuLayoutMask) -> Option<f32> {
+    if !valid_mask(left) || !valid_mask(right) {
+        return None;
+    }
+
+    let left_area = left.pixels.iter().filter(|&&pixel| pixel != 0).count();
+    let right_area = right.pixels.iter().filter(|&&pixel| pixel != 0).count();
+    if left_area == 0 || right_area == 0 {
+        return None;
+    }
+
+    let left_right = left.x.saturating_add(left.width);
+    let right_right = right.x.saturating_add(right.width);
+    let left_bottom = left.y.saturating_add(left.height);
+    let right_bottom = right.y.saturating_add(right.height);
+    let x_start = left.x.max(right.x);
+    let y_start = left.y.max(right.y);
+    let x_end = left_right.min(right_right);
+    let y_end = left_bottom.min(right_bottom);
+
+    let mut intersection = 0usize;
+    if x_start < x_end && y_start < y_end {
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                if left.contains(x, y) && right.contains(x, y) {
+                    intersection += 1;
+                }
+            }
+        }
+    }
+
+    let union = left_area + right_area - intersection;
+    if union == 0 {
+        None
+    } else {
+        Some(intersection as f32 / union as f32)
+    }
 }
 
 fn sort_by_layout(detections: &mut Vec<KoharuLayoutDetection>) {
@@ -2261,8 +2348,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(typography.color, Some([0, 0, 0, 255]));
-        assert_eq!(typography.stroke_color, Some([255, 255, 255, 255]));
-        assert_eq!(typography.stroke_width, Some(3.0));
+        assert_eq!(typography.stroke_color, None);
+        assert_eq!(typography.stroke_width, None);
     }
 
     #[test]
@@ -2288,6 +2375,57 @@ mod tests {
                 .iter()
                 .any(|detection| detection.label == "bubble")
         );
+    }
+
+    #[test]
+    fn bubble_nms_uses_mask_iou_instead_of_overlapping_bounding_boxes() {
+        let make_bubble = |score: f32, x: u32, y: u32| KoharuLayoutDetection {
+            label_id: 2,
+            label: "bubble".to_owned(),
+            score,
+            // Deliberately overlapping model boxes; the instance masks are separate.
+            bbox: [0.0, 0.0, 100.0, 100.0],
+            area: 100,
+            mask: KoharuLayoutMask {
+                x,
+                y,
+                width: 10,
+                height: 10,
+                pixels: vec![u8::MAX; 100],
+            },
+        };
+        let mut detections = vec![make_bubble(0.9, 0, 0), make_bubble(0.8, 90, 90)];
+
+        non_maximum_suppression(&mut detections, 0.5);
+
+        assert_eq!(detections.len(), 2, "disjoint bubble masks must both survive NMS");
+    }
+
+    #[test]
+    fn bubble_nms_still_removes_duplicate_masks() {
+        let make_bubble = |score: f32, bbox: [f32; 4]| KoharuLayoutDetection {
+            label_id: 2,
+            label: "bubble".to_owned(),
+            score,
+            bbox,
+            area: 100,
+            mask: KoharuLayoutMask {
+                x: 10,
+                y: 10,
+                width: 10,
+                height: 10,
+                pixels: vec![u8::MAX; 100],
+            },
+        };
+        let mut detections = vec![
+            make_bubble(0.9, [0.0, 0.0, 100.0, 100.0]),
+            make_bubble(0.8, [30.0, 30.0, 130.0, 130.0]),
+        ];
+
+        non_maximum_suppression(&mut detections, 0.5);
+
+        assert_eq!(detections.len(), 1, "duplicate bubble masks should be suppressed");
+        assert_eq!(detections[0].score, 0.9);
     }
 
     #[test]
@@ -2597,37 +2735,38 @@ mod tests {
     }
 
     #[test]
-    fn text_colors_snap_only_at_luminance_extremes() {
+    fn text_colors_preserve_hues_and_snap_neutral_tones_at_luminance_extremes() {
         assert_eq!(normalize_text_color([20, 31, 24]), [0, 0, 0]);
         assert_eq!(normalize_text_color([230, 240, 250]), [255, 255, 255]);
-        assert_eq!(normalize_text_color([255, 0, 0]), [0, 0, 0]);
+        assert_eq!(normalize_text_color([255, 0, 0]), [255, 0, 0]);
+        assert_eq!(normalize_text_color([245, 75, 165]), [245, 75, 165]);
         assert_eq!(normalize_text_color([0, 255, 0]), [0, 255, 0]);
         assert_eq!(normalize_text_color([20, 115, 235]), [20, 115, 235]);
         assert_eq!(normalize_text_color([40, 70, 40]), [0, 0, 0]);
     }
 
     #[test]
-    fn outlined_text_uses_the_deep_fill_and_measures_the_border() {
+    fn outlined_text_keeps_its_fill_and_adds_no_border() {
         for stroke_width in [2, 3, 5] {
             let (image, detection) = outlined_text(stroke_width, [0, 0, 0], [255, 255, 255]);
 
             let inferred = infer_typography(&image, &detection).unwrap();
 
             assert_eq!(inferred.color, [0, 0, 0]);
-            assert_eq!(inferred.stroke_color, Some([255, 255, 255]));
-            assert_eq!(inferred.stroke_width, Some(stroke_width as f32));
+            assert_eq!(inferred.stroke_color, None);
+            assert_eq!(inferred.stroke_width, None);
         }
     }
 
     #[test]
-    fn outlined_text_roles_do_not_flip_with_inverse_luminance() {
+    fn a_black_original_outline_turns_the_text_black_without_a_border() {
         let (image, detection) = outlined_text(3, [255, 255, 255], [0, 0, 0]);
 
         let inferred = infer_typography(&image, &detection).unwrap();
 
-        assert_eq!(inferred.color, [255, 255, 255]);
-        assert_eq!(inferred.stroke_color, Some([0, 0, 0]));
-        assert_eq!(inferred.stroke_width, Some(3.0));
+        assert_eq!(inferred.color, [0, 0, 0]);
+        assert_eq!(inferred.stroke_color, None);
+        assert_eq!(inferred.stroke_width, None);
     }
 
     #[test]
@@ -2643,14 +2782,40 @@ mod tests {
     }
 
     #[test]
+    fn a_dark_but_not_black_outline_keeps_the_colored_fill() {
+        // Pink text with a dark purple halo, as in a pink dialogue line on dark artwork.
+        let (image, detection) = outlined_text(3, [255, 105, 180], [31, 18, 39]);
+
+        let inferred = infer_typography(&image, &detection).unwrap();
+
+        assert_eq!(inferred.color, [255, 105, 180]);
+        assert_eq!(inferred.stroke_color, None);
+        assert_eq!(inferred.stroke_width, None);
+    }
+
+    #[test]
+    fn a_fill_close_to_the_background_does_not_replace_a_bright_glyph_color() {
+        // Bright pink glyph strokes around dark gaps on a dark background: the dark gaps
+        // are not the paint.
+        let (image, detection) =
+            outlined_text_on_background(3, [44, 0, 34], [255, 105, 180], [20, 32, 45]);
+
+        let inferred = infer_typography(&image, &detection).unwrap();
+
+        assert_eq!(inferred.color, [255, 105, 180]);
+        assert_eq!(inferred.stroke_color, None);
+        assert_eq!(inferred.stroke_width, None);
+    }
+
+    #[test]
     fn outlined_text_is_separated_from_matching_dark_artwork() {
         let (image, detection) = outlined_text_on_textured_background();
 
         let inferred = infer_typography(&image, &detection).unwrap();
 
         assert_eq!(inferred.color, [0, 0, 0]);
-        assert_eq!(inferred.stroke_color, Some([255, 255, 255]));
-        assert_eq!(inferred.stroke_width, Some(3.0));
+        assert_eq!(inferred.stroke_color, None);
+        assert_eq!(inferred.stroke_width, None);
     }
 
     #[test]
@@ -2714,4 +2879,4 @@ mod tests {
 
         assert!(color_palette(&pixels).len() <= 16 * 16 * 16);
     }
-}
+    }
