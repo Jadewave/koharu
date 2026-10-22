@@ -48,6 +48,10 @@ const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
+// Confidence thresholds used when the configuration leaves one unset.
+const DEFAULT_TEXT_THRESHOLD: f32 = 0.2;
+const DEFAULT_BUBBLE_THRESHOLD: f32 = 0.35;
+const DEFAULT_PANEL_THRESHOLD: f32 = 0.55;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default)]
@@ -144,9 +148,9 @@ impl Model {
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(config) = config;
         let network = KoharuLayoutRFDetrSeg2XL::load(device).await?;
         let mut thresholds = network.recommended_thresholds();
-        thresholds.text = config.text_threshold.unwrap_or(thresholds.text);
-        thresholds.bubble = config.bubble_threshold.unwrap_or(thresholds.bubble);
-        thresholds.panel = config.panel_threshold.unwrap_or(thresholds.panel);
+        thresholds.text = config.text_threshold.unwrap_or(DEFAULT_TEXT_THRESHOLD);
+        thresholds.bubble = config.bubble_threshold.unwrap_or(DEFAULT_BUBBLE_THRESHOLD);
+        thresholds.panel = config.panel_threshold.unwrap_or(DEFAULT_PANEL_THRESHOLD);
         Ok(Self {
             network: Arc::new(Mutex::new(network)),
             thresholds,
@@ -409,8 +413,9 @@ fn write_region<'a>(
             font_style: None,
             size: None,
             auto_fit: true,
-            // Keep the inferred fill and outline together. Dropping a fill merely because
-            // its outline is darker turns colored dialogue into the renderer's black default.
+            // The inferred fill is kept even when the source had an outline, because dropping
+            // it would turn colored dialogue into the renderer's black default. No stroke is
+            // inferred, so none is written.
             color: inferred.map(|value| {
                 [value.color[0], value.color[1], value.color[2], u8::MAX]
             }),
@@ -716,11 +721,15 @@ fn infer_text_paint(
 ) -> ([u8; 3], Option<[u8; 3]>, Option<f32>) {
     let clusters = color_clusters(pixels, background_seed);
     if let Some(outline) = infer_outline(&clusters, background_seed, width, height) {
-        return (
-            outline.fill_color,
-            Some(outline.stroke_color),
-            Some(outline.stroke_width),
-        );
+        // The original outline is never reproduced, so no stroke is returned.
+        // Text whose original outline is pure black is rendered black; any other
+        // outlined text keeps its inferred fill.
+        let color = if outline.stroke_color == [0, 0, 0] {
+            [0, 0, 0]
+        } else {
+            outline.fill_color
+        };
+        return (color, None, None);
     }
 
     let nonempty = clusters
@@ -757,7 +766,6 @@ fn infer_text_paint(
 struct OutlinePaint {
     fill_color: [u8; 3],
     stroke_color: [u8; 3],
-    stroke_width: f32,
     score: u64,
 }
 
@@ -830,11 +838,13 @@ fn infer_outline(
                 continue;
             }
 
-            let Some(stroke_width) =
-                measured_stroke_width(&stroke_pixels, &enclosed_fill, &outside, width, height)
-            else {
+            // The width itself is no longer used, but an outline still has to be
+            // measurable to count as one.
+            if measured_stroke_width(&stroke_pixels, &enclosed_fill, &outside, width, height)
+                .is_none()
+            {
                 continue;
-            };
+            }
             let inside_fill = enclosed_fill
                 .iter()
                 .filter(|pixel| pixel.inside_mask)
@@ -843,7 +853,6 @@ fn infer_outline(
             let candidate = OutlinePaint {
                 fill_color: normalized_fill,
                 stroke_color: normalized_stroke,
-                stroke_width,
                 score: u64::from(contrast) * evidence.min(4096) as u64,
             };
             if best.is_none_or(|current: OutlinePaint| candidate.score > current.score) {
@@ -2726,27 +2735,27 @@ mod tests {
     }
 
     #[test]
-    fn outlined_text_uses_the_deep_fill_and_measures_the_border() {
+    fn outlined_text_keeps_its_fill_and_adds_no_border() {
         for stroke_width in [2, 3, 5] {
             let (image, detection) = outlined_text(stroke_width, [0, 0, 0], [255, 255, 255]);
 
             let inferred = infer_typography(&image, &detection).unwrap();
 
             assert_eq!(inferred.color, [0, 0, 0]);
-            assert_eq!(inferred.stroke_color, Some([255, 255, 255]));
-            assert_eq!(inferred.stroke_width, Some(stroke_width as f32));
+            assert_eq!(inferred.stroke_color, None);
+            assert_eq!(inferred.stroke_width, None);
         }
     }
 
     #[test]
-    fn outlined_text_roles_do_not_flip_with_inverse_luminance() {
+    fn a_black_original_outline_turns_the_text_black_without_a_border() {
         let (image, detection) = outlined_text(3, [255, 255, 255], [0, 0, 0]);
 
         let inferred = infer_typography(&image, &detection).unwrap();
 
-        assert_eq!(inferred.color, [255, 255, 255]);
-        assert_eq!(inferred.stroke_color, Some([0, 0, 0]));
-        assert_eq!(inferred.stroke_width, Some(3.0));
+        assert_eq!(inferred.color, [0, 0, 0]);
+        assert_eq!(inferred.stroke_color, None);
+        assert_eq!(inferred.stroke_width, None);
     }
 
     #[test]
@@ -2768,8 +2777,8 @@ mod tests {
         let inferred = infer_typography(&image, &detection).unwrap();
 
         assert_eq!(inferred.color, [0, 0, 0]);
-        assert_eq!(inferred.stroke_color, Some([255, 255, 255]));
-        assert_eq!(inferred.stroke_width, Some(3.0));
+        assert_eq!(inferred.stroke_color, None);
+        assert_eq!(inferred.stroke_width, None);
     }
 
     #[test]
