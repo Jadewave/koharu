@@ -106,6 +106,21 @@ impl Llm {
         })
     }
 
+    /// Generates JSON constrained by the supplied JSON Schema and invokes `on_token` after
+    /// each decoded token, so the caller can stop a generation early.
+    pub fn inference_with_json_schema_callback<F>(
+        &self,
+        input: &Input<'_>,
+        options: &GenerationOptions,
+        schema: &serde_json::Value,
+        on_token: F,
+    ) -> Result<Generation>
+    where
+        F: FnMut(TokenChunk<'_>) -> Result<GenerationControl>,
+    {
+        self.model.inference(input, options, Some(schema), on_token)
+    }
+
     /// Generates and deserializes JSON constrained to the schema of `T`.
     pub fn inference_structured<T>(
         &self,
