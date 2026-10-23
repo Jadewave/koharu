@@ -208,6 +208,11 @@ impl Translator {
             "reasoning pass produced looping segments; translating them again without reasoning"
         );
         let mut retry = request.clone();
+        if selection.provider == Provider::Local {
+            // Encoding the page image on CPU takes minutes per call, so the local retry is
+            // text only.
+            retry.image = None;
+        }
         retry.segments = redo
             .iter()
             .map(|&index| request.segments[index].clone())
