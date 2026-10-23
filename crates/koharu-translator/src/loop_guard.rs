@@ -15,6 +15,17 @@ const MAX_PERIOD: usize = 80;
 const LENGTH_SLACK: usize = 80;
 const LENGTH_RATIO: usize = 10;
 
+/// How much of the end of a partial generation is inspected while it streams.
+const TAIL_CHARS: usize = 400;
+
+/// True when the end of a partial generation has fallen into a repetition loop, so the
+/// generation can be stopped instead of running to the token limit.
+pub(crate) fn tail_is_looping(text: &str) -> bool {
+    let skip = text.chars().count().saturating_sub(TAIL_CHARS);
+    let tail: String = text.chars().skip(skip).collect();
+    has_runaway_repeat(&collapse_runs(&tail))
+}
+
 /// Indices of segments whose translation looks like a repetition loop.
 pub(crate) fn looping_segments(sources: &[String], translations: &[String]) -> Vec<usize> {
     sources
@@ -122,6 +133,25 @@ mod tests {
         let source = "ハハハハ、ごめん。".repeat(5);
         let translation = "Ha ha, xin lỗi. ".repeat(5);
         assert!(!is_looping(&source, &translation));
+    }
+
+    #[test]
+    fn a_looping_tail_is_detected_while_streaming() {
+        let prefix = r#"{"translations": [{"id": 0, "text": ""#;
+        let looping = format!("{prefix}{}", r#"\"\" "#.repeat(30));
+        assert!(tail_is_looping(&looping));
+        let phrase = format!("{prefix}{}", "Tôi không biết. ".repeat(8));
+        assert!(tail_is_looping(&phrase));
+    }
+
+    #[test]
+    fn ordinary_json_output_is_not_a_looping_tail() {
+        let mut text = String::from(r#"{"translations": ["#);
+        for id in 0..12 {
+            text.push_str(&format!(r#"{{"id": {id}, "text": "Ừ."}}, "#));
+        }
+        assert!(!tail_is_looping(&text));
+        assert!(!tail_is_looping(""));
     }
 
     #[test]
