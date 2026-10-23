@@ -61,6 +61,8 @@ const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
 const DEFAULT_TEXT_THRESHOLD: f32 = 0.2;
 const DEFAULT_BUBBLE_THRESHOLD: f32 = 0.35;
 const DEFAULT_PANEL_THRESHOLD: f32 = 0.55;
+// A text box lying at least this fraction inside a larger text box is dropped.
+const NESTED_TEXT_CONTAINMENT: f32 = 0.8;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default)]
@@ -289,6 +291,7 @@ async fn write_page(
         detections.retain(|detection| intersects(detection.bbox, region));
     }
     non_maximum_suppression(&mut detections, 0.5);
+    suppress_nested_text(&mut detections, NESTED_TEXT_CONTAINMENT);
     sort_by_layout(&mut detections);
 
     let image = image.to_rgb8();
@@ -1908,6 +1911,34 @@ fn intersection_over_union(left: [f32; 4], right: [f32; 4]) -> f32 {
     }
 }
 
+/// Drops text boxes that lie (at least `containment` of their area) inside a larger
+/// text box. NMS only removes boxes with IoU above its threshold, so a small box
+/// fully contained in a big one survives it and would be OCR'd and translated twice.
+fn suppress_nested_text(detections: &mut Vec<KoharuLayoutDetection>, containment: f32) {
+    let boxes = detections
+        .iter()
+        .map(|detection| (detection.label == "text", detection.bbox))
+        .collect::<Vec<_>>();
+    let mut index = 0;
+    detections.retain(|detection| {
+        let current = index;
+        index += 1;
+        if detection.label != "text" {
+            return true;
+        }
+        let own = area(detection.bbox);
+        if own <= 0.0 {
+            return true;
+        }
+        !boxes.iter().enumerate().any(|(other, (is_text, bbox))| {
+            other != current
+                && *is_text
+                && area(*bbox) > own
+                && intersection_area(detection.bbox, *bbox) / own >= containment
+        })
+    });
+}
+
 fn intersection_area(left: [f32; 4], right: [f32; 4]) -> f32 {
     (left[2].min(right[2]) - left[0].max(right[0])).max(0.0)
         * (left[3].min(right[3]) - left[1].max(right[1])).max(0.0)
@@ -1935,7 +1966,7 @@ mod tests {
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
         StageInput, StageProcessor, closed_mask_for, color_palette, generation, infer_typography,
         layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
-        non_maximum_suppression, normalize_text_color, write_region,
+        non_maximum_suppression, normalize_text_color, suppress_nested_text, write_region,
     };
 
     #[test]
@@ -2375,6 +2406,27 @@ mod tests {
                 .iter()
                 .any(|detection| detection.label == "bubble")
         );
+    }
+
+    #[test]
+    fn nested_text_boxes_keep_only_the_larger_box() {
+        let mut detections = vec![
+            detection("text", 0.9, [0.0, 0.0, 100.0, 100.0]),
+            detection("text", 0.8, [20.0, 20.0, 80.0, 80.0]),
+            detection("text", 0.7, [90.0, 90.0, 140.0, 140.0]),
+            detection("text", 0.6, [200.0, 0.0, 250.0, 50.0]),
+            detection("bubble", 0.9, [20.0, 20.0, 80.0, 80.0]),
+        ];
+
+        suppress_nested_text(&mut detections, 0.8);
+
+        let texts = detections
+            .iter()
+            .filter(|detection| detection.label == "text")
+            .map(|detection| detection.score)
+            .collect::<Vec<_>>();
+        assert_eq!(texts, [0.9, 0.7, 0.6]);
+        assert!(detections.iter().any(|detection| detection.label == "bubble"));
     }
 
     #[test]
@@ -2879,4 +2931,4 @@ mod tests {
 
         assert!(color_palette(&pixels).len() <= 16 * 16 * 16);
     }
-        }
+}
