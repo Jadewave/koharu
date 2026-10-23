@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use koharu_ml::llm::{
-    ChatMessage, ChatTemplateOptions, GenerationOptions, Input, Llm, LoadOptions, MtmdOptions,
-    media_marker,
+    ChatMessage, ChatTemplateOptions, GenerationControl, GenerationOptions, Input, Llm, LoadOptions,
+    MtmdOptions, TokenChunk, media_marker,
 };
 
 mod catalog;
@@ -14,11 +14,27 @@ pub(crate) use catalog::{DEFAULT_MODEL, DEFAULT_QUANTIZATION};
 
 use crate::{
     Device, Error, GenerationConfig, Model, ModelSelection, Provider, Quantization, Result,
-    TranslationRequest, prompt,
+    TranslationRequest, loop_guard, prompt,
 };
 
 /// How many times segments the model skipped (missing or duplicated IDs) are translated again.
 const MAX_MISSING_RETRIES: u32 = 2;
+
+/// The partial output is checked for a repetition loop every 16 generated tokens.
+const LOOP_CHECK_MASK: usize = 15;
+
+/// Stops a generation that has started repeating itself instead of letting it run to the
+/// token limit (a looping generation on CPU wastes minutes).
+fn stop_on_loop(chunk: TokenChunk<'_>) -> anyhow::Result<GenerationControl> {
+    if chunk.generated_tokens & LOOP_CHECK_MASK == 0 && loop_guard::tail_is_looping(chunk.text) {
+        tracing::warn!(
+            tokens = chunk.generated_tokens,
+            "generation is repeating itself; stopping early"
+        );
+        return Ok(GenerationControl::Stop);
+    }
+    Ok(GenerationControl::Continue)
+}
 
 #[derive(Debug)]
 pub struct LocalTranslator {
@@ -138,7 +154,11 @@ impl LocalTranslator {
                 || Input::new(&prompt),
                 |image| Input::new(&prompt).with_image(image),
             );
-            llm.inference_with_json_schema(&input, &options, &schema)
+            if reasoning {
+                llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
+            } else {
+                llm.inference_with_json_schema(&input, &options, &schema)
+            }
         })
         .await?;
         Ok(prompt::parse_translations(
