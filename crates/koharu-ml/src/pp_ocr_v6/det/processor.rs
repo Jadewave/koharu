@@ -188,7 +188,7 @@ impl PPOCRV6MediumDetImageProcessor {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn boxes_from_bitmap(
+fn boxes_from_bitmap(
     prediction: &[f32],
     width: u32,
     height: u32,
@@ -375,7 +375,12 @@ fn cross(origin: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     (a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0])
 }
 
-fn polygon_score(map: &[f32], width: u32, height: u32, polygon: &[[f32; 2]]) -> f32 {
+pub(crate) fn polygon_score(
+    map: &[f32],
+    width: u32,
+    height: u32,
+    polygon: &[[f32; 2]],
+) -> f32 {
     // Transformers passes an int32 copy of the rotated box to cv2.fillPoly.
     let polygon = polygon
         .iter()
