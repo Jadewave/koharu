@@ -1,68 +1,65 @@
 //! Deterministic helpers for the PP-OCRv6 manga pipeline.
 //!
 //! Everything here is arithmetic on pixel buffers and strings, so it can be
-//! unit-tested without ONNX Runtime. The conventions follow PaddleOCR:
-//! `cv2.resize(INTER_LINEAR)`, `get_rotate_crop_image` and `CTCLabelDecode`.
+//! unit-tested without ONNX Runtime. The numerical conventions follow the
+//! reference demo (`Kellenok/PP-OCR_manga`, `app.py`), which uses OpenCV:
+//! `cv2.resize(INTER_LINEAR)` and `cv2.warpPerspective(INTER_LINEAR)`.
 
-use std::cmp::Ordering;
-
-/// Long side of the detector input for a normal page, from the model card.
+/// White border added around the image before detection, as the demo does.
+pub(super) const DET_MARGIN: usize = 16;
 const DET_LONG_SIDE: f64 = 960.0;
-/// Pages more elongated than this are sized by pixel budget instead of long side.
+const DET_SMALL_SIDE: f64 = 480.0;
+/// Images more elongated than this get a pixel budget instead of a long side.
 const STRIP_ASPECT: f64 = 2.0;
-/// Pixel budget of a 3:4 page whose long side is `DET_LONG_SIDE`.
-const STRIP_PIXEL_BUDGET: f64 = DET_LONG_SIDE * DET_LONG_SIDE * 0.75;
-/// Smallest detector input side; tiny crops are lifted to keep some resolution.
-const DET_MIN_SIDE: f64 = 96.0;
-const DET_MAX_SIDE: f64 = 4000.0;
-const MAX_PAGE_SCALE: f64 = 4.0;
+const DET_MIN_INPUT: usize = 64;
 
 pub(super) const REC_HEIGHT: usize = 48;
-pub(super) const REC_MIN_WIDTH: usize = 320;
-const REC_MAX_WIDTH: usize = 3200;
+const REC_MIN_WIDTH: usize = 16;
+const REC_MAX_WIDTH: usize = 640;
+/// Very long lines (credits, captions) are read wider instead of squeezed.
+const REC_WIDE_FROM: usize = 2000;
+const REC_MAX_WIDE_WIDTH: usize = 2400;
 
-/// Lines taller than this multiple of their width are rotated before reading.
-const VERTICAL_ASPECT: f32 = 1.5;
-
-/// Scale the model card applies to a whole page before detection.
+/// Detector input `(width, height)` for an image that already carries the margin.
 ///
-/// Koharu hands the recognizer one text-block crop at a time, but the detector
-/// was trained on whole pages resized by this rule. Applying the *page* scale to
-/// each crop keeps glyphs at the pixel size the detector expects.
-pub fn page_scale(width: u32, height: u32) -> f64 {
-    let (width, height) = (f64::from(width.max(1)), f64::from(height.max(1)));
+/// Both sides are multiples of 32. Images between 480 and 960 pixels are kept at
+/// their size, larger ones are shrunk to 960 on the long side and smaller ones
+/// are enlarged to 480. Strips more elongated than 2:1 are sized by the pixel
+/// budget of a 3:4 page at 960 instead.
+pub(super) fn detector_size(width: usize, height: usize) -> (usize, usize) {
+    let (width, height) = (width.max(1) as f64, height.max(1) as f64);
     let long = width.max(height);
     let short = width.min(height);
     let scale = if long / short > STRIP_ASPECT {
-        (STRIP_PIXEL_BUDGET / (width * height)).sqrt()
-    } else {
+        (0.75 * DET_LONG_SIDE * DET_LONG_SIDE / (width * height))
+            .sqrt()
+            .min(1.0)
+    } else if long > DET_LONG_SIDE {
         DET_LONG_SIDE / long
-    };
-    scale.clamp(0.05, MAX_PAGE_SCALE)
-}
-
-/// Detector input `(width, height)` for an image viewed at `scale`; both sides
-/// are multiples of 32 as the network requires.
-pub(super) fn detector_size(width: u32, height: u32, scale: f64) -> (u32, u32) {
-    let mut scale = if scale.is_finite() && scale > 0.0 {
-        scale
+    } else if long < DET_SMALL_SIDE {
+        (DET_SMALL_SIDE / long).max(1.0)
     } else {
         1.0
     };
-    let (width, height) = (f64::from(width.max(1)), f64::from(height.max(1)));
-    let short = (width * scale).min(height * scale);
-    if short < DET_MIN_SIDE {
-        scale *= DET_MIN_SIDE / short;
-    }
-    let long = (width * scale).max(height * scale);
-    if long > DET_MAX_SIDE {
-        scale *= DET_MAX_SIDE / long;
-    }
-    (round32(width * scale), round32(height * scale))
+    let side = |value: f64| (((value * scale / 32.0).round() as usize) * 32).max(DET_MIN_INPUT);
+    (side(width), side(height))
 }
 
-fn round32(value: f64) -> u32 {
-    (((value / 32.0).round() as u32).max(1)) * 32
+/// Adds a white border of `margin` pixels to an interleaved RGB8 image.
+pub(super) fn pad_white(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    margin: usize,
+) -> (Vec<u8>, usize, usize) {
+    let (padded_width, padded_height) = (width + 2 * margin, height + 2 * margin);
+    let mut output = vec![255u8; padded_width * padded_height * 3];
+    for y in 0..height {
+        let from = y * width * 3;
+        let to = ((y + margin) * padded_width + margin) * 3;
+        output[to..to + width * 3].copy_from_slice(&rgb[from..from + width * 3]);
+    }
+    (output, padded_width, padded_height)
 }
 
 /// Source taps and blend weight for one output coordinate along one axis.
@@ -93,8 +90,8 @@ fn axis(source: usize, target: usize) -> Axis {
 
 /// Resizes interleaved RGB8 to `[3, new_height, new_width]` floats in BGR order.
 ///
-/// PaddleOCR feeds OpenCV's BGR arrays through the ImageNet mean and standard
-/// deviation listed in RGB order, so `mean` and `std` are indexed by BGR slot.
+/// The demo works on OpenCV's BGR arrays, so `mean` and `std` are indexed by BGR
+/// slot (blue first).
 pub(super) fn resize_normalize(
     rgb: &[u8],
     width: usize,
@@ -131,18 +128,35 @@ fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
 
-/// Upright size of the line bounded by `quad` (top-left, top-right,
-/// bottom-right, bottom-left).
-pub(super) fn quad_size(quad: &[[f32; 2]; 4]) -> (usize, usize) {
-    let width = distance(quad[0], quad[1]).max(distance(quad[3], quad[2]));
-    let height = distance(quad[0], quad[3]).max(distance(quad[1], quad[2]));
-    (
-        (width.round() as usize).max(1),
-        (height.round() as usize).max(1),
-    )
+/// Orders the corners of a box as top-left, top-right, bottom-right,
+/// bottom-left using coordinate sums and differences, as the demo does.
+pub(super) fn order_corners(points: &[[f32; 2]; 4]) -> [[f32; 2]; 4] {
+    let (mut top_left, mut bottom_right, mut top_right, mut bottom_left) = (0, 0, 0, 0);
+    for (index, point) in points.iter().enumerate() {
+        let sum = point[0] + point[1];
+        let diff = point[1] - point[0];
+        if sum < points[top_left][0] + points[top_left][1] {
+            top_left = index;
+        }
+        if sum > points[bottom_right][0] + points[bottom_right][1] {
+            bottom_right = index;
+        }
+        if diff < points[top_right][1] - points[top_right][0] {
+            top_right = index;
+        }
+        if diff > points[bottom_left][1] - points[bottom_left][0] {
+            bottom_left = index;
+        }
+    }
+    [
+        points[top_left],
+        points[top_right],
+        points[bottom_right],
+        points[bottom_left],
+    ]
 }
 
-fn sample(rgb: &[u8], width: usize, height: usize, x: f32, y: f32) -> [f32; 3] {
+fn bilinear(rgb: &[u8], width: usize, height: usize, x: f32, y: f32) -> [f32; 3] {
     let x = x.clamp(0.0, (width - 1) as f32);
     let y = y.clamp(0.0, (height - 1) as f32);
     let (x0, y0) = (x.floor() as usize, y.floor() as usize);
@@ -158,67 +172,63 @@ fn sample(rgb: &[u8], width: usize, height: usize, x: f32, y: f32) -> [f32; 3] {
     pixel
 }
 
-/// Samples the upright line bounded by `quad` out of an interleaved RGB8 image.
+/// Cuts the upright line bounded by `corners` (top-left, top-right,
+/// bottom-right, bottom-left) out of an interleaved RGB8 image.
 ///
-/// This stands in for `cv2.warpPerspective`: the detector's boxes are rotated
-/// rectangles, for which bilinear interpolation of the four corners is the same
-/// mapping. Pixels outside the image replicate the border.
-pub(super) fn crop_quad(
+/// This stands in for `cv2.warpPerspective` with the destination corners at
+/// `(0, 0)`, `(w - 1, 0)`, `(w - 1, h - 1)` and `(0, h - 1)`. The boxes are
+/// rotated rectangles, for which bilinear interpolation of the four corners is
+/// the same mapping. Pixels outside the image replicate the border. Returns
+/// `None` for a degenerate box.
+pub(super) fn crop_perspective(
     rgb: &[u8],
     width: usize,
     height: usize,
-    quad: &[[f32; 2]; 4],
-) -> (Vec<u8>, usize, usize) {
-    let (out_width, out_height) = quad_size(quad);
+    corners: &[[f32; 2]; 4],
+) -> Option<(Vec<u8>, usize, usize)> {
+    let [top_left, top_right, bottom_right, bottom_left] = *corners;
+    let out_width = distance(bottom_right, bottom_left).max(distance(top_right, top_left)) as usize;
+    let out_height = distance(top_right, bottom_right).max(distance(top_left, bottom_left)) as usize;
+    if out_width == 0 || out_height == 0 || width == 0 || height == 0 {
+        return None;
+    }
     let mut output = vec![0u8; out_width * out_height * 3];
     for y in 0..out_height {
-        let v = (y as f32 + 0.5) / out_height as f32;
+        let v = if out_height > 1 {
+            y as f32 / (out_height - 1) as f32
+        } else {
+            0.0
+        };
         for x in 0..out_width {
-            let u = (x as f32 + 0.5) / out_width as f32;
-            let point = |axis: usize| {
-                (1.0 - u) * (1.0 - v) * quad[0][axis]
-                    + u * (1.0 - v) * quad[1][axis]
-                    + u * v * quad[2][axis]
-                    + (1.0 - u) * v * quad[3][axis]
+            let u = if out_width > 1 {
+                x as f32 / (out_width - 1) as f32
+            } else {
+                0.0
             };
-            let pixel = sample(rgb, width, height, point(0) - 0.5, point(1) - 0.5);
+            let point = |axis: usize| {
+                (1.0 - u) * (1.0 - v) * corners[0][axis]
+                    + u * (1.0 - v) * corners[1][axis]
+                    + u * v * corners[2][axis]
+                    + (1.0 - u) * v * corners[3][axis]
+            };
+            let pixel = bilinear(rgb, width, height, point(0), point(1));
             let at = (y * out_width + x) * 3;
             for (channel, value) in pixel.iter().enumerate() {
                 output[at + channel] = value.round().clamp(0.0, 255.0) as u8;
             }
         }
     }
-    (output, out_width, out_height)
+    Some((output, out_width, out_height))
 }
 
-/// Direction in which vertical lines are turned upright for the recognizer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Rotation {
-    Ccw,
-    Cw,
-}
-
-/// Whether a line of this upright size is read as vertical text.
-pub(super) fn is_vertical(width: usize, height: usize) -> bool {
-    height as f32 / width.max(1) as f32 >= VERTICAL_ASPECT
-}
-
-/// Rotates an interleaved RGB8 image by 90 degrees (`np.rot90` for `Ccw`).
-pub(super) fn rotate90(
-    rgb: &[u8],
-    width: usize,
-    height: usize,
-    rotation: Rotation,
-) -> (Vec<u8>, usize, usize) {
+/// Rotates an interleaved RGB8 image by 90 degrees counter-clockwise
+/// (`np.rot90`, `cv2.ROTATE_90_COUNTERCLOCKWISE`).
+pub(super) fn rotate_ccw(rgb: &[u8], width: usize, height: usize) -> (Vec<u8>, usize, usize) {
     let (out_width, out_height) = (height, width);
     let mut output = vec![0u8; rgb.len()];
     for y in 0..out_height {
         for x in 0..out_width {
-            let (source_x, source_y) = match rotation {
-                Rotation::Ccw => (width - 1 - y, x),
-                Rotation::Cw => (y, height - 1 - x),
-            };
-            let from = (source_y * width + source_x) * 3;
+            let from = (x * width + (width - 1 - y)) * 3;
             let to = (y * out_width + x) * 3;
             output[to..to + 3].copy_from_slice(&rgb[from..from + 3]);
         }
@@ -226,30 +236,25 @@ pub(super) fn rotate90(
     (output, out_width, out_height)
 }
 
-/// Recognizer input `[3, REC_HEIGHT, padded]` and its padded width.
+/// Recognizer input `[3, REC_HEIGHT, width]` and its width, or `None` for a crop
+/// too small to read.
 ///
-/// The line is resized to a fixed height, keeping its aspect ratio, and padded on
-/// the right with zeros (after normalization) up to `REC_MIN_WIDTH`.
-pub(super) fn rec_input(
-    rgb: &[u8],
-    width: usize,
-    height: usize,
-    mean: [f32; 3],
-    std: [f32; 3],
-) -> (Vec<f32>, usize) {
-    let target = ((REC_HEIGHT as f64 * width as f64 / height.max(1) as f64).ceil() as usize)
-        .clamp(1, REC_MAX_WIDTH);
-    let planes = resize_normalize(rgb, width, height, target, REC_HEIGHT, mean, std);
-    let padded = target.max(REC_MIN_WIDTH);
-    if padded == target {
-        return (planes, padded);
+/// The line is resized to height 48 keeping its aspect ratio, at most 640 wide
+/// (2400 for lines that would be wider than 2000), and normalized to `[-1, 1]`.
+/// Unlike the stock PaddleOCR recognizer there is no padding to a minimum width.
+pub(super) fn rec_input(rgb: &[u8], width: usize, height: usize) -> Option<(Vec<f32>, usize)> {
+    if width < 2 || height < 2 {
+        return None;
     }
-    let mut output = vec![0.0f32; 3 * REC_HEIGHT * padded];
-    for row in 0..3 * REC_HEIGHT {
-        output[row * padded..row * padded + target]
-            .copy_from_slice(&planes[row * target..(row + 1) * target]);
-    }
-    (output, padded)
+    let natural = (REC_HEIGHT as f64 * width as f64 / height as f64).round() as usize;
+    let cap = if natural > REC_WIDE_FROM {
+        REC_MAX_WIDE_WIDTH
+    } else {
+        REC_MAX_WIDTH
+    };
+    let target = natural.min(cap).max(REC_MIN_WIDTH);
+    let planes = resize_normalize(rgb, width, height, target, REC_HEIGHT, [0.5; 3], [0.5; 3]);
+    Some((planes, target))
 }
 
 /// Reads one symbol per line; the CTC blank is added by [`ctc_decode`].
@@ -266,8 +271,8 @@ pub(super) fn parse_dictionary(text: &str) -> Vec<String> {
 
 /// Greedy CTC decoding of `[steps, classes]` scores.
 ///
-/// Class 0 is the blank, classes `1..=dictionary.len()` are the dictionary and an
-/// optional final class is the space PaddleOCR appends (`use_space_char`).
+/// Class 0 is the blank, classes `1..=dictionary.len()` are the dictionary and
+/// the demo appends a final space class.
 pub(super) fn ctc_decode(
     scores: &[f32],
     steps: usize,
@@ -309,96 +314,6 @@ pub(super) fn ctc_decode(
     Ok(text)
 }
 
-/// One recognized line with the geometry needed to order it.
-#[derive(Debug, Clone)]
-pub(super) struct Line {
-    pub center: [f32; 2],
-    /// Short side of the line's box: glyph size across the reading direction.
-    pub thickness: f32,
-    pub vertical: bool,
-    pub text: String,
-}
-
-fn primary(line: &Line, vertical: bool) -> f32 {
-    if vertical {
-        -line.center[0]
-    } else {
-        line.center[1]
-    }
-}
-
-fn secondary(line: &Line, vertical: bool) -> f32 {
-    if vertical {
-        line.center[1]
-    } else {
-        line.center[0]
-    }
-}
-
-/// Orders lines in reading order: right-to-left columns for vertical text,
-/// top-to-bottom rows otherwise. Lines whose cross-axis positions are within
-/// 0.6 of the median thickness share a row or column and are read along it.
-pub(super) fn order_lines(mut lines: Vec<Line>) -> Vec<Line> {
-    if lines.len() < 2 {
-        return lines;
-    }
-    let vertical = lines.iter().filter(|line| line.vertical).count() * 2 > lines.len();
-    let mut thickness = lines.iter().map(|line| line.thickness).collect::<Vec<_>>();
-    thickness.sort_by(f32::total_cmp);
-    let tolerance = thickness[thickness.len() / 2] * 0.6;
-
-    lines.sort_by(|a, b| primary(a, vertical).total_cmp(&primary(b, vertical)));
-    let mut ordered = Vec::with_capacity(lines.len());
-    let mut group: Vec<Line> = Vec::new();
-    let mut anchor = 0.0f32;
-    for line in lines {
-        if !group.is_empty() && primary(&line, vertical) - anchor > tolerance {
-            group.sort_by(|a, b| {
-                secondary(a, vertical)
-                    .partial_cmp(&secondary(b, vertical))
-                    .unwrap_or(Ordering::Equal)
-            });
-            ordered.append(&mut group);
-        }
-        if group.is_empty() {
-            anchor = primary(&line, vertical);
-        }
-        group.push(line);
-    }
-    group.sort_by(|a, b| {
-        secondary(a, vertical)
-            .partial_cmp(&secondary(b, vertical))
-            .unwrap_or(Ordering::Equal)
-    });
-    ordered.append(&mut group);
-    ordered
-}
-
-fn is_cjk(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFE30..=0xFE4F
-            | 0xFF00..=0xFFEF | 0x20000..=0x2FA1F
-    )
-}
-
-/// Joins ordered lines. CJK text is concatenated; a space separates lines only
-/// when both sides of the break are non-CJK (words of a Latin-script balloon).
-pub(super) fn join_lines(lines: &[Line]) -> String {
-    let mut text = String::new();
-    for line in lines {
-        let next = line.text.trim();
-        let (Some(first), last) = (next.chars().next(), text.chars().last()) else {
-            continue;
-        };
-        if last.is_some_and(|last| !is_cjk(last) && !is_cjk(first)) {
-            text.push(' ');
-        }
-        text.push_str(next);
-    }
-    text
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,24 +322,27 @@ mod tests {
     const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
     #[test]
-    fn page_scale_follows_the_model_card() {
-        assert!((page_scale(1200, 1800) - 960.0 / 1800.0).abs() < 1e-9);
-        // An 800x4000 strip is sized by pixel budget instead of long side.
-        let strip = page_scale(800, 4000);
-        assert!((strip - (691_200.0f64 / 3_200_000.0).sqrt()).abs() < 1e-9);
-        assert!(strip > 960.0 / 4000.0);
+    fn detector_size_follows_the_demo() {
+        // 1280x720 frame plus the margin: shrunk to a 960 long side.
+        assert_eq!(detector_size(1312, 752), (960, 544));
+        // Between 480 and 960 the size is kept (rounded to 32).
+        assert_eq!(detector_size(700, 500), (704, 512));
+        // Small crops are enlarged until the long side reaches 480.
+        assert_eq!(detector_size(240, 120), (480, 256));
+        // Elongated strips use the 3:4 pixel budget.
+        let (width, height) = detector_size(832, 4032);
+        assert_eq!((width % 32, height % 32), (0, 0));
+        assert!(width * height <= 691_200 + 2 * 32 * 4032);
     }
 
     #[test]
-    fn detector_size_is_a_multiple_of_32_and_lifts_tiny_crops() {
-        let (width, height) = detector_size(1200, 1800, page_scale(1200, 1800));
-        assert_eq!((width % 32, height % 32), (0, 0));
-        assert_eq!(height, 960);
-        let (width, height) = detector_size(40, 20, 1.0);
-        assert!(width >= 96 && height >= 96 - 32, "{width}x{height}");
-        assert_eq!((width % 32, height % 32), (0, 0));
-        let (width, height) = detector_size(100, 20_000, 1.0);
-        assert!(width <= 4032 && height <= 4032);
+    fn white_margin_surrounds_the_image() {
+        let rgb = [10u8, 20, 30, 40, 50, 60];
+        let (padded, width, height) = pad_white(&rgb, 2, 1, 1);
+        assert_eq!((width, height), (4, 3));
+        assert_eq!(&padded[..3], &[255, 255, 255]);
+        let row = (width + 1) * 3;
+        assert_eq!(&padded[row..row + 6], &rgb);
     }
 
     #[test]
@@ -440,21 +358,28 @@ mod tests {
     }
 
     #[test]
-    fn axis_aligned_quad_crops_the_matching_pixels() {
+    fn corners_are_ordered_like_the_demo() {
+        let ordered = order_corners(&[[40.0, 30.0], [0.0, 0.0], [0.0, 30.0], [40.0, 0.0]]);
+        assert_eq!(ordered, [[0.0, 0.0], [40.0, 0.0], [40.0, 30.0], [0.0, 30.0]]);
+    }
+
+    #[test]
+    fn crop_spans_the_box_between_its_end_pixels() {
         let (width, height) = (6usize, 4usize);
         let rgb = (0..width * height * 3)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
-        let quad = [[1.0, 1.0], [5.0, 1.0], [5.0, 3.0], [1.0, 3.0]];
-        let (crop, crop_width, crop_height) = crop_quad(&rgb, width, height, &quad);
-        assert_eq!((crop_width, crop_height), (4, 2));
-        for y in 0..crop_height {
-            for x in 0..crop_width {
-                let from = ((y + 1) * width + x + 1) * 3;
-                let to = (y * crop_width + x) * 3;
-                assert_eq!(crop[to..to + 3], rgb[from..from + 3]);
-            }
-        }
+        let corners = [[1.0, 1.0], [4.0, 1.0], [4.0, 2.0], [1.0, 2.0]];
+        let (crop, crop_width, crop_height) =
+            crop_perspective(&rgb, width, height, &corners).unwrap();
+        // The demo truncates the side lengths (3 and 1) and maps the destination
+        // corners at `w - 1`, so the first and last pixels are the box's end pixels.
+        assert_eq!((crop_width, crop_height), (3, 1));
+        let first = (width + 1) * 3;
+        let last = (width + 4) * 3;
+        assert_eq!(crop[..3], rgb[first..first + 3]);
+        assert_eq!(crop[6..9], rgb[last..last + 3]);
+        assert!(crop_perspective(&rgb, width, height, &[[1.0, 1.0]; 4]).is_none());
     }
 
     #[test]
@@ -462,26 +387,25 @@ mod tests {
         // 3 wide, 2 high; each pixel stores its own index.
         let rgb = (0..6u8).flat_map(|value| [value; 3]).collect::<Vec<_>>();
         // np.rot90([[0,1,2],[3,4,5]]) == [[2,5],[1,4],[0,3]]
-        let (ccw, width, height) = rotate90(&rgb, 3, 2, Rotation::Ccw);
+        let (rotated, width, height) = rotate_ccw(&rgb, 3, 2);
         assert_eq!((width, height), (2, 3));
-        let ccw = ccw.chunks(3).map(|pixel| pixel[0]).collect::<Vec<_>>();
-        assert_eq!(ccw, [2, 5, 1, 4, 0, 3]);
-        // np.rot90(..., -1) == [[3,0],[4,1],[5,2]]
-        let (cw, _, _) = rotate90(&rgb, 3, 2, Rotation::Cw);
-        let cw = cw.chunks(3).map(|pixel| pixel[0]).collect::<Vec<_>>();
-        assert_eq!(cw, [3, 0, 4, 1, 5, 2]);
+        let values = rotated.chunks(3).map(|pixel| pixel[0]).collect::<Vec<_>>();
+        assert_eq!(values, [2, 5, 1, 4, 0, 3]);
     }
 
     #[test]
-    fn recognizer_input_is_padded_with_zeros() {
+    fn recognizer_input_has_no_padding_and_is_capped() {
         let rgb = vec![128u8; 96 * 48 * 3];
-        let (input, padded) = rec_input(&rgb, 96, 48, MEAN, STD);
-        assert_eq!(padded, REC_MIN_WIDTH);
-        assert_eq!(input.len(), 3 * REC_HEIGHT * padded);
-        assert!(input[padded - 1].abs() < f32::EPSILON);
-        assert!(input[0].abs() > 0.0);
-        let (_, wide) = rec_input(&vec![0u8; 960 * 48 * 3], 960, 48, MEAN, STD);
-        assert_eq!(wide, 960);
+        let (input, width) = rec_input(&rgb, 96, 48).unwrap();
+        assert_eq!(width, 96);
+        assert_eq!(input.len(), 3 * REC_HEIGHT * width);
+        // 128 / 255 normalized with mean = std = 0.5.
+        assert!((input[0] - (128.0 / 255.0 - 0.5) / 0.5).abs() < 1e-5);
+        // A very long line is squeezed to 640, an extreme one to 2400.
+        assert_eq!(rec_input(&vec![0u8; 960 * 48 * 3], 960, 48).unwrap().1, 640);
+        assert_eq!(rec_input(&vec![0u8; 2400 * 48 * 3], 2400, 48).unwrap().1, 2400);
+        assert_eq!(rec_input(&vec![0u8; 3 * 48 * 3], 3, 48).unwrap().1, REC_MIN_WIDTH);
+        assert!(rec_input(&[0u8; 3], 1, 1).is_none());
     }
 
     #[test]
@@ -494,7 +418,10 @@ mod tests {
             row
         };
         let sequence = [1, 1, 0, 1, 2, 2, 4, 3, 0];
-        let scores = sequence.iter().flat_map(|class| step(*class)).collect::<Vec<_>>();
+        let scores = sequence
+            .iter()
+            .flat_map(|class| step(*class))
+            .collect::<Vec<_>>();
         let text = ctc_decode(&scores, sequence.len(), 5, &dictionary).unwrap();
         assert_eq!(text, "ああい う");
         assert!(ctc_decode(&scores, sequence.len(), 7, &dictionary).is_err());
@@ -503,48 +430,5 @@ mod tests {
     #[test]
     fn dictionary_keeps_a_blank_looking_symbol_but_drops_the_trailing_newline() {
         assert_eq!(parse_dictionary("a\r\n \nb\n"), ["a", " ", "b"]);
-    }
-
-    fn line(x: f32, y: f32, vertical: bool, text: &str) -> Line {
-        Line {
-            center: [x, y],
-            thickness: 20.0,
-            vertical,
-            text: text.to_owned(),
-        }
-    }
-
-    #[test]
-    fn vertical_text_is_read_right_to_left() {
-        let ordered = order_lines(vec![
-            line(40.0, 100.0, true, "三"),
-            line(200.0, 120.0, true, "一"),
-            line(120.0, 90.0, true, "二"),
-        ]);
-        let text = ordered.iter().map(|l| l.text.as_str()).collect::<String>();
-        assert_eq!(text, "一二三");
-    }
-
-    #[test]
-    fn horizontal_text_is_read_top_to_bottom_and_joined_by_script() {
-        let ordered = order_lines(vec![
-            line(100.0, 90.0, false, "world"),
-            line(100.0, 40.0, false, "hello"),
-        ]);
-        assert_eq!(join_lines(&ordered), "hello world");
-        let ordered = order_lines(vec![
-            line(100.0, 70.0, false, "第二行"),
-            line(100.0, 20.0, false, "第一行，"),
-        ]);
-        assert_eq!(join_lines(&ordered), "第一行，第二行");
-    }
-
-    #[test]
-    fn lines_on_one_row_are_read_left_to_right() {
-        let ordered = order_lines(vec![
-            line(300.0, 52.0, false, "right"),
-            line(80.0, 48.0, false, "left"),
-        ]);
-        assert_eq!(join_lines(&ordered), "left right");
     }
 }
