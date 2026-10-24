@@ -76,6 +76,9 @@ dunce = "1.0.5"
 rayon = "1.12.0"
 # disables `esaxx_fast` feature which is conflicting with `ort`
 tokenizers = { version = "0.23.2", features = ["onig"] }
+# ONNX Runtime is loaded at run time (`load-dynamic`) so no second C++ runtime is linked in.
+# If cargo reports that `std` is not a feature of this ort release, remove it from the list.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"] }
 strum = { version = "0.28.0", features = ["derive"] }
 sys-locale = "0.3.2"
 sysinfo = { version = "0.39.6", features = ["system"] }
