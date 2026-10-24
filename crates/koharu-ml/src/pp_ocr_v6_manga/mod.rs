@@ -2,36 +2,48 @@
 //! recognizer, run on ONNX Runtime.
 //!
 //! Upstream: <https://huggingface.co/Kellenok/PP-OCRv6_manga>. The checkpoint is
-//! pinned below; its README describes the preprocessing and the DB thresholds.
+//! pinned below. The pipeline is a port of the author's reference demo
+//! (<https://huggingface.co/spaces/Kellenok/PP-OCR_manga>, `app.py`): the detector
+//! finds the text lines inside the crop, each line is cut out upright, the
+//! recognizer reads it, and the lines are put back in reading order.
 //!
-//! The recognizer reads one text line, so a text block is processed in three
-//! steps: the detector finds the lines inside the crop, each line is cut out
-//! upright (vertical lines are rotated), and the recognized lines are put back in
-//! reading order.
+//! The recognizer is sensitive to its input: it expects BGR pixels scaled to
+//! `[-1, 1]` at a height of 48 with no padding, and the detector expects the
+//! ImageNet statistics. Both differ from what the PP-OCRv6 medium port in
+//! `pp_ocr_v6` uses, so nothing is shared with it except the DB contour scoring.
 //!
-//! Intentional divergences from the upstream example, kept here so they can be
-//! revisited:
-//! - Koharu supplies one block crop at a time, so the detector input is sized
-//!   from the *page* (see [`page_scale`]) rather than from the crop.
-//! - The upstream example's learned furigana filter is not ported. Furigana is
-//!   rare in the Chinese and Korean text this engine is mostly used for.
-//! - When the detector finds no line in a crop, the whole crop is read as one
-//!   line instead of returning nothing, because Koharu's layout detector has
-//!   already decided that the crop contains text.
+//! Intentional divergences from the demo, kept here so they can be revisited:
+//! - The `pyclipper` offset of a contour is replaced by the equivalent computation
+//!   on its convex hull (see [`detect`]).
+//! - The demo's heuristics that trim furigana and stray margins off narrow vertical
+//!   lines (`clean_manga_vertical_crop`) are not ported, and no furigana line is
+//!   dropped (the demo does not drop them by default either).
+//! - The FP32 ONNX files are used instead of the FP16 ones.
+//! - Lines are joined into one text; the demo lists them separately.
+//! - Koharu hands over one text-block crop at a time, so the detector uses the
+//!   demo's "Single bubble" preset (`0.20`, `0.45`, `1.6`). Set
+//!   `KOHARU_PPOCR_DB=threshold,box_threshold,unclip_ratio` to try other values.
+//!
+//! Set `KOHARU_PPOCR_DEBUG` to a directory to save the detector's map and the
+//! detected boxes for every call.
 
+mod debug;
+mod detect;
 mod geometry;
+mod layout;
 mod session;
+
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use image::{DynamicImage, RgbImage};
 
 use self::{
-    geometry::{Line, Rotation},
+    debug::DetectorMap,
+    detect::{DbParams, MapLayout},
+    layout::LineBox,
     session::OnnxSession,
 };
-use crate::pp_ocr_v6::det::boxes_from_bitmap;
-
-pub use self::geometry::page_scale;
 
 crate::model_repository!("Kellenok/PP-OCRv6_manga" @ "72e97f5f9938b06bcf1dda07b4d49cd0632091ca" {
     DETECTOR = "det/manga_det_v0.2.onnx",
@@ -39,74 +51,51 @@ crate::model_repository!("Kellenok/PP-OCRv6_manga" @ "72e97f5f9938b06bcf1dda07b4
     DICTIONARY = "ppocrv6_dict.txt",
 });
 
-// PaddleOCR normalizes OpenCV's BGR arrays with the ImageNet statistics listed
-// in RGB order, so these are indexed by BGR slot.
-const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-const STD: [f32; 3] = [0.229, 0.224, 0.225];
+// The detector normalizes BGR pixels with the ImageNet statistics (blue first).
+const DETECTOR_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+const DETECTOR_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
-// DB post-processing values recommended by the model card. The shared
-// implementation is the one used by the PP-OCRv6 medium detector.
-const DB_THRESHOLD: f32 = 0.15;
-const DB_BOX_THRESHOLD: f32 = 0.25;
-const DB_UNCLIP_RATIO: f32 = 1.4;
-const DB_MIN_SIZE: i32 = 3;
-const DB_MAX_CANDIDATES: usize = 1000;
-
-/// Optional overrides for the DB post-processing values above, so the detector
-/// can be tuned on a deployed Space without a rebuild.
-const DB_THRESHOLD_ENV: &str = "KOHARU_PPOCR_DB_THRESHOLD";
-const DB_BOX_THRESHOLD_ENV: &str = "KOHARU_PPOCR_DB_BOX_THRESHOLD";
-const DB_UNCLIP_RATIO_ENV: &str = "KOHARU_PPOCR_DB_UNCLIP_RATIO";
-
-/// Second attempt when the detector finds no line at the normal thresholds:
-/// multiplied into the pixel and box thresholds before falling back to reading
-/// the whole crop as a single line.
-const RELAXED_FACTOR: f32 = 0.5;
-
-#[derive(Debug, Clone, Copy)]
-struct DbParams {
-    threshold: f32,
-    box_threshold: f32,
-    unclip_ratio: f32,
-}
-
-impl DbParams {
-    fn from_env() -> Self {
-        let read = |name: &str, default: f32| {
-            std::env::var(name)
-                .ok()
-                .and_then(|value| value.trim().parse::<f32>().ok())
-                .filter(|value| value.is_finite() && *value > 0.0)
-                .unwrap_or(default)
-        };
-        Self {
-            threshold: read(DB_THRESHOLD_ENV, DB_THRESHOLD),
-            box_threshold: read(DB_BOX_THRESHOLD_ENV, DB_BOX_THRESHOLD),
-            unclip_ratio: read(DB_UNCLIP_RATIO_ENV, DB_UNCLIP_RATIO),
-        }
-    }
-
-    fn relaxed(self) -> Self {
-        Self {
-            threshold: self.threshold * RELAXED_FACTOR,
-            box_threshold: self.box_threshold * RELAXED_FACTOR,
-            ..self
-        }
-    }
-}
-
-/// Selects how vertical lines are turned upright: `cw` or the default `ccw`
-/// (`np.rot90`, as PaddleOCR does). Only a debugging aid for checking which
-/// direction a checkpoint was trained with.
-const VERTICAL_ROTATION_ENV: &str = "KOHARU_PPOCR_VERTICAL_ROTATION";
+/// The demo's "Single bubble" preset.
+const DB_PARAMS: DbParams = DbParams {
+    threshold: 0.20,
+    box_threshold: 0.45,
+    unclip_ratio: 1.6,
+};
+const DB_ENV: &str = "KOHARU_PPOCR_DB";
+const DEBUG_ENV: &str = "KOHARU_PPOCR_DEBUG";
 
 #[derive(Debug)]
 pub struct PpOcrV6Manga {
     detector: OnnxSession,
     recognizer: OnnxSession,
     dictionary: Vec<String>,
-    rotation: Rotation,
-    db: DbParams,
+    params: DbParams,
+    debug_directory: Option<PathBuf>,
+}
+
+fn db_params_from_env() -> DbParams {
+    let Ok(value) = std::env::var(DB_ENV) else {
+        return DB_PARAMS;
+    };
+    let parsed = value
+        .split(',')
+        .map(|part| part.trim().parse::<f32>())
+        .collect::<Result<Vec<_>, _>>();
+    match parsed {
+        Ok(values) if values.len() == 3 => DbParams {
+            threshold: values[0],
+            box_threshold: values[1],
+            unclip_ratio: values[2],
+        },
+        _ => {
+            tracing::warn!(
+                "ignoring {}={:?}: expected `threshold,box_threshold,unclip_ratio`",
+                DB_ENV,
+                value
+            );
+            DB_PARAMS
+        }
+    }
 }
 
 impl PpOcrV6Manga {
@@ -142,134 +131,110 @@ impl PpOcrV6Manga {
             .with_context(|| format!("failed to load {}", detector_path.display()))?;
         let recognizer = OnnxSession::load(&recognizer_path)
             .with_context(|| format!("failed to load {}", recognizer_path.display()))?;
-        let rotation = match std::env::var(VERTICAL_ROTATION_ENV).as_deref() {
-            Ok("cw") => Rotation::Cw,
-            _ => Rotation::Ccw,
-        };
+
+        let debug_directory = std::env::var_os(DEBUG_ENV).map(PathBuf::from);
+        if let Some(directory) = &debug_directory {
+            std::fs::create_dir_all(directory)
+                .with_context(|| format!("failed to create {}", directory.display()))?;
+        }
 
         Ok(Self {
             detector,
             recognizer,
             dictionary,
-            rotation,
-            db: DbParams::from_env(),
+            params: db_params_from_env(),
+            debug_directory,
         })
     }
 
-    /// Reads a text block without knowing its page: the crop is viewed at its own
-    /// resolution, shrunk if it exceeds the detector's long side.
+    /// Reads one text-block crop and returns its lines in reading order.
     pub fn inference(&self, image: &DynamicImage) -> Result<String> {
-        let scale = page_scale(image.width(), image.height()).min(1.0);
-        self.inference_with_scale(image, scale)
-    }
-
-    /// Reads a text block cropped from a page whose detector scale is `scale`
-    /// (see [`page_scale`]).
-    pub fn inference_with_scale(&self, image: &DynamicImage, scale: f64) -> Result<String> {
         let rgb = image.to_rgb8();
-        let (width, height) = rgb.dimensions();
+        let (width, height) = (rgb.width() as usize, rgb.height() as usize);
         if width < 2 || height < 2 {
             return Ok(String::new());
         }
 
-        let mut quads = self.detect(&rgb, scale, self.db)?;
-        let mut detected = quads.len();
-        if quads.is_empty() {
-            quads = self.detect(&rgb, scale, self.db.relaxed())?;
-            detected = quads.len();
-        }
-        let whole_crop_fallback = quads.is_empty();
-        if whole_crop_fallback {
-            let (right, bottom) = (width as f32, height as f32);
-            quads.push([[0.0, 0.0], [right, 0.0], [right, bottom], [0.0, bottom]]);
-        }
-        tracing::debug!(
-            crop_width = width,
-            crop_height = height,
-            scale,
-            lines = detected,
-            whole_crop_fallback,
-            "pp-ocrv6-manga detection"
-        );
+        let (boxes, map) = self.detect(&rgb)?;
+        let vertical = layout::page_is_vertical(&boxes, width as f32, height as f32);
+        let ordered = layout::reading_order(boxes, vertical);
 
-        let mut lines = Vec::with_capacity(quads.len());
-        for quad in &quads {
-            let (crop, crop_width, crop_height) =
-                geometry::crop_quad(rgb.as_raw(), width as usize, height as usize, quad);
-            let vertical = geometry::is_vertical(crop_width, crop_height);
-            let (upright, upright_width, upright_height) = if vertical {
-                geometry::rotate90(&crop, crop_width, crop_height, self.rotation)
-            } else {
-                (crop, crop_width, crop_height)
-            };
-            let text = self.recognize(&upright, upright_width, upright_height)?;
-            tracing::debug!(
-                line_width = upright_width,
-                line_height = upright_height,
-                vertical,
-                text = text.as_str(),
-                "pp-ocrv6-manga line"
-            );
-            if text.trim().is_empty() {
-                continue;
-            }
-            lines.push(Line {
-                center: [
-                    quad.iter().map(|point| point[0]).sum::<f32>() / 4.0,
-                    quad.iter().map(|point| point[1]).sum::<f32>() / 4.0,
-                ],
-                thickness: crop_width.min(crop_height) as f32,
-                vertical,
-                text,
-            });
+        let mut texts = Vec::with_capacity(ordered.len());
+        for line in &ordered {
+            texts.push(self.read_line(&rgb, line)?);
         }
-        Ok(geometry::join_lines(&geometry::order_lines(lines)))
+        if let Some(directory) = &self.debug_directory {
+            debug::dump(directory, &rgb, &map, &ordered, &texts);
+        }
+        Ok(layout::join_lines(&texts))
     }
 
-    /// Finds text lines as quadrilaterals (top-left, top-right, bottom-right,
-    /// bottom-left) in the coordinates of `rgb`.
-    fn detect(&self, rgb: &RgbImage, scale: f64, db: DbParams) -> Result<Vec<[[f32; 2]; 4]>> {
-        let (width, height) = rgb.dimensions();
-        let (input_width, input_height) = geometry::detector_size(width, height, scale);
+    /// Finds the text lines of `rgb` and returns them with the detector's map.
+    fn detect(&self, rgb: &RgbImage) -> Result<(Vec<LineBox>, DetectorMap)> {
+        let (width, height) = (rgb.width() as usize, rgb.height() as usize);
+        let (padded, padded_width, padded_height) =
+            geometry::pad_white(rgb.as_raw(), width, height, geometry::DET_MARGIN);
+        let (input_width, input_height) = geometry::detector_size(padded_width, padded_height);
         let input = geometry::resize_normalize(
-            rgb.as_raw(),
-            width as usize,
-            height as usize,
-            input_width as usize,
-            input_height as usize,
-            MEAN,
-            STD,
-        );
-        let (shape, probabilities) = self
-            .detector
-            .run_f32([1, 3, i64::from(input_height), i64::from(input_width)], input)?;
-        ensure!(
-            probabilities.len() == input_width as usize * input_height as usize,
-            "PP-OCRv6 manga detector returned {shape:?} for a {input_width}x{input_height} input"
-        );
-        Ok(boxes_from_bitmap(
-            &probabilities,
+            &padded,
+            padded_width,
+            padded_height,
             input_width,
             input_height,
+            DETECTOR_MEAN,
+            DETECTOR_STD,
+        );
+        let (shape, values) = self
+            .detector
+            .run_f32([1, 3, input_height as i64, input_width as i64], input)?;
+        ensure!(
+            values.len() == input_width * input_height,
+            "PP-OCRv6 manga detector returned {shape:?} for a {input_width}x{input_height} input"
+        );
+
+        let layout = MapLayout {
+            map_width: input_width as u32,
+            map_height: input_height as u32,
+            padded_width,
+            padded_height,
+            margin: geometry::DET_MARGIN,
             width,
             height,
-            db.threshold,
-            db.box_threshold,
-            db.unclip_ratio,
-            DB_MIN_SIZE,
-            DB_MAX_CANDIDATES,
-        )
-        .into_iter()
-        .map(|detection| detection.polygon)
-        .collect())
+        };
+        let boxes = detect::line_boxes(&values, &layout, self.params);
+        let map = DetectorMap {
+            values,
+            width: input_width as u32,
+            height: input_height as u32,
+        };
+        Ok((boxes, map))
     }
 
-    fn recognize(&self, rgb: &[u8], width: usize, height: usize) -> Result<String> {
-        let (input, padded_width) = geometry::rec_input(rgb, width, height, MEAN, STD);
-        let (shape, scores) = self.recognizer.run_f32(
-            [1, 3, geometry::REC_HEIGHT as i64, padded_width as i64],
-            input,
-        )?;
+    /// Cuts one line out of the crop, turns it upright and reads it. Returns an
+    /// empty string for a line that is too small to read.
+    fn read_line(&self, rgb: &RgbImage, line: &LineBox) -> Result<String> {
+        let corners = geometry::order_corners(&line.corners);
+        let Some((crop, crop_width, crop_height)) = geometry::crop_perspective(
+            rgb.as_raw(),
+            rgb.width() as usize,
+            rgb.height() as usize,
+            &corners,
+        ) else {
+            return Ok(String::new());
+        };
+        // Vertical lines are read as horizontal text turned counter-clockwise.
+        let (pixels, width, height) = if crop_height > crop_width {
+            geometry::rotate_ccw(&crop, crop_width, crop_height)
+        } else {
+            (crop, crop_width, crop_height)
+        };
+        let Some((input, input_width)) = geometry::rec_input(&pixels, width, height) else {
+            return Ok(String::new());
+        };
+
+        let (shape, scores) = self
+            .recognizer
+            .run_f32([1, 3, geometry::REC_HEIGHT as i64, input_width as i64], input)?;
         ensure!(
             shape.len() == 3 && shape[0] == 1,
             "PP-OCRv6 manga recognizer returned {shape:?}, expected [1, steps, classes]"
