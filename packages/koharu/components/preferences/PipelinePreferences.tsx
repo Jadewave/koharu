@@ -166,6 +166,7 @@ function ModelOptions({
     case 'manga-ocr':
     case 'baberu-ocr':
     case 'hayai-ocr':
+    case 'pp-ocrv6-manga':
     case 'lama':
     case 'aot-inpainting':
       return null
