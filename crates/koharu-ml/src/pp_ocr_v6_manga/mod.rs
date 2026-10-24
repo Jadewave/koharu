@@ -52,6 +52,49 @@ const DB_UNCLIP_RATIO: f32 = 1.4;
 const DB_MIN_SIZE: i32 = 3;
 const DB_MAX_CANDIDATES: usize = 1000;
 
+/// Optional overrides for the DB post-processing values above, so the detector
+/// can be tuned on a deployed Space without a rebuild.
+const DB_THRESHOLD_ENV: &str = "KOHARU_PPOCR_DB_THRESHOLD";
+const DB_BOX_THRESHOLD_ENV: &str = "KOHARU_PPOCR_DB_BOX_THRESHOLD";
+const DB_UNCLIP_RATIO_ENV: &str = "KOHARU_PPOCR_DB_UNCLIP_RATIO";
+
+/// Second attempt when the detector finds no line at the normal thresholds:
+/// multiplied into the pixel and box thresholds before falling back to reading
+/// the whole crop as a single line.
+const RELAXED_FACTOR: f32 = 0.5;
+
+#[derive(Debug, Clone, Copy)]
+struct DbParams {
+    threshold: f32,
+    box_threshold: f32,
+    unclip_ratio: f32,
+}
+
+impl DbParams {
+    fn from_env() -> Self {
+        let read = |name: &str, default: f32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(default)
+        };
+        Self {
+            threshold: read(DB_THRESHOLD_ENV, DB_THRESHOLD),
+            box_threshold: read(DB_BOX_THRESHOLD_ENV, DB_BOX_THRESHOLD),
+            unclip_ratio: read(DB_UNCLIP_RATIO_ENV, DB_UNCLIP_RATIO),
+        }
+    }
+
+    fn relaxed(self) -> Self {
+        Self {
+            threshold: self.threshold * RELAXED_FACTOR,
+            box_threshold: self.box_threshold * RELAXED_FACTOR,
+            ..self
+        }
+    }
+}
+
 /// Selects how vertical lines are turned upright: `cw` or the default `ccw`
 /// (`np.rot90`, as PaddleOCR does). Only a debugging aid for checking which
 /// direction a checkpoint was trained with.
@@ -63,6 +106,7 @@ pub struct PpOcrV6Manga {
     recognizer: OnnxSession,
     dictionary: Vec<String>,
     rotation: Rotation,
+    db: DbParams,
 }
 
 impl PpOcrV6Manga {
@@ -108,6 +152,7 @@ impl PpOcrV6Manga {
             recognizer,
             dictionary,
             rotation,
+            db: DbParams::from_env(),
         })
     }
 
@@ -127,11 +172,25 @@ impl PpOcrV6Manga {
             return Ok(String::new());
         }
 
-        let mut quads = self.detect(&rgb, scale)?;
+        let mut quads = self.detect(&rgb, scale, self.db)?;
+        let mut detected = quads.len();
         if quads.is_empty() {
+            quads = self.detect(&rgb, scale, self.db.relaxed())?;
+            detected = quads.len();
+        }
+        let whole_crop_fallback = quads.is_empty();
+        if whole_crop_fallback {
             let (right, bottom) = (width as f32, height as f32);
             quads.push([[0.0, 0.0], [right, 0.0], [right, bottom], [0.0, bottom]]);
         }
+        tracing::debug!(
+            crop_width = width,
+            crop_height = height,
+            scale,
+            lines = detected,
+            whole_crop_fallback,
+            "pp-ocrv6-manga detection"
+        );
 
         let mut lines = Vec::with_capacity(quads.len());
         for quad in &quads {
@@ -144,6 +203,13 @@ impl PpOcrV6Manga {
                 (crop, crop_width, crop_height)
             };
             let text = self.recognize(&upright, upright_width, upright_height)?;
+            tracing::debug!(
+                line_width = upright_width,
+                line_height = upright_height,
+                vertical,
+                text = text.as_str(),
+                "pp-ocrv6-manga line"
+            );
             if text.trim().is_empty() {
                 continue;
             }
@@ -162,7 +228,7 @@ impl PpOcrV6Manga {
 
     /// Finds text lines as quadrilaterals (top-left, top-right, bottom-right,
     /// bottom-left) in the coordinates of `rgb`.
-    fn detect(&self, rgb: &RgbImage, scale: f64) -> Result<Vec<[[f32; 2]; 4]>> {
+    fn detect(&self, rgb: &RgbImage, scale: f64, db: DbParams) -> Result<Vec<[[f32; 2]; 4]>> {
         let (width, height) = rgb.dimensions();
         let (input_width, input_height) = geometry::detector_size(width, height, scale);
         let input = geometry::resize_normalize(
@@ -187,9 +253,9 @@ impl PpOcrV6Manga {
             input_height,
             width,
             height,
-            DB_THRESHOLD,
-            DB_BOX_THRESHOLD,
-            DB_UNCLIP_RATIO,
+            db.threshold,
+            db.box_threshold,
+            db.unclip_ratio,
             DB_MIN_SIZE,
             DB_MAX_CANDIDATES,
         )
