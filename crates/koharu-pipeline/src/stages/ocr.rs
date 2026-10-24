@@ -8,7 +8,7 @@ use image::DynamicImage;
 use koharu_ml::{
     baberu_ocr::BaberuOcr, hayai_ocr::HayaiOcr, manga_ocr::MangaOcr,
     paddle_ocr_vl::PaddleOCRVLTask, paddle_ocr_vl_quantized::PaddleOCRVLQuantized,
-    pp_ocr_v6_manga::{PpOcrV6Manga, page_scale},
+    pp_ocr_v6_manga::PpOcrV6Manga,
 };
 use koharu_scene::{
     Authored, EntityId, Geometry, LanguageTag, OcrAnalysis, Origin, RecognizedFrom, Region,
@@ -173,12 +173,8 @@ impl Model {
                 .await?
             }
             Self::PpOcrV6Manga(model) => {
-                // The detector expects glyphs at the size they have on a page
-                // resized by the model card's rule, so each crop is viewed at its
-                // page's scale rather than its own.
-                let scale = page_scale(source.width(), source.height());
-                infer_text(model.clone(), targets, move |model, image| {
-                    model.inference_with_scale(image, scale)
+                infer_text(model.clone(), targets, |model, image| {
+                    model.inference(image)
                 })
                 .await?
             }
