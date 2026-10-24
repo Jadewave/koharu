@@ -8,6 +8,7 @@ use koharu_torch::Device;
 
 use crate::backend::TryIntoDevice;
 
+pub(crate) use self::processor::boxes_from_bitmap;
 pub use self::{
     config::PPOCRV6MediumDetConfig,
     processor::{PPOCRV6MediumDetImageProcessor, TextDetection, TextDetections},
