@@ -188,7 +188,7 @@ impl PPOCRV6MediumDetImageProcessor {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn boxes_from_bitmap(
+pub(crate) fn boxes_from_bitmap(
     prediction: &[f32],
     width: u32,
     height: u32,
