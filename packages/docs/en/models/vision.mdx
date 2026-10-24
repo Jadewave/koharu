@@ -14,16 +14,22 @@ Text, bubble, and panel thresholds control how much evidence each class needs. L
 
 ## OCR
 
-| Processor        | Use                                               |
-| ---------------- | ------------------------------------------------- |
-| PaddleOCR-VL 1.6 | Default general vision-language OCR               |
-| Manga OCR        | Japanese manga text                               |
-| Baberu OCR       | Alternative manga-oriented recognition            |
-| Hayai OCR        | Chinese, Korean, Japanese, and English manga text |
+| Processor        | Use                                                                 |
+| ---------------- | ------------------------------------------------------------------- |
+| PaddleOCR-VL 1.6 | Default general vision-language OCR                                 |
+| Manga OCR        | Japanese manga text                                                 |
+| Baberu OCR       | Alternative manga-oriented recognition                              |
+| Hayai OCR        | Chinese, Korean, Japanese, and English manga text                   |
+| PP-OCRv6 Manga   | Line-level reading of manga and webtoon text, run with ONNX Runtime |
 
 <Note>
   OCR reads detected text regions. Check detection first when text is missing: changing the
   recognizer cannot recover a region that was never passed to it.
+</Note>
+
+<Note>
+  PP-OCRv6 Manga reads one text line at a time and runs on ONNX Runtime, which must be available as
+  `libonnxruntime.so` next to the executable or through `ORT_DYLIB_PATH`. The Docker image bundles it.
 </Note>
 
 ## Inpainting
