@@ -64,6 +64,7 @@ impl Serialize for PipelineConfig {
             OcrModel::MangaOcr => "manga-ocr",
             OcrModel::BaberuOcr => "baberu-ocr",
             OcrModel::HayaiOcr => "hayai-ocr",
+            OcrModel::PpOcrV6Manga => "pp-ocrv6-manga",
         };
         let inpainting = match &self.inpainting {
             InpaintingModel::LaMa {} => "lama",
@@ -126,6 +127,7 @@ impl<'de> Deserialize<'de> for PipelineConfig {
             "manga-ocr" => OcrModel::MangaOcr,
             "baberu-ocr" => OcrModel::BaberuOcr,
             "hayai-ocr" => OcrModel::HayaiOcr,
+            "pp-ocrv6-manga" => OcrModel::PpOcrV6Manga,
             model => {
                 return Err(serde::de::Error::custom(format!(
                     "unsupported OCR model {model}"
@@ -237,6 +239,7 @@ impl PipelineConfig {
                 | OcrModel::MangaOcr
                 | OcrModel::BaberuOcr
                 | OcrModel::HayaiOcr
+                | OcrModel::PpOcrV6Manga
         ) {
             bail!("unsupported OCR model")
         }
@@ -273,6 +276,8 @@ pub enum OcrModel {
     BaberuOcr,
     #[serde(rename = "hayai-ocr")]
     HayaiOcr,
+    #[serde(rename = "pp-ocrv6-manga")]
+    PpOcrV6Manga,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
@@ -335,6 +340,20 @@ mod tests {
                 if config.prompt == "Remove the lettering."
                     && config.negative_prompt == "letters, words"
         ));
+    }
+
+    #[test]
+    fn parses_the_pp_ocrv6_manga_recognizer() {
+        let config: PipelineConfig = toml::from_str(
+            r#"
+                [ocr]
+                model = "pp-ocrv6-manga"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(config.ocr, OcrModel::PpOcrV6Manga));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
