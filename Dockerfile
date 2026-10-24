@@ -33,6 +33,16 @@ ENV LIBCLANG_PATH=/usr/lib/llvm-18/lib
 RUN bun install --frozen-lockfile
 RUN bun run build
 
+# ONNX Runtime for PP-OCRv6 manga. The Rust side loads it at run time (`ort`
+# `load-dynamic`), so nothing is linked at build time. Keep the version in step
+# with the `ort` release pinned in Cargo.toml (rc.10 expects ONNX Runtime 1.22.x).
+ARG ORT_VERSION=1.22.0
+RUN mkdir -p /opt/ort \
+    && curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \
+        | tar -xz -C /tmp \
+    && cp -L "/tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION}" /opt/ort/libonnxruntime.so \
+    && rm -rf "/tmp/onnxruntime-linux-x64-${ORT_VERSION}"
+
 
 FROM ubuntu:24.04 AS runtime
 
@@ -109,6 +119,7 @@ COPY --from=builder /src/target/release/icudtl.dat /app/icudtl.dat
 COPY --from=builder /src/target/release/resources.pak /app/resources.pak
 COPY --from=builder /src/target/release/locales /app/locales
 COPY --from=builder /src/target/release/chrome-sandbox /app/chrome-sandbox
+COPY --from=builder /opt/ort/libonnxruntime.so /app/libonnxruntime.so
 
 RUN chown -R 1000:1000 /app \
     && chown root:root /app/chrome-sandbox \
