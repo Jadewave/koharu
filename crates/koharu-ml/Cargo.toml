@@ -11,6 +11,11 @@ repository.workspace = true
 keywords.workspace = true
 publish.workspace = true
 
+[features]
+default = ["ppocr-manga"]
+# PP-OCRv6 manga runs on ONNX Runtime. Build with `default-features = false` to drop it.
+ppocr-manga = ["dep:ort"]
+
 [dependencies]
 koharu-diffusion = { workspace = true }
 koharu-llama = { workspace = true, features = ["llguidance"] }
@@ -27,6 +32,7 @@ encoding_rs = { workspace = true }
 fast_image_resize = { workspace = true }
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
+ort = { workspace = true, optional = true }
 rayon = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
