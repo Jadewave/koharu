@@ -87,4 +87,4 @@ mod tests {
         let model = PPOCRV6MediumDet::load(crate::Device::cpu()).await.unwrap();
         model.inference(&DynamicImage::new_rgb8(64, 64)).unwrap();
     }
-  }
+}
