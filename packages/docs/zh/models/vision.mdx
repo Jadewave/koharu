@@ -14,15 +14,21 @@ icon: 'eye'
 
 ## OCR
 
-| 模型             | 用途                           |
-| ---------------- | ------------------------------ |
-| PaddleOCR-VL 1.6 | 默认通用视觉语言 OCR           |
-| Manga OCR        | 日语漫画文字                   |
-| Baberu OCR       | 另一种漫画识别模型             |
-| Hayai OCR        | 中文、韩文、日文、英文漫画文字 |
+| 模型             | 用途                                             |
+| ---------------- | ------------------------------------------------ |
+| PaddleOCR-VL 1.6 | 默认通用视觉语言 OCR                             |
+| Manga OCR        | 日语漫画文字                                     |
+| Baberu OCR       | 另一种漫画识别模型                               |
+| Hayai OCR        | 中文、韩文、日文、英文漫画文字                   |
+| PP-OCRv6 Manga   | 按行识别漫画和条漫文字（通过 ONNX Runtime 运行） |
 
 <Note>
   OCR 读取已检测到的文字区域。文字缺失时先检查检测结果：更换识别器无法恢复从未传入的区域。
+</Note>
+
+<Note>
+  PP-OCRv6 Manga 按行识别，并通过 ONNX Runtime 运行。请将 `libonnxruntime.so` 放在可执行文件旁，
+  或用 `ORT_DYLIB_PATH` 指定；Docker 镜像已内置。
 </Note>
 
 ## 图像修复
