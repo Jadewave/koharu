@@ -13,12 +13,15 @@ use catalog::LocalModelDescriptor;
 pub(crate) use catalog::{DEFAULT_MODEL, DEFAULT_QUANTIZATION};
 
 use crate::{
-    Device, Error, GenerationConfig, Model, ModelSelection, Provider, Quantization, Result,
-    TranslationRequest, loop_guard, prompt,
+    Device, Error, GenerationConfig, GlossaryEntry, Language, Model, ModelSelection, Provider,
+    Quantization, Result, TranslationRequest, loop_guard, prompt,
 };
 
 /// How many times segments the model skipped (missing or duplicated IDs) are translated again.
 const MAX_MISSING_RETRIES: u32 = 2;
+
+/// Upper bound for the tokens of one glossary update.
+const GLOSSARY_MAX_TOKENS: usize = 400;
 
 /// The partial output is checked for a repetition loop every 16 generated tokens.
 const LOOP_CHECK_MASK: usize = 15;
@@ -108,6 +111,8 @@ impl LocalTranslator {
                 "local translation skipped segments; translating them again"
             );
             let mut retry = request.clone();
+            // Encoding the page image on CPU takes minutes, so retries are text only.
+            retry.image = None;
             retry.segments = missing
                 .iter()
                 .map(|&index| request.segments[index].clone())
@@ -154,18 +159,66 @@ impl LocalTranslator {
                 || Input::new(&prompt),
                 |image| Input::new(&prompt).with_image(image),
             );
-            if reasoning {
-                llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
-            } else {
-                llm.inference_with_json_schema(&input, &options, &schema)
-            }
+            llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
         })
         .await?;
+        tracing::info!(
+            prompt_tokens = output.prompt_tokens,
+            prompt_secs = output.prompt_duration.as_secs_f32(),
+            generated_tokens = output.generated_tokens,
+            generation_secs = output.generation_duration.as_secs_f32(),
+            finish = ?output.finish_reason,
+            reasoning,
+            "local generation finished"
+        );
         Ok(prompt::parse_translations(
             "local",
             &output.text,
             &request.segments,
         )?)
+    }
+
+    /// Asks the model for the glossary entries of one page, from its source lines. Text only,
+    /// without reasoning, with a short output.
+    pub(crate) async fn extract_glossary(
+        &self,
+        target: Language,
+        glossary: &[GlossaryEntry],
+        lines: &[String],
+        generation: GenerationConfig,
+    ) -> Result<Vec<GlossaryEntry>> {
+        let (system, user) = prompt::glossary_prompts(target, glossary, lines)?;
+        let prompt = self
+            .llm
+            .render_chat_prompt_with_options(
+                &[ChatMessage::system(system), ChatMessage::user(user)],
+                ChatTemplateOptions {
+                    add_generation_prompt: true,
+                    enable_thinking: false,
+                },
+            )
+            .context("failed to render local glossary prompt")?;
+        let mut options = self.descriptor.generation.options(GenerationConfig {
+            reasoning: Some(false),
+            ..generation
+        });
+        options.max_tokens = GLOSSARY_MAX_TOKENS;
+        let schema = prompt::glossary_schema();
+        let llm = Arc::clone(&self.llm);
+        let output = tokio_rayon::spawn(move || {
+            let input = Input::new(&prompt);
+            llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
+        })
+        .await?;
+        tracing::info!(
+            prompt_tokens = output.prompt_tokens,
+            prompt_secs = output.prompt_duration.as_secs_f32(),
+            generated_tokens = output.generated_tokens,
+            generation_secs = output.generation_duration.as_secs_f32(),
+            finish = ?output.finish_reason,
+            "local glossary generation finished"
+        );
+        Ok(prompt::parse_glossary(&output.text))
     }
 
     fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
