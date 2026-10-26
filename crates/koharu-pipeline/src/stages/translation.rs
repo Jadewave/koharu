@@ -18,6 +18,31 @@ impl Processor {
     pub(super) fn new(config: TranslationConfig, translator: Translator) -> Self {
         Self { config, translator }
     }
+
+    /// True when a glossary is written for this model selection (local models only).
+    pub(super) fn builds_glossary(&self) -> bool {
+        self.config.model.provider == koharu_translator::Provider::Local
+    }
+
+    /// Lets the glossary model read the OCR text of the whole work before any page is
+    /// translated.
+    pub(super) async fn build_glossary(
+        &self,
+        project: &str,
+        lines: Vec<String>,
+        stop: impl Fn() -> bool + Send + Sync,
+    ) -> Result<()> {
+        self.translator
+            .build_glossary(
+                &self.config.model,
+                self.config.generation,
+                self.config.target_language,
+                project,
+                lines,
+                stop,
+            )
+            .await
+    }
 }
 
 #[async_trait]
