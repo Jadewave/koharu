@@ -17,13 +17,56 @@ const LENGTH_RATIO: usize = 10;
 
 /// How much of the end of a partial generation is inspected while it streams.
 const TAIL_CHARS: usize = 400;
+/// A single character repeated this many times in a row at the end of a partial generation
+/// is a loop (`”””””…`); shorter runs (ellipses, screams) are legitimate.
+const MAX_SINGLE_RUN: usize = 48;
+
+/// True when a segment contains something worth translating. Segments made only of
+/// punctuation, quotation marks or ellipses are returned unchanged: models tend to fall
+/// into a repetition loop on them.
+pub(crate) fn needs_translation(source: &str) -> bool {
+    source.chars().any(char::is_alphanumeric)
+}
 
 /// True when the end of a partial generation has fallen into a repetition loop, so the
 /// generation can be stopped instead of running to the token limit.
 pub(crate) fn tail_is_looping(text: &str) -> bool {
     let skip = text.chars().count().saturating_sub(TAIL_CHARS);
     let tail: String = text.chars().skip(skip).collect();
-    has_runaway_repeat(&collapse_runs(&tail))
+    longest_run(&tail) >= MAX_SINGLE_RUN || has_runaway_repeat(&collapse_runs(&tail))
+}
+
+/// Length of the longest run of one identical character.
+fn longest_run(text: &str) -> usize {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    let mut previous = None;
+    for character in text.chars() {
+        if previous == Some(character) {
+            run += 1;
+        } else {
+            run = 1;
+            previous = Some(character);
+        }
+        longest = longest.max(run);
+    }
+    longest
+}
+
+/// Indices of segments that came back unchanged although their source contains non-ASCII
+/// letters (kana, kanji, hangul...): the model skipped them and the source text was kept.
+pub(crate) fn untranslated_segments(sources: &[String], translations: &[String]) -> Vec<usize> {
+    sources
+        .iter()
+        .zip(translations)
+        .enumerate()
+        .filter_map(|(index, (source, translation))| {
+            let has_foreign_letters = source
+                .chars()
+                .any(|character| character.is_alphabetic() && !character.is_ascii());
+            (has_foreign_letters && translation.trim() == source.trim()).then_some(index)
+        })
+        .collect()
 }
 
 /// Indices of segments whose translation looks like a repetition loop.
@@ -145,6 +188,25 @@ mod tests {
     }
 
     #[test]
+    fn a_single_character_flood_is_a_looping_tail() {
+        let prefix = r#"{"translations": [{"id": 1, "text": ""#;
+        assert!(tail_is_looping(&format!("{prefix}{}", "”".repeat(60))));
+        assert!(!tail_is_looping(&format!("{prefix}{}", "…".repeat(12))));
+    }
+
+    #[test]
+    fn only_segments_with_letters_or_digits_need_translation() {
+        assert!(needs_translation("おはよう"));
+        assert!(needs_translation("「やめろ！」"));
+        assert!(needs_translation("3"));
+        assert!(!needs_translation("…"));
+        assert!(!needs_translation("“"));
+        assert!(!needs_translation("「」"));
+        assert!(!needs_translation("！？"));
+        assert!(!needs_translation(" "));
+    }
+
+    #[test]
     fn ordinary_json_output_is_not_a_looping_tail() {
         let mut text = String::from(r#"{"translations": ["#);
         for id in 0..12 {
@@ -152,6 +214,23 @@ mod tests {
         }
         assert!(!tail_is_looping(&text));
         assert!(!tail_is_looping(""));
+    }
+
+    #[test]
+    fn unchanged_foreign_text_counts_as_untranslated() {
+        let sources = vec![
+            "おはよう".to_owned(),
+            "OK".to_owned(),
+            "…".to_owned(),
+            "ありがとう".to_owned(),
+        ];
+        let translations = vec![
+            "おはよう".to_owned(),
+            "OK".to_owned(),
+            "…".to_owned(),
+            "Cảm ơn".to_owned(),
+        ];
+        assert_eq!(untranslated_segments(&sources, &translations), [0]);
     }
 
     #[test]
