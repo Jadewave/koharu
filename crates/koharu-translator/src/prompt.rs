@@ -5,7 +5,7 @@ use indoc::indoc;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Value, json};
 
-use crate::{Language, TranslationContext, TranslationRequest};
+use crate::{GlossaryEntry, Language, TranslationContext, TranslationRequest};
 
 pub(crate) fn prompts(request: &TranslationRequest) -> anyhow::Result<(String, String)> {
     let input = TranslationInput {
@@ -28,12 +28,25 @@ pub(crate) fn translations(
     text: &str,
     source_segments: &[String],
 ) -> anyhow::Result<Vec<String>> {
+    parse_translations(provider, text, source_segments).map(|(translations, _)| translations)
+}
+
+/// Parses a model response and also reports which segment indices the model never
+/// returned. Those entries still hold their source text in the first element.
+pub(crate) fn parse_translations(
+    provider: &str,
+    text: &str,
+    source_segments: &[String],
+) -> anyhow::Result<(Vec<String>, Vec<usize>)> {
     let output = serde_json::from_str::<TranslationOutput>(text).with_context(|| {
-        format!(
-            "{provider} returned invalid translation JSON for {} segments; response was: {}",
-            source_segments.len(),
-            snippet(text),
-        )
+        InvalidTranslationOutput {
+            message: format!(
+                "{provider} returned invalid translation JSON for {} segments; response was: {}",
+                source_segments.len(),
+                snippet(text),
+            ),
+            response: text.to_owned(),
+        }
     })?;
     let mut translations = source_segments.to_vec();
     let mut translated = vec![false; source_segments.len()];
@@ -45,7 +58,185 @@ pub(crate) fn translations(
         }
     }
 
-    Ok(translations)
+    let missing = translated
+        .iter()
+        .enumerate()
+        .filter_map(|(index, done)| (!done).then_some(index))
+        .collect();
+    Ok((translations, missing))
+}
+
+/// Context attached to a response that is not valid translation JSON. It keeps the raw
+/// response so callers can still recover the segments written before the model was cut
+/// off (typically by a repetition loop that ran into the token limit).
+#[derive(Debug)]
+pub(crate) struct InvalidTranslationOutput {
+    message: String,
+    pub(crate) response: String,
+}
+
+impl std::fmt::Display for InvalidTranslationOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// Reads whatever complete `{"id", "text"}` objects a truncated or malformed response
+/// holds. Returns the translations (source text for anything not recovered) and the
+/// indices that were not recovered. Never fails: an unusable response recovers nothing.
+pub(crate) fn salvage_translations(
+    text: &str,
+    source_segments: &[String],
+) -> (Vec<String>, Vec<usize>) {
+    let mut translations = source_segments.to_vec();
+    let mut translated = vec![false; source_segments.len()];
+
+    let array = text
+        .find("\"translations\"")
+        .and_then(|key| text[key..].find('[').map(|offset| key + offset + 1));
+    if let Some(start) = array {
+        let mut rest = &text[start..];
+        loop {
+            rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+            if !rest.starts_with('{') {
+                break;
+            }
+            let mut stream =
+                serde_json::Deserializer::from_str(rest).into_iter::<TranslationOutputSegment>();
+            let Some(Ok(segment)) = stream.next() else {
+                break;
+            };
+            let consumed = stream.byte_offset();
+            if segment.id < translations.len() && !translated[segment.id] {
+                translations[segment.id] = segment.text;
+                translated[segment.id] = true;
+            }
+            rest = &rest[consumed..];
+        }
+    }
+
+    let missing = translated
+        .iter()
+        .enumerate()
+        .filter_map(|(index, done)| (!done).then_some(index))
+        .collect();
+    (translations, missing)
+}
+
+#[derive(Serialize)]
+struct GlossaryInput<'a> {
+    glossary: &'a [GlossaryEntry],
+    lines: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct GlossaryOutput {
+    entries: Vec<GlossaryEntry>,
+}
+
+/// System and user prompts that ask a model for the new glossary entries of a stretch of the
+/// work, from its source lines alone.
+pub(crate) fn glossary_prompts(
+    target: Language,
+    glossary: &[GlossaryEntry],
+    lines: &[String],
+) -> anyhow::Result<(String, String)> {
+    let input = GlossaryInput {
+        glossary,
+        lines,
+    };
+    let user = serde_json::to_string(&input).context("failed to serialize glossary input")?;
+    let system = format!(
+        indoc! {"
+            You maintain the glossary of a manga that is being translated into {target}.
+            Other, smaller models will translate every page and must follow your glossary exactly, so you decide the renderings.
+
+            You receive the current glossary and the source lines of a stretch of the work (OCR text in reading order, page after page).
+            Return only NEW entries:
+            - name: a character, place, organization, or title seen in the lines and the {target} rendering to use for it.
+            - term: a recurring term, skill, item, or sound-effect convention and the rendering to use for it.
+            - address: how one character addresses another. `source` is \"Speaker -> Listener\" with the names used in the lines, `target` is the pronoun pair to use for the speaker and for the listener (for Vietnamese, for example \"tôi - cậu\"), chosen from their relationship, age, rank, and tone.
+
+            Rules:
+            - Choose natural renderings that will still fit the rest of the work.
+            - Skip anything already in the glossary and anything that does not appear in these lines.
+            - Write `kind` as exactly name, term, or address.
+            - At most 12 entries, every string short.
+            - Return an empty `entries` array when there is nothing new.
+        "},
+        target = target,
+    )
+    .trim_end()
+    .to_owned();
+    Ok((system, user))
+}
+
+pub(crate) fn glossary_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "entries": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string" },
+                        "source": { "type": "string" },
+                        "target": { "type": "string" }
+                    },
+                    "required": ["kind", "source", "target"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["entries"],
+        "additionalProperties": false
+    })
+}
+
+/// Reads the glossary entries of a response, keeping the complete ones when it was cut off.
+pub(crate) fn parse_glossary(text: &str) -> Vec<GlossaryEntry> {
+    if let Ok(output) = serde_json::from_str::<GlossaryOutput>(text) {
+        return output.entries;
+    }
+    let mut entries = Vec::new();
+    let array = text
+        .find("\"entries\"")
+        .and_then(|key| text[key..].find('[').map(|offset| key + offset + 1));
+    if let Some(start) = array {
+        let mut rest = &text[start..];
+        loop {
+            rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+            if !rest.starts_with('{') {
+                break;
+            }
+            let mut stream =
+                serde_json::Deserializer::from_str(rest).into_iter::<GlossaryEntry>();
+            let Some(Ok(entry)) = stream.next() else {
+                break;
+            };
+            let consumed = stream.byte_offset();
+            entries.push(entry);
+            rest = &rest[consumed..];
+        }
+    }
+    entries
+}
+
+/// The glossary as a block for the translation prompt.
+pub(crate) fn render_glossary(entries: &[GlossaryEntry]) -> String {
+    let mut block = String::from(
+        "Glossary (established earlier in this work; always use exactly these renderings):",
+    );
+    for entry in entries {
+        let _ = write!(
+            block,
+            "\n- {}: {} = {}",
+            entry.kind, entry.source, entry.target
+        );
+    }
+    block
 }
 
 /// Keeps a model response readable in a log line without truncating so hard
@@ -140,6 +331,19 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
     )
     .trim_end()
     .to_owned();
+
+    if request.target_language == Language::Vietnamese {
+        prompt.push_str("\n\n");
+        prompt.push_str(indoc! {"
+            Vietnamese address and subject consistency:
+            - Choose the pronouns for each speaker and listener (tôi, tao, mình, tớ, cậu, anh, chị, em, ông, bà, ...) from their relationship, age, rank, and tone, and keep the same pair for the whole page.
+            - Change a pair only when the source clearly shifts the relationship or tone (anger, intimacy, respect).
+            - Never alternate between different first-person or second-person pronouns for the same speaker or the same listener, inside one segment or across segments.
+            - Source text often drops the subject. Work out who speaks and who is addressed from the context and the image, and write the subject explicitly in Vietnamese when the sentence needs it, always with the pronoun already chosen for that character.
+            - Render each character name, title, and the way others address them the same way every time.
+            - When context entries are supplied, reuse the pronouns and names already used there.
+        "}.trim_end());
+    }
 
     if !request.context.is_empty() {
         prompt.push_str("\n\n");
@@ -375,5 +579,92 @@ mod tests {
         let prompt = translation_system_prompt(&request);
         assert!(prompt.contains("attached original page image"));
         assert!(prompt.contains("Translate only the supplied segments"));
+    }
+
+    #[test]
+    fn salvage_keeps_complete_segments_from_a_truncated_response() {
+        let sources = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let text = r#"{"translations":[{"id":0,"text":"Xin chào"},{"id":1,"text":"lặp lặp lặp lặp"#;
+
+        let (translations, missing) = salvage_translations(text, &sources);
+
+        assert_eq!(translations, ["Xin chào", "b", "c"]);
+        assert_eq!(missing, [1, 2]);
+    }
+
+    #[test]
+    fn salvage_recovers_nothing_from_unusable_text() {
+        let sources = vec!["a".to_owned(), "b".to_owned()];
+        for text in ["", "not json", r#"{"translations":"#, r#"{"translations":[{"id":0"#] {
+            let (translations, missing) = salvage_translations(text, &sources);
+            assert_eq!(translations, ["a", "b"], "{text}");
+            assert_eq!(missing, [0, 1], "{text}");
+        }
+    }
+
+    #[test]
+    fn invalid_output_keeps_the_raw_response() {
+        let sources = vec!["a".to_owned()];
+        let response = r#"{"translations":[{"id":0,"text":"cut"#;
+        let error = translations("test", response, &sources).unwrap_err();
+        let invalid = error
+            .downcast_ref::<InvalidTranslationOutput>()
+            .expect("typed context");
+        assert_eq!(invalid.response, response);
+    }
+
+    #[test]
+    fn glossary_output_is_parsed_even_when_truncated() {
+        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+            kind: kind.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let full = r#"{"entries":[{"kind":"name","source":"田中","target":"Tanaka"}]}"#;
+        assert_eq!(parse_glossary(full), [entry("name", "田中", "Tanaka")]);
+        let cut = r#"{"entries":[{"kind":"name","source":"田中","target":"Tanaka"},{"kind":"term","source":"霊力","target":"linh"#;
+        assert_eq!(parse_glossary(cut), [entry("name", "田中", "Tanaka")]);
+        assert!(parse_glossary("garbage").is_empty());
+        assert!(parse_glossary(r#"{"entries":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn glossary_is_rendered_one_entry_per_line() {
+        let entries = vec![
+            GlossaryEntry {
+                kind: "name".to_owned(),
+                source: "田中".to_owned(),
+                target: "Tanaka".to_owned(),
+            },
+            GlossaryEntry {
+                kind: "address".to_owned(),
+                source: "田中 -> 鈴木".to_owned(),
+                target: "tôi - cậu".to_owned(),
+            },
+        ];
+        let block = render_glossary(&entries);
+        assert!(block.starts_with("Glossary"));
+        assert!(block.contains("\n- name: 田中 = Tanaka"));
+        assert!(block.contains("\n- address: 田中 -> 鈴木 = tôi - cậu"));
+    }
+
+    #[test]
+    fn vietnamese_prompts_carry_address_consistency_rules() {
+        let vietnamese =
+            translation_system_prompt(&TranslationRequest::new(["a"], Language::Vietnamese));
+        assert!(vietnamese.contains("Vietnamese address and subject consistency"));
+        let english = translation_system_prompt(&TranslationRequest::new(["a"], Language::English));
+        assert!(!english.contains("Vietnamese address and subject consistency"));
+    }
+
+    #[test]
+    fn parse_translations_reports_missing_and_duplicate_ids() {
+        let sources = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let text = r#"{"translations":[{"id":0,"text":"A"},{"id":0,"text":"dup"},{"id":2,"text":"C"}]}"#;
+
+        let (translations, missing) = parse_translations("test", text, &sources).unwrap();
+
+        assert_eq!(translations, ["A", "b", "C"]);
+        assert_eq!(missing, [1]);
     }
 }
