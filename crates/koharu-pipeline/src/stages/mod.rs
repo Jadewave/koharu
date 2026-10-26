@@ -118,6 +118,19 @@ impl Stages {
     pub(crate) fn unload(&self, stage: Stage) -> bool {
         self.processor(stage).unload()
     }
+
+    pub(crate) fn builds_glossary(&self) -> bool {
+        self.translation.builds_glossary()
+    }
+
+    pub(crate) async fn build_glossary(
+        &self,
+        project: &str,
+        lines: Vec<String>,
+        stop: impl Fn() -> bool + Send + Sync,
+    ) -> Result<()> {
+        self.translation.build_glossary(project, lines, stop).await
+    }
 }
 
 fn generation(producer: &str, model: &str) -> Result<Generation> {
