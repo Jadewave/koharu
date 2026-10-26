@@ -140,6 +140,30 @@ impl StageRunner {
             })
     }
 
+    /// Runs between the last non-translation stage and the first translation: frees the
+    /// vision models, then lets the glossary model read the OCR text of every page.
+    pub(crate) async fn prepare_translation(
+        &self,
+        project: &str,
+        lines: Vec<String>,
+        stop: impl Fn() -> bool + Send + Sync,
+    ) -> Result<()> {
+        let heavy = self.stages.builds_glossary() && !lines.is_empty();
+        let _permit = if heavy {
+            Some(self.accelerator.acquire().await)
+        } else {
+            None
+        };
+        if heavy {
+            for stage in [Stage::Detection, Stage::Ocr, Stage::Inpainting] {
+                if self.stages.unload(stage) {
+                    tracing::info!(%stage, "unloaded model before the glossary phase");
+                }
+            }
+        }
+        self.stages.build_glossary(project, lines, stop).await
+    }
+
     fn stage_error(&self, stage: Stage, model: &str, failure: AttemptFailure) -> PipelineError {
         self.stages.unload(stage);
         let message = match failure.kind {
