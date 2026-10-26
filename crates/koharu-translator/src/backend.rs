@@ -121,6 +121,16 @@ pub(crate) fn encode_image(image: &DynamicImage) -> anyhow::Result<EncodedImage>
     })
 }
 
+/// One entry of the glossary built while translating: a name, a recurring term, or how one
+/// character addresses another. It is replayed to every model that translates later pages.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GlossaryEntry {
+    /// `name`, `term` or `address`.
+    pub kind: String,
+    pub source: String,
+    pub target: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TranslationContext {
     pub source: String,
