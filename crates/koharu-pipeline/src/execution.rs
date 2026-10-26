@@ -79,7 +79,7 @@ impl<'a> Execution<'a> {
             stop: request.stop,
             progress: request.progress,
             scope,
-            scheduler: Scheduler::new(&pages, &stages),
+            scheduler: Scheduler::new(&pages, &stages).with_translation_gate(),
             scene: snapshot,
             images: BTreeMap::new(),
             busy_stages: BTreeSet::new(),
@@ -107,6 +107,11 @@ impl<'a> Execution<'a> {
             }
 
             let Some(completion) = running.next().await else {
+                if self.scheduler.translation_gated() && !self.stopped() && self.failure.is_none()
+                {
+                    self.open_translation().await;
+                    continue;
+                }
                 break;
             };
             self.busy_stages.remove(&completion.stage);
@@ -148,6 +153,42 @@ impl<'a> Execution<'a> {
             self.stop.clone(),
             self.progress.clone(),
         ))
+    }
+
+    /// Runs once every other stage has finished on every page and before the first page is
+    /// translated: the glossary model reads the OCR text of the whole work, then the
+    /// translation model takes over. A failed glossary never fails the run.
+    async fn open_translation(&mut self) {
+        let pages = self.scope.pages().to_vec();
+        let lines = match source_lines(&self.scene, &pages, self.scope.entities(), |page| {
+            self.scope.region(page)
+        }) {
+            Ok(lines) => lines,
+            Err(error) => {
+                tracing::warn!(%error, "could not read the OCR text for the glossary");
+                Vec::new()
+            }
+        };
+        if let Some(&page) = pages.first() {
+            progress::emit(
+                self.progress.as_ref(),
+                Progress::Loading {
+                    page,
+                    stage: Stage::Translation,
+                    model: "glossary".to_owned(),
+                },
+            );
+        }
+        let project = format!("{:?}", self.scene.project_id());
+        let stop = self.stop.clone();
+        if let Err(error) = self
+            .runner
+            .prepare_translation(&project, lines, move || stop.stopped())
+            .await
+        {
+            tracing::warn!(%error, "glossary phase failed; translating without a glossary");
+        }
+        self.scheduler.open_translation();
     }
 
     async fn apply_completion(
@@ -260,6 +301,36 @@ impl<'a> Execution<'a> {
             elapsed: self.started.elapsed(),
         }
     }
+}
+
+/// The OCR text of every page in scope, in reading order.
+fn source_lines(
+    scene: &Snapshot,
+    pages: &[EntityId],
+    entities: Option<Arc<BTreeSet<EntityId>>>,
+    region: impl Fn(EntityId) -> Option<crate::Bounds>,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for &page in pages {
+        let region = region(page);
+        let Some(group) = scene.page(page)?.text_group()? else {
+            continue;
+        };
+        for layer in group.text_layers()? {
+            if !crate::scope::contains_entity(scene, page, entities.as_deref(), region, layer.id())?
+            {
+                continue;
+            }
+            let content = layer.content()?;
+            let Some(source) = content.source()? else {
+                continue;
+            };
+            if !source.text.value.trim().is_empty() {
+                lines.push(source.text.value);
+            }
+        }
+    }
+    Ok(lines)
 }
 
 fn validate_commit(previous: &Snapshot, next: &Snapshot) -> Result<()> {
