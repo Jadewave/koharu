@@ -19,6 +19,8 @@ struct StageWork {
 struct PageWork {
     page: EntityId,
     stages: Vec<StageWork>,
+    /// The page no longer holds a slot of the sliding window.
+    retired: bool,
 }
 
 impl PageWork {
@@ -46,6 +48,7 @@ impl PageWork {
 }
 
 pub(crate) struct Scheduler {
+    translation_closed: bool,
     pages: Vec<PageWork>,
     page_index: BTreeMap<EntityId, usize>,
     page_window: usize,
@@ -67,10 +70,12 @@ impl Scheduler {
                         state: WorkState::Pending,
                     })
                     .collect(),
+                retired: false,
             })
             .collect::<Vec<_>>();
         let total = pages.len().saturating_mul(stages.len());
         Self {
+            translation_closed: false,
             page_index: pages
                 .iter()
                 .enumerate()
@@ -86,6 +91,26 @@ impl Scheduler {
 
     pub(crate) fn total(&self) -> usize {
         self.total
+    }
+
+    /// Holds every translation back until `open_translation` is called, so detection, OCR
+    /// and inpainting finish for all pages first. Pages leave the sliding window as soon as
+    /// their other stages are done, so the held translations never starve the pages behind.
+    pub(crate) fn with_translation_gate(mut self) -> Self {
+        self.translation_closed = self.pages.iter().any(|page| {
+            page.stages
+                .iter()
+                .any(|work| work.stage == Stage::Translation)
+        });
+        self
+    }
+
+    pub(crate) fn translation_gated(&self) -> bool {
+        self.translation_closed
+    }
+
+    pub(crate) fn open_translation(&mut self) {
+        self.translation_closed = false;
     }
 
     pub(crate) fn start_next(
@@ -105,6 +130,7 @@ impl Scheduler {
                     .find_map(|(index, work)| {
                         (work.state == WorkState::Pending
                             && !busy_stages.contains(&work.stage)
+                            && !(self.translation_closed && work.stage == Stage::Translation)
                             && self.pages[page_index].ready(index))
                         .then_some(index)
                     });
@@ -122,23 +148,38 @@ impl Scheduler {
         None
     }
 
+    /// Marks a stage finished. Returns true when the page has just left the sliding window
+    /// or has just finished entirely, so its cached images can be released.
     pub(crate) fn complete_stage(&mut self, page: EntityId, stage: Stage) -> bool {
         let Some(&page_index) = self.page_index.get(&page) else {
             return false;
         };
+        let gated = self.translation_closed;
         let page = &mut self.pages[page_index];
         let was_finished = page.finished();
         if let Some(work) = page.stages.iter_mut().find(|work| work.stage == stage) {
             work.state = WorkState::Finished;
         }
-        let page_finished = !was_finished && page.finished();
-        if page_finished {
+        let finished = !was_finished && page.finished();
+        let settled = if gated {
+            page.stages
+                .iter()
+                .filter(|work| work.stage != Stage::Translation)
+                .all(|work| work.state == WorkState::Finished)
+        } else {
+            page.finished()
+        };
+        let retired = !page.retired && settled;
+        if retired {
+            page.retired = true;
             self.active_pages = self.active_pages.saturating_sub(1);
+        }
+        if finished {
             while self.head < self.pages.len() && self.pages[self.head].finished() {
                 self.head += 1;
             }
         }
-        page_finished
+        retired || finished
     }
 }
 
@@ -187,6 +228,52 @@ mod tests {
         assert_eq!(translation, (pages[0], Stage::Translation));
         assert!(busy.contains(&Stage::Detection));
         assert!(busy.contains(&Stage::Inpainting));
+    }
+
+    #[test]
+    fn translation_gate_lets_every_page_finish_its_other_stages_first() {
+        let pages = pages(6);
+        let mut scheduler = Scheduler::new(&pages, &Stage::ALL).with_translation_gate();
+        let busy = BTreeSet::new();
+
+        let mut other_stages = 0;
+        while let Some((page, stage)) = scheduler.start_next(&busy) {
+            assert_ne!(stage, Stage::Translation);
+            other_stages += 1;
+            scheduler.complete_stage(page, stage);
+        }
+        assert_eq!(other_stages, 18);
+        assert!(scheduler.translation_gated());
+
+        scheduler.open_translation();
+        assert!(!scheduler.translation_gated());
+        let mut translated = Vec::new();
+        while let Some((page, stage)) = scheduler.start_next(&busy) {
+            assert_eq!(stage, Stage::Translation);
+            translated.push(page);
+            assert!(scheduler.complete_stage(page, stage));
+        }
+        assert_eq!(translated, pages);
+    }
+
+    #[test]
+    fn translation_gate_is_open_without_a_translation_stage() {
+        let pages = pages(2);
+        let stages = [Stage::Detection, Stage::Ocr];
+        let scheduler = Scheduler::new(&pages, &stages).with_translation_gate();
+        assert!(!scheduler.translation_gated());
+    }
+
+    #[test]
+    fn translation_only_runs_wait_for_the_gate_too() {
+        let pages = pages(2);
+        let mut scheduler = Scheduler::new(&pages, &[Stage::Translation]).with_translation_gate();
+        let busy = BTreeSet::new();
+        assert!(scheduler.start_next(&busy).is_none());
+        scheduler.open_translation();
+        assert_eq!(scheduler.start_next(&busy), Some((pages[0], Stage::Translation)));
+        assert!(scheduler.complete_stage(pages[0], Stage::Translation));
+        assert_eq!(scheduler.start_next(&busy), Some((pages[1], Stage::Translation)));
     }
 
     #[test]
