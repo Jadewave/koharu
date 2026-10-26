@@ -10,23 +10,161 @@ mod prompt;
 mod provider;
 mod remote;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use koharu_ml::Device;
 
 use error::{Error, Result};
 use local::LocalTranslator;
 
-pub use backend::{TranslationContext, TranslationRequest};
+pub use backend::{GlossaryEntry, TranslationContext, TranslationRequest};
 pub use language::Language;
 pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
 pub use provider::{Provider, ProviderConfig, ProvidersConfig};
 
+/// The model that writes the glossary (names, terms, address pairs) every other model follows.
+const GLOSSARY_MODEL: &str = "gemma4-26b-a4b-uncensored";
+
+/// How many recent translated lines are replayed as context for the next page, so
+/// pronouns, names and tone stay the same from page to page.
+const MEMORY_PAIRS: usize = 6;
+/// Each remembered line is cut to this many characters to keep the prompt short.
+const MEMORY_SEGMENT_CHARS: usize = 60;
+/// Remembered lines are dropped after this long without a translation (a new chapter).
+const MEMORY_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// The glossary is written once per run, after OCR has read every page and before the first
+/// page is translated. The glossary model reads this many source lines at a time...
+const GLOSSARY_CHUNK_LINES: usize = 40;
+/// ...in at most this many reads (an even sample of the work when it has more lines).
+const GLOSSARY_MAX_CHUNKS: usize = 6;
+/// Entries kept in the glossary; the oldest are dropped first.
+const GLOSSARY_MAX_ENTRIES: usize = 40;
+/// Each glossary field and each shown line is cut to this many characters.
+const GLOSSARY_FIELD_CHARS: usize = 60;
+const GLOSSARY_LINE_CHARS: usize = 80;
+
+/// Names, terms and address pairs decided by the glossary model for one work.
+#[derive(Default)]
+struct Glossary {
+    language: Option<Language>,
+    project: Option<String>,
+    entries: Vec<GlossaryEntry>,
+}
+
+impl Glossary {
+    /// Starts over for another work or another target language; the same work keeps what it
+    /// has, so a later run extends the glossary instead of rebuilding it.
+    fn begin(&mut self, project: &str, language: Language) {
+        if self.language != Some(language) || self.project.as_deref() != Some(project) {
+            self.entries.clear();
+        }
+        self.language = Some(language);
+        self.project = Some(project.to_owned());
+    }
+
+    /// Adds entries that are not known yet. Existing entries win, so a rendering never
+    /// flips once it has been chosen.
+    fn merge(&mut self, entries: Vec<GlossaryEntry>) {
+        for entry in entries.into_iter().filter_map(clean_entry) {
+            let source = entry.source.to_lowercase();
+            let known = self
+                .entries
+                .iter()
+                .any(|known| known.kind == entry.kind && known.source.to_lowercase() == source);
+            if !known {
+                self.entries.push(entry);
+            }
+        }
+        let excess = self.entries.len().saturating_sub(GLOSSARY_MAX_ENTRIES);
+        self.entries.drain(..excess);
+    }
+}
+
+fn clean_entry(entry: GlossaryEntry) -> Option<GlossaryEntry> {
+    let kind = entry.kind.trim().to_lowercase();
+    let kind = if ["name", "term", "address"].contains(&kind.as_str()) {
+        kind
+    } else {
+        "term".to_owned()
+    };
+    let source: String = entry.source.trim().chars().take(GLOSSARY_FIELD_CHARS).collect();
+    let target: String = entry.target.trim().chars().take(GLOSSARY_FIELD_CHARS).collect();
+    (!source.is_empty() && !target.is_empty()).then_some(GlossaryEntry {
+        kind,
+        source,
+        target,
+    })
+}
+
+/// Source lines worth showing to the glossary model: with text, trimmed, cut short, each
+/// distinct line once, in reading order.
+fn prepare_glossary_lines(lines: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    lines
+        .into_iter()
+        .filter(|line| loop_guard::needs_translation(line))
+        .map(|line| {
+            line.trim()
+                .chars()
+                .take(GLOSSARY_LINE_CHARS)
+                .collect::<String>()
+        })
+        .filter(|line| seen.insert(line.clone()))
+        .collect()
+}
+
+/// The reads of the glossary model: consecutive chunks, thinned out evenly when the work is
+/// long so the phase stays bounded.
+fn glossary_chunks(lines: &[String]) -> Vec<&[String]> {
+    let chunks: Vec<&[String]> = lines.chunks(GLOSSARY_CHUNK_LINES).collect();
+    if chunks.len() <= GLOSSARY_MAX_CHUNKS {
+        return chunks;
+    }
+    (0..GLOSSARY_MAX_CHUNKS)
+        .map(|index| chunks[index * chunks.len() / GLOSSARY_MAX_CHUNKS])
+        .collect()
+}
+
+fn glossary_selection() -> ModelSelection {
+    ModelSelection {
+        provider: Provider::Local,
+        model: Some(GLOSSARY_MODEL.to_owned()),
+        quantization: None,
+        vision: false,
+        reasoning: false,
+    }
+}
+
+struct TranslationMemory {
+    language: Option<Language>,
+    recent: VecDeque<TranslationContext>,
+    updated: Instant,
+}
+
+impl Default for TranslationMemory {
+    fn default() -> Self {
+        Self {
+            language: None,
+            recent: VecDeque::new(),
+            updated: Instant::now(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Translator {
     providers: koharu_config::Config<ProvidersConfig>,
     local: Arc<tokio::sync::Mutex<Option<LoadedLocal>>>,
+    /// Holds the glossary model while another model translates, so neither evicts the other.
+    glossary_model: Arc<tokio::sync::Mutex<Option<LoadedLocal>>>,
+    memory: Arc<std::sync::Mutex<TranslationMemory>>,
+    glossary: Arc<std::sync::Mutex<Glossary>>,
     client: reqwest::Client,
     device: Device,
 }
@@ -51,6 +189,9 @@ impl Translator {
         Ok(Self {
             providers,
             local: Arc::new(tokio::sync::Mutex::new(None)),
+            glossary_model: Arc::new(tokio::sync::Mutex::new(None)),
+            memory: Arc::new(std::sync::Mutex::new(TranslationMemory::default())),
+            glossary: Arc::new(std::sync::Mutex::new(Glossary::default())),
             client: koharu_runtime::http_client()?,
             device,
         })
@@ -83,10 +224,17 @@ impl Translator {
     }
 
     pub fn unload(&self) -> bool {
-        self.local
+        let fallback = self
+            .glossary_model
             .try_lock()
             .map(|mut loaded| loaded.take().is_some())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let main = self
+            .local
+            .try_lock()
+            .map(|mut loaded| loaded.take().is_some())
+            .unwrap_or(false);
+        main || fallback
     }
 
     #[tracing::instrument(skip_all)]
@@ -131,6 +279,20 @@ impl Translator {
 
         let generation = generation.for_model(selection);
 
+        if request.context.is_empty() {
+            request.context = self.recall(request.target_language);
+        }
+        if let Some(block) = self.glossary_block(request.target_language) {
+            request.instructions = Some(
+                match request.instructions.as_deref().map(str::trim) {
+                    Some(instructions) if !instructions.is_empty() => {
+                        format!("{instructions}\n\n{block}")
+                    }
+                    _ => block,
+                },
+            );
+        }
+
         if Self::supports_vision(selection, &generation) {
             request.prepare_image()?;
         } else {
@@ -138,9 +300,41 @@ impl Translator {
         }
 
         let expected = request.segments.len();
-        let translated = self
-            .translate_segments(selection, generation, &request)
-            .await?;
+        let translatable: Vec<usize> = request
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| loop_guard::needs_translation(segment))
+            .map(|(index, _)| index)
+            .collect();
+        let translated = if translatable.len() == expected {
+            self.translate_segments(selection, generation, &request)
+                .await?
+        } else if translatable.is_empty() {
+            request.segments.clone()
+        } else {
+            let mut subset = request.clone();
+            subset.segments = translatable
+                .iter()
+                .map(|&index| request.segments[index].clone())
+                .collect();
+            let partial = self
+                .translate_segments(selection, generation, &subset)
+                .await?;
+            if partial.len() != translatable.len() {
+                return Err(Error::SegmentCount {
+                    provider: provider_id,
+                    expected: translatable.len(),
+                    actual: partial.len(),
+                }
+                .into());
+            }
+            let mut merged = request.segments.clone();
+            for (&index, text) in translatable.iter().zip(partial) {
+                merged[index] = text;
+            }
+            merged
+        };
         if translated.len() != expected {
             return Err(Error::SegmentCount {
                 provider: provider_id,
@@ -149,39 +343,215 @@ impl Translator {
             }
             .into());
         }
+        self.remember(request.target_language, &request.segments, &translated);
         tracing::Span::current().record("outcome", "completed");
         Ok((provider_id, translated))
     }
 
-    /// Translates every segment. With reasoning enabled the first pass runs with reasoning;
-    /// segments that come back looping (or never come back because the response was cut
-    /// off) are translated again with reasoning disabled, and only those segments.
+    /// The glossary as a prompt block, if there is one for this language.
+    fn glossary_block(&self, language: Language) -> Option<String> {
+        let glossary = self.glossary.lock().ok()?;
+        if glossary.language != Some(language) || glossary.entries.is_empty() {
+            return None;
+        }
+        Some(prompt::render_glossary(&glossary.entries))
+    }
+
+    /// Writes the glossary of a work from the OCR text of all its pages: the glossary model
+    /// reads the lines in chunks and decides the renderings of names, terms and address
+    /// pairs, then it is released so the translation model can take its place. Only local
+    /// models write glossaries; any other provider translates without one.
+    ///
+    /// A failure leaves the glossary as it was and is reported to the caller, which is
+    /// expected to translate anyway.
+    pub async fn build_glossary(
+        &self,
+        selection: &ModelSelection,
+        generation: GenerationConfig,
+        language: Language,
+        project: &str,
+        lines: Vec<String>,
+        stop: impl Fn() -> bool + Send + Sync,
+    ) -> anyhow::Result<()> {
+        if let Ok(mut glossary) = self.glossary.lock() {
+            glossary.begin(project, language);
+        }
+        if selection.provider != Provider::Local {
+            return Ok(());
+        }
+        let lines = prepare_glossary_lines(lines);
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let generation = generation.for_model(selection);
+        let shared = selection.model.as_deref() == Some(GLOSSARY_MODEL);
+        if !shared {
+            // Make room: the translation model is loaded again once the glossary is done.
+            *self.local.lock().await = None;
+        }
+        let started = Instant::now();
+        let result = self
+            .write_glossary(selection, shared, generation, language, &lines, &stop)
+            .await;
+        if !shared {
+            *self.glossary_model.lock().await = None;
+        }
+        let entries = self
+            .glossary
+            .lock()
+            .map(|glossary| glossary.entries.len())
+            .unwrap_or(0);
+        tracing::info!(
+            entries,
+            lines = lines.len(),
+            secs = started.elapsed().as_secs_f32(),
+            "glossary phase finished"
+        );
+        result
+    }
+
+    async fn write_glossary(
+        &self,
+        selection: &ModelSelection,
+        shared: bool,
+        generation: GenerationConfig,
+        language: Language,
+        lines: &[String],
+        stop: &(impl Fn() -> bool + Send + Sync),
+    ) -> anyhow::Result<()> {
+        let loaded = if shared {
+            self.local(selection).await
+        } else {
+            self.load_into(&self.glossary_model, &glossary_selection())
+                .await
+        };
+        let translator = loaded?;
+        for chunk in glossary_chunks(lines) {
+            if stop() {
+                break;
+            }
+            let known = self
+                .glossary
+                .lock()
+                .map(|glossary| glossary.entries.clone())
+                .unwrap_or_default();
+            match translator
+                .extract_glossary(language, &known, chunk, generation)
+                .await
+            {
+                Ok(entries) => {
+                    if let Ok(mut glossary) = self.glossary.lock() {
+                        glossary.merge(entries);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "glossary chunk failed; continuing"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Lines remembered from the previous pages, if they are still fresh.
+    fn recall(&self, language: Language) -> Vec<TranslationContext> {
+        let Ok(mut memory) = self.memory.lock() else {
+            return Vec::new();
+        };
+        if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
+            memory.recent.clear();
+            return Vec::new();
+        }
+        memory.recent.iter().cloned().collect()
+    }
+
+    /// Remembers the lines that translated cleanly, newest last.
+    fn remember(&self, language: Language, sources: &[String], translations: &[String]) {
+        let Ok(mut memory) = self.memory.lock() else {
+            return;
+        };
+        if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
+            memory.recent.clear();
+        }
+        memory.language = Some(language);
+        for (source, translation) in sources.iter().zip(translations) {
+            if !loop_guard::needs_translation(source)
+                || translation.trim() == source.trim()
+                || loop_guard::is_looping(source, translation)
+            {
+                continue;
+            }
+            memory.recent.push_back(TranslationContext {
+                source: source.chars().take(MEMORY_SEGMENT_CHARS).collect(),
+                translation: translation.chars().take(MEMORY_SEGMENT_CHARS).collect(),
+            });
+        }
+        while memory.recent.len() > MEMORY_PAIRS {
+            memory.recent.pop_front();
+        }
+        memory.updated = Instant::now();
+    }
+
+    /// Forgets the remembered lines and the glossary, e.g. when another work begins.
+    pub fn forget(&self) {
+        if let Ok(mut memory) = self.memory.lock() {
+            memory.recent.clear();
+        }
+        if let Ok(mut glossary) = self.glossary.lock() {
+            glossary.entries.clear();
+        }
+    }
+
+    /// Translates every segment; what cannot be translated keeps its source text.
     async fn translate_segments(
         &self,
         selection: &ModelSelection,
         generation: GenerationConfig,
         request: &TranslationRequest,
     ) -> anyhow::Result<Vec<String>> {
-        if generation.reasoning != Some(true) {
-            return self.dispatch(selection, generation, request).await;
-        }
+        self.translate_guarded(selection, generation, request)
+            .await
+            .map(|(translated, _kept)| translated)
+    }
 
+    /// Translates every segment with the main model. With reasoning enabled the first pass
+    /// runs with reasoning;
+    /// segments that come back looping (or never come back because the response was cut
+    /// off) are translated again with reasoning disabled, and only those segments.
+    /// Whatever still fails keeps its source text instead of failing the page; the indices of
+    /// those segments are returned too.
+    async fn translate_guarded(
+        &self,
+        selection: &ModelSelection,
+        generation: GenerationConfig,
+        request: &TranslationRequest,
+    ) -> anyhow::Result<(Vec<String>, Vec<usize>)> {
+        let reasoning = generation.reasoning == Some(true);
         let total = request.segments.len();
         let (mut translated, redo) = match self.dispatch(selection, generation, request).await {
             Ok(translated) => {
                 if translated.len() != total {
-                    return Ok(translated);
+                    return Ok((translated, Vec::new()));
                 }
-                let redo = loop_guard::looping_segments(&request.segments, &translated);
+                let mut redo = if reasoning {
+                    loop_guard::looping_segments(&request.segments, &translated)
+                } else {
+                    Vec::new()
+                };
+                for index in loop_guard::untranslated_segments(&request.segments, &translated) {
+                    if !redo.contains(&index) {
+                        redo.push(index);
+                    }
+                }
+                redo.sort_unstable();
                 (translated, redo)
             }
-            Err(error) if retryable(&error) => {
-                let (translated, mut redo) = match invalid_output(&error) {
-                    Some(output) => {
-                        prompt::salvage_translations(&output.response, &request.segments)
-                    }
-                    None => (request.segments.clone(), (0..total).collect()),
-                };
+            Err(error) => {
+                let recovered = invalid_output(&error).map(|output| {
+                    prompt::salvage_translations(&output.response, &request.segments)
+                });
+                if !retryable(&error) || !(reasoning || recovered.is_some()) {
+                    return Err(error);
+                }
+                let (translated, mut redo) =
+                    recovered.unwrap_or_else(|| (request.segments.clone(), (0..total).collect()));
                 for index in loop_guard::looping_segments(&request.segments, &translated) {
                     if !redo.contains(&index) {
                         redo.push(index);
@@ -192,19 +562,28 @@ impl Translator {
                     %error,
                     redo = redo.len(),
                     total,
-                    "reasoning pass failed; translating unrecovered segments without reasoning"
+                    "translation failed; unrecovered segments need another pass"
                 );
                 (translated, redo)
             }
-            Err(error) => return Err(error),
         };
         if redo.is_empty() {
-            return Ok(translated);
+            return Ok((translated, redo));
+        }
+        if !reasoning {
+            tracing::warn!(
+                kept = redo.len(),
+                total,
+                sources = ?preview(&request.segments, &redo),
+                "segments could not be translated; keeping source text"
+            );
+            return Ok((translated, redo));
         }
 
         tracing::warn!(
             looping = redo.len(),
             total,
+            sources = ?preview(&request.segments, &redo),
             "reasoning pass produced looping segments; translating them again without reasoning"
         );
         let mut retry = request.clone();
@@ -217,31 +596,63 @@ impl Translator {
             .iter()
             .map(|&index| request.segments[index].clone())
             .collect();
+        let mut failed: Vec<usize> = Vec::new();
         let without_reasoning = GenerationConfig {
             reasoning: Some(false),
             ..generation
         };
-        let retried = self.dispatch(selection, without_reasoning, &retry).await?;
-        if retried.len() != redo.len() {
-            let provider: &'static str = selection.provider.into();
-            return Err(Error::SegmentCount {
-                provider,
-                expected: redo.len(),
-                actual: retried.len(),
+        let retried = match self.dispatch(selection, without_reasoning, &retry).await {
+            Ok(retried) => {
+                if retried.len() != redo.len() {
+                    let provider: &'static str = selection.provider.into();
+                    return Err(Error::SegmentCount {
+                        provider,
+                        expected: redo.len(),
+                        actual: retried.len(),
+                    }
+                    .into());
+                }
+                retried
             }
-            .into());
-        }
+            Err(error) => match invalid_output(&error).filter(|_| retryable(&error)) {
+                Some(output) => {
+                    let (partial, missing) =
+                        prompt::salvage_translations(&output.response, &retry.segments);
+                    failed.extend(missing.iter().map(|&position| redo[position]));
+                    tracing::warn!(
+                        %error,
+                        kept = missing.len(),
+                        "translation without reasoning failed; keeping source text for the rest"
+                    );
+                    partial
+                }
+                None => return Err(error),
+            },
+        };
         for (&index, text) in redo.iter().zip(retried) {
             translated[index] = text;
+        }
+        for index in loop_guard::untranslated_segments(&request.segments, &translated) {
+            if !failed.contains(&index) {
+                failed.push(index);
+            }
         }
         let remaining = loop_guard::looping_segments(&request.segments, &translated);
         if !remaining.is_empty() {
             tracing::warn!(
-                remaining = remaining.len(),
-                "segments still look like loops after retrying without reasoning"
+                kept = remaining.len(),
+                sources = ?preview(&request.segments, &remaining),
+                "segments still loop without reasoning; keeping source text"
             );
+            for &index in &remaining {
+                translated[index] = request.segments[index].clone();
+                if !failed.contains(&index) {
+                    failed.push(index);
+                }
+            }
         }
-        Ok(translated)
+        failed.sort_unstable();
+        Ok((translated, failed))
     }
 
     async fn dispatch(
@@ -281,7 +692,15 @@ impl Translator {
     }
 
     async fn local(&self, selection: &ModelSelection) -> Result<Arc<LocalTranslator>> {
-        let mut loaded = self.local.lock().await;
+        self.load_into(&self.local, selection).await
+    }
+
+    async fn load_into(
+        &self,
+        slot: &tokio::sync::Mutex<Option<LoadedLocal>>,
+        selection: &ModelSelection,
+    ) -> Result<Arc<LocalTranslator>> {
+        let mut loaded = slot.lock().await;
         if loaded
             .as_ref()
             .is_none_or(|loaded| !loaded.matches(selection))
@@ -299,6 +718,14 @@ impl Translator {
                 .translator,
         ))
     }
+}
+
+/// The start of each listed segment, for log lines.
+fn preview(segments: &[String], indices: &[usize]) -> Vec<String> {
+    indices
+        .iter()
+        .map(|&index| segments[index].chars().take(24).collect())
+        .collect()
 }
 
 /// Finds the raw response of an unparsable translation, however the error was wrapped.
@@ -327,6 +754,67 @@ fn retryable(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glossary_keeps_the_first_rendering_and_caps_its_size() {
+        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+            kind: kind.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let mut glossary = Glossary::default();
+        glossary.merge(vec![entry("name", "田中", "Tanaka"), entry("bogus", "霊力", "linh lực")]);
+        glossary.merge(vec![entry("name", "田中", "Tanaca"), entry("name", "", "x")]);
+        assert_eq!(glossary.entries.len(), 2);
+        assert_eq!(glossary.entries[0].target, "Tanaka");
+        assert_eq!(glossary.entries[1].kind, "term");
+
+        let many: Vec<GlossaryEntry> = (0..60)
+            .map(|index| entry("name", &format!("n{index}"), "x"))
+            .collect();
+        glossary.merge(many);
+        assert_eq!(glossary.entries.len(), GLOSSARY_MAX_ENTRIES);
+        assert_eq!(glossary.entries.last().map(|e| e.source.as_str()), Some("n59"));
+    }
+
+    #[test]
+    fn glossary_lines_are_cleaned_and_deduplicated() {
+        let lines = vec![
+            "おはよう".to_owned(),
+            "…".to_owned(),
+            " おはよう ".to_owned(),
+            "やあ".to_owned(),
+        ];
+        assert_eq!(prepare_glossary_lines(lines), ["おはよう", "やあ"]);
+    }
+
+    #[test]
+    fn long_works_are_sampled_in_a_bounded_number_of_chunks() {
+        let short: Vec<String> = (0..100).map(|index| format!("line {index}")).collect();
+        assert_eq!(glossary_chunks(&short).len(), 3);
+
+        let long: Vec<String> = (0..2000).map(|index| format!("line {index}")).collect();
+        let chunks = glossary_chunks(&long);
+        assert_eq!(chunks.len(), GLOSSARY_MAX_CHUNKS);
+        assert_eq!(chunks[0][0], "line 0");
+        assert!(glossary_chunks(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_glossary_belongs_to_one_work_and_language() {
+        let entry = GlossaryEntry {
+            kind: "name".to_owned(),
+            source: "田中".to_owned(),
+            target: "Tanaka".to_owned(),
+        };
+        let mut glossary = Glossary::default();
+        glossary.begin("project-a", Language::Vietnamese);
+        glossary.merge(vec![entry]);
+        glossary.begin("project-a", Language::Vietnamese);
+        assert_eq!(glossary.entries.len(), 1);
+        glossary.begin("project-b", Language::Vietnamese);
+        assert!(glossary.entries.is_empty());
+    }
 
     #[test]
     fn invalid_output_is_found_through_the_error_wrapper() {
