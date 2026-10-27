@@ -155,13 +155,16 @@ pub(crate) fn glossary_prompts(
             Return only NEW entries:
             - name: a character, place, organization, or title seen in the lines and the {target} rendering to use for it.
             - term: a recurring term, skill, item, or sound-effect convention and the rendering to use for it.
+            - character: `source` is the character's name as it appears in the lines, `target` a short profile in {target}: gender, rough age, role, how they speak (formal, casual, rough), and the first-person pronoun they use.
+            - style: `source` is exactly work, `target` one short note on genre, setting, and overall register. At most one, and only if the glossary has none yet.
             - address: how one character addresses another. `source` is \"Speaker -> Listener\" with the names used in the lines, `target` is the pronoun pair to use for the speaker and for the listener (for Vietnamese, for example \"tôi - cậu\"), chosen from their relationship, age, rank, and tone.
 
             Rules:
             - Choose natural renderings that will still fit the rest of the work.
-            - Skip anything already in the glossary and anything that does not appear in these lines.
-            - Write `kind` as exactly name, term, or address.
-            - At most 12 entries, every string short.
+            - Be exhaustive: list every named character, place, organization, title, and recurring term in the lines, and every pair of speaking characters whose way of addressing each other you can tell.
+            - Skip entries already in the glossary you were given and anything that does not appear in these lines.
+            - Write `kind` as exactly style, address, character, name, or term.
+            - At most 20 entries, every string short.
             - Return an empty `entries` array when there is nothing new.
         "},
         target = target,
@@ -177,7 +180,7 @@ pub(crate) fn glossary_schema() -> Value {
         "properties": {
             "entries": {
                 "type": "array",
-                "maxItems": 12,
+                "maxItems": 20,
                 "items": {
                     "type": "object",
                     "properties": {
