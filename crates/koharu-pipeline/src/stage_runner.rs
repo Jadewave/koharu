@@ -1,346 +1,226 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, ensure};
-use futures::{StreamExt as _, stream::FuturesUnordered};
-use koharu_scene::{EntityId, Snapshot};
+use anyhow::Result;
+use koharu_scene::{EntityId, Patch};
 
 use crate::{
-    Committer, ErrorKind, PipelineError, Progress, ProgressSink, Report, Request, RunStatus, Stage,
-    StageOutput, StopToken,
-    images::ImageCache,
+    ErrorKind, PipelineConfig, PipelineError, Progress, ProgressSink, Stage, StopToken,
+    accelerator::AcceleratorGate,
     progress,
     resources::ResourceMonitor,
-    scheduler::Scheduler,
-    scope::NormalizedScope,
-    stage_runner::{StageCompletion, StageJob, StageOutcome, StageRunner},
-    stages::StageInput,
+    stages::{StageInput, Stages},
 };
 
-pub(crate) struct Execution<'a> {
-    runner: Arc<StageRunner>,
-    resources: Arc<ResourceMonitor>,
-    committer: &'a mut dyn Committer,
-    stop: StopToken,
-    progress: Option<ProgressSink>,
-    scope: NormalizedScope,
-    scheduler: Scheduler,
-    scene: Snapshot,
-    images: BTreeMap<EntityId, Arc<ImageCache>>,
-    busy_stages: BTreeSet<Stage>,
-    completed: usize,
-    failure: Option<PipelineError>,
-    base: koharu_scene::Revision,
-    started: Instant,
-    inpainting_mask: Option<crate::InpaintingMask>,
+pub(crate) struct StageRunner {
+    stages: Stages,
+    accelerator: AcceleratorGate,
 }
 
-impl<'a> Execution<'a> {
+impl StageRunner {
     pub(crate) fn new(
-        runner: Arc<StageRunner>,
+        config: &PipelineConfig,
+        translator: koharu_translator::Translator,
+        device: &koharu_ml::Device,
         resources: Arc<ResourceMonitor>,
-        snapshot: Snapshot,
-        request: Request,
-        committer: &'a mut dyn Committer,
-    ) -> std::result::Result<Self, PipelineError> {
-        let started = Instant::now();
-        let base = snapshot.revision();
-        let stages = request
-            .operation
-            .stages()
-            .map_err(|error| PipelineError::new(ErrorKind::InvalidInput, None, error))?;
-        let scope = NormalizedScope::new(&snapshot, &request.scope, &stages)
-            .map_err(|error| PipelineError::new(ErrorKind::InvalidInput, None, error))?;
-        let pages = scope.pages().to_vec();
-        if let Some(mask) = request.inpainting_mask.as_ref()
-            && (!pages.contains(&mask.page) || !stages.contains(&Stage::Inpainting))
-        {
-            return Err(PipelineError::new(
-                ErrorKind::InvalidInput,
-                Some(Stage::Inpainting),
-                anyhow::anyhow!("the inpainting mask page is outside the inpainting scope"),
-            ));
-        }
-        progress::emit(
-            request.progress.as_ref(),
-            Progress::Started {
-                pages: pages.clone(),
-                stages: stages.clone(),
-            },
-        );
-
+    ) -> Result<Self> {
         Ok(Self {
-            runner,
-            resources,
-            committer,
-            stop: request.stop,
-            progress: request.progress,
-            scope,
-            scheduler: Scheduler::new(&pages, &stages).with_translation_gate(),
-            scene: snapshot,
-            images: BTreeMap::new(),
-            busy_stages: BTreeSet::new(),
-            completed: 0,
-            failure: None,
-            base,
-            started,
-            inpainting_mask: request.inpainting_mask,
+            stages: Stages::new(config, translator, device)?,
+            accelerator: AcceleratorGate::new(device, resources),
         })
     }
 
-    pub(crate) async fn run(mut self) -> std::result::Result<Report, PipelineError> {
-        if self.stopped() {
-            return Ok(self.report(RunStatus::Stopped));
-        }
-
-        self.resources.start();
-        self.resources.wait_for_sample().await;
-
-        let runner = self.runner.clone();
-        let mut running = FuturesUnordered::new();
-        loop {
-            while let Some(job) = self.take_ready_job() {
-                running.push(runner.run(job));
-            }
-
-            let Some(completion) = running.next().await else {
-                if self.scheduler.translation_gated() && !self.stopped() && self.failure.is_none()
-                {
-                    self.open_translation().await;
-                    continue;
-                }
-                break;
-            };
-            self.busy_stages.remove(&completion.stage);
-            if self.stopped() || self.failure.is_some() {
-                continue;
-            }
-            if let Err(error) = self.apply_completion(completion).await {
-                self.failure = Some(error);
-            }
-        }
-
-        self.finalize()
-    }
-
-    fn take_ready_job(&mut self) -> Option<StageJob> {
-        if self.stopped() || self.failure.is_some() {
-            return None;
-        }
-        let (page, stage) = self.scheduler.start_next(&self.busy_stages)?;
-        self.busy_stages.insert(stage);
-        let images = self
-            .images
-            .entry(page)
-            .or_insert_with(|| Arc::new(ImageCache::default()))
-            .clone();
-        Some(StageJob::new(
-            stage,
-            StageInput::new(
-                self.scene.clone(),
-                page,
-                self.scope.entities(),
-                self.scope.region(page),
-                images,
-                self.inpainting_mask
-                    .as_ref()
-                    .filter(|mask| stage == Stage::Inpainting && mask.page == page)
-                    .cloned(),
-            ),
-            self.stop.clone(),
-            self.progress.clone(),
-        ))
-    }
-
-    /// Runs once every other stage has finished on every page and before the first page is
-    /// translated: the glossary model reads the OCR text of the whole work, then the
-    /// translation model takes over. A failed glossary never fails the run.
-    async fn open_translation(&mut self) {
-        let pages = self.scope.pages().to_vec();
-        let lines = match source_lines(&self.scene, &pages, self.scope.entities(), |page| {
-            self.scope.region(page)
-        }) {
-            Ok(lines) => lines,
-            Err(error) => {
-                tracing::warn!(%error, "could not read the OCR text for the glossary");
-                Vec::new()
-            }
-        };
-        if let Some(&page) = pages.first() {
-            progress::emit(
-                self.progress.as_ref(),
-                Progress::Loading {
-                    page,
-                    stage: Stage::Translation,
-                    model: "glossary".to_owned(),
-                },
-            );
-        }
-        let project = format!("{:?}", self.scene.project_id());
-        let stop = self.stop.clone();
-        if let Err(error) = self
-            .runner
-            .prepare_translation(&project, lines, move || stop.stopped())
-            .await
-        {
-            tracing::warn!(%error, "glossary phase failed; translating without a glossary");
-        }
-        self.scheduler.open_translation();
-    }
-
-    async fn apply_completion(
-        &mut self,
-        completion: StageCompletion,
-    ) -> std::result::Result<(), PipelineError> {
-        let StageCompletion {
+    #[tracing::instrument(skip_all)]
+    pub(crate) async fn run(&self, job: StageJob) -> StageCompletion {
+        let started = Instant::now();
+        let page = job.input.page();
+        let model = self.stages.model(job.stage).to_owned();
+        let outcome = self.run_with_recovery(&job, &model).await;
+        StageCompletion {
             page,
-            stage,
+            stage: job.stage,
             model,
-            elapsed,
+            elapsed: started.elapsed(),
             outcome,
-        } = completion;
-        match outcome? {
-            StageOutcome::Stopped => {}
-            StageOutcome::Skipped => {
-                self.mark_complete(page, stage);
-                progress::emit(self.progress.as_ref(), Progress::Skipped { page, stage });
-            }
-            StageOutcome::Patch(patch) => {
-                if !self.commit_patch(page, stage, patch).await? {
-                    return Ok(());
-                }
-                self.mark_complete(page, stage);
-                progress::emit(
-                    self.progress.as_ref(),
-                    Progress::Finished {
-                        page,
-                        stage,
-                        model,
-                        elapsed,
-                    },
-                );
-            }
         }
-        Ok(())
     }
 
-    async fn commit_patch(
-        &mut self,
-        page: EntityId,
-        stage: Stage,
-        patch: koharu_scene::Patch,
-    ) -> std::result::Result<bool, PipelineError> {
-        let patch = patch
-            .rebase_on(&self.scene)
-            .and_then(|patch| {
-                patch.validate_on(&self.scene)?;
-                Ok(patch.with_label(format!("Pipeline {stage} for page {page}")))
-            })
-            .context("failed to rebase stage output onto the latest scene")
-            .map_err(|error| PipelineError::new(ErrorKind::InvalidOutput, Some(stage), error))?;
-        if self.stopped() {
-            return Ok(false);
+    async fn run_with_recovery(
+        &self,
+        job: &StageJob,
+        model: &str,
+    ) -> std::result::Result<StageOutcome, PipelineError> {
+        if job.stop.stopped() {
+            return Ok(StageOutcome::Stopped);
         }
+        let skip = self.stages.skip(job.stage, &job.input).map_err(|error| {
+            self.stage_error(
+                job.stage,
+                model,
+                AttemptFailure {
+                    kind: ErrorKind::Processing,
+                    error,
+                },
+            )
+        })?;
+        if skip {
+            return Ok(StageOutcome::Skipped);
+        }
+        let permit = self.accelerator.acquire().await;
+        if job.stop.stopped() {
+            return Ok(StageOutcome::Stopped);
+        }
+        let first = self.load_and_process(job, model).await;
+        let failure = match first {
+            Ok(outcome) => return Ok(outcome),
+            Err(failure) if is_out_of_memory(&failure.error) && !job.stop.stopped() => failure,
+            Err(failure) => return Err(self.stage_error(job.stage, model, failure)),
+        };
 
-        let next = self
-            .committer
-            .commit(StageOutput { page, stage, patch })
+        drop(permit);
+        tracing::warn!(stage = %job.stage, page = %job.input.page(), error = %failure.error, "retrying stage after memory pressure");
+        let _metric =
+            tracing::info_span!(target: "koharu_metrics", "stage_retry", stage = %job.stage, model);
+        let _permit = self.accelerator.recover(job.stage, &self.stages).await;
+        if job.stop.stopped() {
+            return Ok(StageOutcome::Stopped);
+        }
+        match self.load_and_process(job, model).await {
+            Ok(outcome) => Ok(outcome),
+            Err(failure) => Err(self.stage_error(job.stage, model, failure)),
+        }
+    }
+
+    async fn load_and_process(
+        &self,
+        job: &StageJob,
+        model: &str,
+    ) -> std::result::Result<StageOutcome, AttemptFailure> {
+        progress::emit(
+            job.progress.as_ref(),
+            Progress::Loading {
+                page: job.input.page(),
+                stage: job.stage,
+                model: model.to_owned(),
+            },
+        );
+        self.stages
+            .load(job.stage)
             .await
-            .with_context(|| format!("failed to commit {stage} output for page {page}"))
-            .map_err(|error| PipelineError::new(ErrorKind::Commit, Some(stage), error))?;
-        validate_commit(&self.scene, &next)
-            .map_err(|error| PipelineError::new(ErrorKind::Commit, Some(stage), error))?;
-        self.scene = next;
-        Ok(true)
+            .map_err(|error| AttemptFailure {
+                kind: ErrorKind::ModelLoad,
+                error,
+            })?;
+        if job.stop.stopped() {
+            return Ok(StageOutcome::Stopped);
+        }
+        progress::emit(
+            job.progress.as_ref(),
+            Progress::Running {
+                page: job.input.page(),
+                stage: job.stage,
+                model: model.to_owned(),
+            },
+        );
+        self.stages
+            .process(job.stage, job.input.clone())
+            .await
+            .map(|patch| {
+                if patch.is_empty() {
+                    StageOutcome::Skipped
+                } else {
+                    StageOutcome::Patch(patch)
+                }
+            })
+            .map_err(|error| AttemptFailure {
+                kind: ErrorKind::Processing,
+                error,
+            })
     }
 
-    fn mark_complete(&mut self, page: EntityId, stage: Stage) {
-        if self.scheduler.complete_stage(page, stage) {
-            self.images.remove(&page);
-        }
-        self.completed += 1;
-    }
-
-    fn stopped(&self) -> bool {
-        self.stop.stopped()
-    }
-
-    fn finalize(mut self) -> std::result::Result<Report, PipelineError> {
-        if let Some(error) = self.failure.take() {
-            return Err(error);
-        }
-        if !self.stopped() && self.completed != self.scheduler.total() {
-            return Err(PipelineError::new(
-                ErrorKind::InvalidOutput,
-                None,
-                anyhow::anyhow!(
-                    "pipeline scheduler stopped after {} of {} work items",
-                    self.completed,
-                    self.scheduler.total()
-                ),
-            ));
-        }
-        let status = if self.stopped() {
-            RunStatus::Stopped
+    /// Runs between the last non-translation stage and the first translation: frees the
+    /// vision models, then lets the glossary model read the OCR text of every page.
+    pub(crate) async fn prepare_translation(
+        &self,
+        project: &str,
+        lines: Vec<String>,
+        stop: impl Fn() -> bool + Send + Sync,
+    ) -> Result<()> {
+        let heavy = self.stages.builds_glossary() && !lines.is_empty();
+        let _permit = if heavy {
+            Some(self.accelerator.acquire().await)
         } else {
-            RunStatus::Completed
+            None
         };
-        Ok(self.report(status))
+        if heavy {
+            for stage in [Stage::Detection, Stage::Ocr, Stage::Inpainting] {
+                if self.stages.unload(stage) {
+                    tracing::info!(%stage, "unloaded model before the glossary phase");
+                }
+            }
+        }
+        self.stages.build_glossary(project, lines, stop).await
     }
 
-    fn report(&self, status: RunStatus) -> Report {
-        Report {
-            status,
-            base: self.base,
-            final_revision: self.scene.revision(),
-            completed: self.completed,
-            total: self.scheduler.total(),
-            elapsed: self.started.elapsed(),
+    fn stage_error(&self, stage: Stage, model: &str, failure: AttemptFailure) -> PipelineError {
+        self.stages.unload(stage);
+        let message = match failure.kind {
+            ErrorKind::ModelLoad => format!("failed to load {model}"),
+            _ => format!("{model} failed"),
+        };
+        PipelineError::new(failure.kind, Some(stage), failure.error.context(message))
+    }
+}
+
+struct AttemptFailure {
+    kind: ErrorKind,
+    error: anyhow::Error,
+}
+
+fn is_out_of_memory(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        let message = source.to_string().to_ascii_lowercase();
+        message.contains("out of memory")
+            || message.contains("cuda_error_out_of_memory")
+            || message.contains("not enough memory")
+    })
+}
+
+pub(crate) struct StageJob {
+    stage: Stage,
+    input: StageInput,
+    stop: StopToken,
+    progress: Option<ProgressSink>,
+}
+
+impl StageJob {
+    pub(crate) fn new(
+        stage: Stage,
+        input: StageInput,
+        stop: StopToken,
+        progress: Option<ProgressSink>,
+    ) -> Self {
+        Self {
+            stage,
+            input,
+            stop,
+            progress,
         }
     }
 }
 
-/// The OCR text of every page in scope, in reading order.
-fn source_lines(
-    scene: &Snapshot,
-    pages: &[EntityId],
-    entities: Option<Arc<BTreeSet<EntityId>>>,
-    region: impl Fn(EntityId) -> Option<crate::Bounds>,
-) -> Result<Vec<String>> {
-    let mut lines = Vec::new();
-    for &page in pages {
-        let region = region(page);
-        let Some(group) = scene.page(page)?.text_group()? else {
-            continue;
-        };
-        for layer in group.text_layers()? {
-            if !crate::scope::contains_entity(scene, page, entities.as_deref(), region, layer.id())?
-            {
-                continue;
-            }
-            let content = layer.content()?;
-            let Some(source) = content.source()? else {
-                continue;
-            };
-            if !source.text.value.trim().is_empty() {
-                lines.push(source.text.value);
-            }
-        }
-    }
-    Ok(lines)
+pub(crate) enum StageOutcome {
+    Patch(Patch),
+    Skipped,
+    Stopped,
 }
 
-fn validate_commit(previous: &Snapshot, next: &Snapshot) -> Result<()> {
-    ensure!(
-        previous.project_id() == next.project_id(),
-        "committer returned a snapshot from another project"
-    );
-    ensure!(
-        next.revision() > previous.revision(),
-        "committer did not advance the scene revision"
-    );
-    Ok(())
+pub(crate) struct StageCompletion {
+    pub(crate) page: EntityId,
+    pub(crate) stage: Stage,
+    pub(crate) model: String,
+    pub(crate) elapsed: Duration,
+    pub(crate) outcome: std::result::Result<StageOutcome, PipelineError>,
 }
