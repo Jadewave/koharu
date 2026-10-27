@@ -21,7 +21,7 @@ use crate::{
 const MAX_MISSING_RETRIES: u32 = 2;
 
 /// Upper bound for the tokens of one glossary update.
-const GLOSSARY_MAX_TOKENS: usize = 400;
+const GLOSSARY_MAX_TOKENS: usize = 900;
 
 /// The partial output is checked for a repetition loop every 16 generated tokens.
 const LOOP_CHECK_MASK: usize = 15;
