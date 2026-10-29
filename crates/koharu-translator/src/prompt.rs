@@ -348,7 +348,7 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             - When context entries are supplied, reuse the pronouns and names already used there.
 
             Vietnamese fidelity and naturalness:
-            - First get the exact meaning of each sentence right; never invent content or guess a different meaning. Check polite forms and homographs (for example Japanese 要る "need" versus 居る "be", 御着用ください "please wear").
+            - First get the exact meaning of each sentence right; never invent content or guess a different meaning. Check polite forms and homographs (for example Japanese 要る 'need' versus 居る 'be', 御着用ください 'please wear').
             - Then say it the way a Vietnamese speaker would in that situation: short spoken sentences, fitting sentence-final particles (nhé, nhỉ, mà, đấy, thôi, ạ) for the tone and politeness, no word-for-word calques.
             - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them.
             - Keep each line about as long as the source allows, because Vietnamese text must fit the same speech bubble.
