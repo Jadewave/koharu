@@ -232,12 +232,34 @@ impl TextRenderer {
         } else {
             layout.with_font_size(descriptor.font_size.unwrap_or(maximum))
         };
-        let layout = self
+        let mut run = self
             .layout(&layout, &descriptor.text)
             .map_err(|source| Error::Layout {
                 entity: descriptor.entity,
                 source,
             })?;
+        // Free text sits in the narrow box of the original (often vertical) text, so a
+        // longer translation shrinks to an unreadable size. Widen the box around its
+        // centre until the text reaches a readable size; keep the largest result.
+        if descriptor.auto_fit
+            && !descriptor.point_text
+            && !is_bubble_text
+            && run.font_size + f32::EPSILON < FREE_TEXT_READABLE_SIZE
+        {
+            for factor in FREE_TEXT_WIDEN_FACTORS {
+                let wide = layout.clone().with_max_width(bounds.width * factor);
+                let Ok(candidate) = self.layout(&wide, &descriptor.text) else {
+                    continue;
+                };
+                if candidate.font_size > run.font_size {
+                    run = candidate;
+                }
+                if run.font_size + f32::EPSILON >= FREE_TEXT_READABLE_SIZE {
+                    break;
+                }
+            }
+        }
+        let layout = run;
         let (mut x, mut y) = if descriptor.point_text {
             (bounds.x, bounds.y)
         } else {
@@ -319,6 +341,13 @@ impl TextRenderer {
     }
 }
 
+/// Free text is widened (around its centre) until it can be drawn at least this large.
+const FREE_TEXT_READABLE_SIZE: f32 = 15.0;
+/// Width multipliers tried, in order, for free text that would otherwise be tiny.
+const FREE_TEXT_WIDEN_FACTORS: [f32; 5] = [1.4, 1.9, 2.5, 3.2, 4.0];
+/// Largest size automatic fitting starts from for free text.
+const FREE_TEXT_MAXIMUM_SIZE: f32 = 30.0;
+
 fn automatic_maximum(
     descriptor: &TextNodeDescriptor,
     bounds: LayoutBox,
@@ -331,7 +360,7 @@ fn automatic_maximum(
             bounds.width
         }
     } else {
-        24.0
+        FREE_TEXT_MAXIMUM_SIZE
     }
 }
 
@@ -477,7 +506,7 @@ mod tests {
             height: 120.0,
         };
 
-        assert_eq!(automatic_maximum(&descriptor, bounds, false), 24.0);
+        assert_eq!(automatic_maximum(&descriptor, bounds, false), FREE_TEXT_MAXIMUM_SIZE);
         assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
     }
 
