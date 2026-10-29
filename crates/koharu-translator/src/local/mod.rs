@@ -22,6 +22,7 @@ const MAX_MISSING_RETRIES: u32 = 2;
 
 /// Upper bound for the tokens of one glossary update.
 const GLOSSARY_MAX_TOKENS: usize = 900;
+const GUIDE_MAX_TOKENS: usize = 500;
 
 /// The partial output is checked for a repetition loop every 16 generated tokens.
 const LOOP_CHECK_MASK: usize = 15;
@@ -176,6 +177,49 @@ impl LocalTranslator {
             &output.text,
             &request.segments,
         )?)
+    }
+
+    /// Asks the model for the translation guide of the work, from the glossary and a sample of
+    /// the source lines. Text only, without reasoning.
+    pub(crate) async fn write_guide(
+        &self,
+        target: Language,
+        glossary: &[GlossaryEntry],
+        lines: &[String],
+        generation: GenerationConfig,
+    ) -> Result<String> {
+        let (system, user) = prompt::guide_prompts(target, glossary, lines)?;
+        let prompt = self
+            .llm
+            .render_chat_prompt_with_options(
+                &[ChatMessage::system(system), ChatMessage::user(user)],
+                ChatTemplateOptions {
+                    add_generation_prompt: true,
+                    enable_thinking: false,
+                },
+            )
+            .context("failed to render local guide prompt")?;
+        let mut options = self.descriptor.generation.options(GenerationConfig {
+            reasoning: Some(false),
+            ..generation
+        });
+        options.max_tokens = GUIDE_MAX_TOKENS;
+        let schema = prompt::guide_schema();
+        let llm = Arc::clone(&self.llm);
+        let output = tokio_rayon::spawn(move || {
+            let input = Input::new(&prompt);
+            llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
+        })
+        .await?;
+        tracing::info!(
+            prompt_tokens = output.prompt_tokens,
+            prompt_secs = output.prompt_duration.as_secs_f32(),
+            generated_tokens = output.generated_tokens,
+            generation_secs = output.generation_duration.as_secs_f32(),
+            finish = ?output.finish_reason,
+            "local guide generation finished"
+        );
+        Ok(prompt::parse_guide(&output.text))
     }
 
     /// Asks the model for the glossary entries of one page, from its source lines. Text only,
