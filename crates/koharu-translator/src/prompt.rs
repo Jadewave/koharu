@@ -320,6 +320,7 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             - Preserve meaning, character voice, emotional tone, relationship nuance, emphasis, and sound effects.
             - Localize idioms and sound effects naturally while keeping wording concise enough for speech bubbles.
             - Use surrounding segments only for disambiguation and continuity; never merge or split segments.
+            - A sentence can run across consecutive segments (for example one line split between two speech bubbles); translate each segment so that, read in order, they form one natural sentence.
             - Write every translated `text` value only in {target}; do not include source text, notes, explanations, or alternatives.
             - Never preserve or repeat original-language text; translate names, terms, and sound effects using natural {target} conventions.
 
@@ -345,6 +346,12 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             - Source text often drops the subject. Work out who speaks and who is addressed from the context and the image, and write the subject explicitly in Vietnamese when the sentence needs it, always with the pronoun already chosen for that character.
             - Render each character name, title, and the way others address them the same way every time.
             - When context entries are supplied, reuse the pronouns and names already used there.
+
+            Vietnamese fidelity and naturalness:
+            - First get the exact meaning of each sentence right; never invent content or guess a different meaning. Check polite forms and homographs (for example Japanese 要る "need" versus 居る "be", 御着用ください "please wear").
+            - Then say it the way a Vietnamese speaker would in that situation: short spoken sentences, fitting sentence-final particles (nhé, nhỉ, mà, đấy, thôi, ạ) for the tone and politeness, no word-for-word calques.
+            - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them.
+            - Keep each line about as long as the source allows, because Vietnamese text must fit the same speech bubble.
         "}.trim_end());
     }
 
@@ -656,6 +663,7 @@ mod tests {
         let vietnamese =
             translation_system_prompt(&TranslationRequest::new(["a"], Language::Vietnamese));
         assert!(vietnamese.contains("Vietnamese address and subject consistency"));
+        assert!(vietnamese.contains("Vietnamese fidelity and naturalness"));
         let english = translation_system_prompt(&TranslationRequest::new(["a"], Language::English));
         assert!(!english.contains("Vietnamese address and subject consistency"));
     }
