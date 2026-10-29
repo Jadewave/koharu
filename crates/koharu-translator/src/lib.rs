@@ -63,8 +63,6 @@ struct Glossary {
     language: Option<Language>,
     project: Option<String>,
     entries: Vec<GlossaryEntry>,
-    /// Short briefing on the work, written once after the entries and sent with every page.
-    guide: String,
 }
 
 impl Glossary {
@@ -73,7 +71,6 @@ impl Glossary {
     fn begin(&mut self, project: &str, language: Language) {
         if self.language != Some(language) || self.project.as_deref() != Some(project) {
             self.entries.clear();
-            self.guide.clear();
         }
         self.language = Some(language);
         self.project = Some(project.to_owned());
@@ -95,35 +92,6 @@ impl Glossary {
         let excess = self.entries.len().saturating_sub(GLOSSARY_MAX_ENTRIES);
         self.entries.drain(..excess);
     }
-}
-
-/// Source lines the guide is written from (spread evenly over the work), the glossary entries
-/// shown with them, and the longest guide kept. Prefill on a CPU is slow, so all three are small.
-const GUIDE_SAMPLE_LINES: usize = 40;
-const GUIDE_MAX_ENTRIES: usize = 40;
-const GUIDE_MAX_CHARS: usize = 900;
-
-/// An even sample of the work's lines, in reading order.
-fn guide_sample(lines: &[String]) -> Vec<String> {
-    if lines.len() <= GUIDE_SAMPLE_LINES {
-        return lines.to_vec();
-    }
-    (0..GUIDE_SAMPLE_LINES)
-        .map(|index| lines[index * lines.len() / GUIDE_SAMPLE_LINES].clone())
-        .collect()
-}
-
-/// The entries that help most to brief a reader on the work: style, address and character first.
-fn guide_entries(entries: &[GlossaryEntry]) -> Vec<GlossaryEntry> {
-    let mut sorted: Vec<&GlossaryEntry> = entries.iter().collect();
-    sorted.sort_by_key(|entry| {
-        GLOSSARY_KINDS
-            .iter()
-            .position(|kind| *kind == entry.kind)
-            .unwrap_or(GLOSSARY_KINDS.len())
-    });
-    sorted.truncate(GUIDE_MAX_ENTRIES);
-    sorted.into_iter().cloned().collect()
 }
 
 /// `style` entries always apply; the others are ordered by how much they help a page.
@@ -429,7 +397,7 @@ impl Translator {
     /// names, terms and characters on it (or on the pages just before it).
     fn glossary_block(&self, language: Language, segments: &[String]) -> Option<String> {
         let glossary = self.glossary.lock().ok()?;
-        if glossary.language != Some(language) {
+        if glossary.language != Some(language) || glossary.entries.is_empty() {
             return None;
         }
         let mut corpus = segments.join("\n");
@@ -440,16 +408,10 @@ impl Translator {
             }
         }
         let selected = relevant_entries(&glossary.entries, &corpus);
-        let guide = (!glossary.guide.is_empty()).then(|| prompt::render_guide(&glossary.guide));
-        match (guide, selected.is_empty()) {
-            (None, true) => None,
-            (Some(guide), true) => Some(guide),
-            (None, false) => Some(prompt::render_glossary(&selected)),
-            (Some(guide), false) => Some(format!(
-                "{guide}\n\n{}",
-                prompt::render_glossary(&selected)
-            )),
+        if selected.is_empty() {
+            return None;
         }
+        Some(prompt::render_glossary(&selected))
     }
 
     /// Writes the glossary of a work from the OCR text of all its pages: the glossary model
@@ -502,18 +464,6 @@ impl Translator {
             secs = started.elapsed().as_secs_f32(),
             "glossary phase finished"
         );
-        // Dump the whole glossary so it can be read from the logs.
-        if let Ok(glossary) = self.glossary.lock() {
-            for (index, entry) in glossary.entries.iter().enumerate() {
-                tracing::info!(
-                    "glossary entry {:03} [{}] {} => {}",
-                    index + 1,
-                    entry.kind,
-                    entry.source,
-                    entry.target
-                );
-            }
-        }
         result
     }
 
@@ -552,33 +502,6 @@ impl Translator {
                     }
                 }
                 Err(error) => tracing::warn!(%error, "glossary chunk failed; continuing"),
-            }
-        }
-        // The guide is written once per work; a later run keeps the one it has.
-        let needs_guide = self
-            .glossary
-            .lock()
-            .map(|glossary| glossary.guide.is_empty())
-            .unwrap_or(false);
-        if needs_guide && !stop() {
-            let entries = self
-                .glossary
-                .lock()
-                .map(|glossary| guide_entries(&glossary.entries))
-                .unwrap_or_default();
-            match translator
-                .write_guide(language, &entries, &guide_sample(lines), generation)
-                .await
-            {
-                Ok(guide) if !guide.is_empty() => {
-                    if let Ok(mut glossary) = self.glossary.lock() {
-                        if glossary.guide.is_empty() {
-                            glossary.guide = guide.chars().take(GUIDE_MAX_CHARS).collect();
-                        }
-                    }
-                }
-                Ok(_) => tracing::warn!("guide came back empty; continuing without it"),
-                Err(error) => tracing::warn!(%error, "guide failed; continuing"),
             }
         }
         Ok(())
@@ -646,7 +569,6 @@ impl Translator {
         }
         if let Ok(mut glossary) = self.glossary.lock() {
             glossary.entries.clear();
-            glossary.guide.clear();
         }
     }
 
@@ -988,26 +910,6 @@ mod tests {
     }
 
     #[test]
-    fn the_guide_samples_lines_and_prefers_character_entries() {
-        let lines: Vec<String> = (0..400).map(|index| format!("line {index}")).collect();
-        let sample = guide_sample(&lines);
-        assert_eq!(sample.len(), GUIDE_SAMPLE_LINES);
-        assert_eq!(sample[0], "line 0");
-        assert_eq!(guide_sample(&lines[..5]).len(), 5);
-        let entry = |kind: &str, source: &str| GlossaryEntry {
-            kind: kind.to_owned(),
-            source: source.to_owned(),
-            target: "x".to_owned(),
-        };
-        let mut entries: Vec<GlossaryEntry> =
-            (0..60).map(|index| entry("term", &format!("t{index}"))).collect();
-        entries.push(entry("character", "A"));
-        let chosen = guide_entries(&entries);
-        assert_eq!(chosen.len(), GUIDE_MAX_ENTRIES);
-        assert_eq!(chosen[0].kind, "character");
-    }
-
-    #[test]
     fn a_glossary_belongs_to_one_work_and_language() {
         let entry = GlossaryEntry {
             kind: "name".to_owned(),
@@ -1019,10 +921,8 @@ mod tests {
         glossary.merge(vec![entry]);
         glossary.begin("project-a", Language::Vietnamese);
         assert_eq!(glossary.entries.len(), 1);
-        glossary.guide = "guide".to_owned();
         glossary.begin("project-b", Language::Vietnamese);
         assert!(glossary.entries.is_empty());
-        assert!(glossary.guide.is_empty());
     }
 
     #[test]
