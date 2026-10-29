@@ -818,10 +818,10 @@ impl Traversal<'_> {
                 .and_then(|value| value.color)
                 .unwrap_or([0, 0, 0, 255]),
             stroke: resolve_stroke(typography.as_ref()),
-            line_height: 1.2,
+            line_height: 1.15,
             letter_spacing: 0.0,
             word_spacing: 0.0,
-            text_inset: [4.0; 4],
+            text_inset: [3.0; 4],
             point_text: !is_bubble && layout.kind == TextLayoutKind::Point,
         };
         Ok(Some(LayerDraft {
