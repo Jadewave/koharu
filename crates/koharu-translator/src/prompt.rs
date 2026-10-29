@@ -174,71 +174,6 @@ pub(crate) fn glossary_prompts(
     Ok((system, user))
 }
 
-#[derive(Serialize)]
-struct GuideInput<'a> {
-    glossary: &'a [GlossaryEntry],
-    lines: &'a [String],
-}
-
-#[derive(Deserialize)]
-struct GuideOutput {
-    guide: String,
-}
-
-/// System and user prompts that ask the glossary model for the translation guide of the work:
-/// a short briefing written from the glossary and a sample of the source lines.
-pub(crate) fn guide_prompts(
-    target: Language,
-    glossary: &[GlossaryEntry],
-    lines: &[String],
-) -> anyhow::Result<(String, String)> {
-    let input = GuideInput { glossary, lines };
-    let user = serde_json::to_string(&input).context("failed to serialize guide input")?;
-    let system = format!(
-        indoc! {"
-            You write the translation guide of a manga that is being translated into {target}.
-            Smaller models translate every page knowing only this guide, a few glossary entries, and the page itself, so the guide must tell them what they cannot see.
-
-            You receive the glossary and a sample of the source lines of the work (OCR text in reading order).
-            Write ONE guide in English, at most 120 words, plain sentences. Quote {target} words exactly as they must appear. Cover, in this order, only what the input lets you tell:
-            - What the work is: genre, setting, who narrates and in which person, overall tone.
-            - The main characters and how they relate (who is whose husband, wife, senior, customer, and so on), and the pronouns they use for each other.
-            - How each main character speaks: formal, casual, rough, shy.
-            - Rules for this work: names, honorifics, recurring terms, sound effects.
-
-            Rules:
-            - Never invent facts; leave out what you cannot tell.
-            - Use the names and renderings of the glossary.
-            - No preamble, no markdown, no list longer than a few short items.
-        "},
-        target = target,
-    )
-    .trim_end()
-    .to_owned();
-    Ok((system, user))
-}
-
-pub(crate) fn guide_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": { "guide": { "type": "string" } },
-        "required": ["guide"],
-        "additionalProperties": false
-    })
-}
-
-/// The guide written by a model; empty when the response is unusable.
-pub(crate) fn parse_guide(text: &str) -> String {
-    serde_json::from_str::<GuideOutput>(text)
-        .map(|output| output.guide.trim().to_owned())
-        .unwrap_or_default()
-}
-
-/// The guide as a block for the translation prompt.
-pub(crate) fn render_guide(guide: &str) -> String {
-    format!("Translation guide for this work (follow it; it says who the characters are and how they speak):\n{guide}")
-}
-
 pub(crate) fn glossary_schema() -> Value {
     json!({
         "type": "object",
@@ -701,17 +636,6 @@ mod tests {
         assert_eq!(parse_glossary(cut), [entry("name", "田中", "Tanaka")]);
         assert!(parse_glossary("garbage").is_empty());
         assert!(parse_glossary(r#"{"entries":[]}"#).is_empty());
-    }
-
-    #[test]
-    fn guide_is_parsed_and_rendered() {
-        assert_eq!(parse_guide(r#"{"guide":"  A drama.  "}"#), "A drama.");
-        assert!(parse_guide("garbage").is_empty());
-        assert!(parse_guide(r#"{"guide":"cut off"#).is_empty());
-        assert!(render_guide("A drama.").ends_with("\nA drama."));
-        let (system, user) = guide_prompts(Language::Vietnamese, &[], &["やあ".to_owned()]).unwrap();
-        assert!(system.contains("translation guide"));
-        assert!(user.contains("やあ"));
     }
 
     #[test]
