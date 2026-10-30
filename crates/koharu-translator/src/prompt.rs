@@ -306,6 +306,9 @@ pub(crate) fn output_schema(expected: usize) -> Value {
     })
 }
 
+/// Added to the instructions when a Vietnamese answer came back as romaji.
+pub(crate) const VIETNAMESE_ONLY_NOTE: &str = "Correction: some earlier answers were romaji, Latin letters spelling out Japanese sounds. Every translation must be real Vietnamese with proper diacritics. For a stammer, hesitation or other voiced sound, write a short Vietnamese interjection such as 'Ưm...', 'Ơ...', 'Hự...' or 'Hả...'. Never spell a Japanese sound with Latin letters.";
+
 fn translation_system_prompt(request: &TranslationRequest) -> String {
     let source = request
         .source_language
@@ -347,11 +350,12 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             - Render each character name, title, and the way others address them the same way every time.
             - When context entries are supplied, reuse the pronouns and names already used there.
 
-            Vietnamese fidelity and naturalness:
-            - First get the exact meaning of each sentence right; never invent content or guess a different meaning. Check polite forms and homographs (for example Japanese 要る 'need' versus 居る 'be', 御着用ください 'please wear').
-            - Then say it the way a Vietnamese speaker would in that situation: short spoken sentences, fitting sentence-final particles (nhé, nhỉ, mà, đấy, thôi, ạ) for the tone and politeness, no word-for-word calques.
-            - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them.
-            - Keep each line about as long as the source allows, because Vietnamese text must fit the same speech bubble.
+            Vietnamese style and fidelity:
+            - Meaning first: translate exactly what is said; never add, drop, soften or guess. Check polite forms and homographs (for example Japanese 要る 'need' versus 居る 'be', 御着用ください 'please wear').
+            - Then write it the way a native Vietnamese comic translator would: natural spoken Vietnamese, as people really say it aloud in that situation, not the source word order. Short plain sentences; drop filler Vietnamese would not say; prefer common words over stiff Sino-Vietnamese or bookish ones.
+            - Keep each speaker's voice (rough, shy, gentle, formal, childish). Casual speech takes fitting particles such as nhé, nhỉ, mà, đấy, thôi, chứ; polite speech takes dạ, vâng, ạ. Do not overuse one particle. Stammering and trailing off stay in the sentence ('Em... em thì...').
+            - Vietnamese only: every translation is real Vietnamese with diacritics. Never romaji, that is Latin letters spelling out Japanese sounds (for example 'Nan...nnn'). A moan, stammer, hesitation or other voiced sound becomes a short Vietnamese interjection ('Ưm...', 'Ơ...', 'Hự...', 'Hả...'). Only a pure drawn sound effect that no character voices may stay as the original characters.
+            - Keep each line about as long as the source allows, because the text must fit the same speech bubble.
         "}.trim_end());
     }
 
@@ -663,9 +667,10 @@ mod tests {
         let vietnamese =
             translation_system_prompt(&TranslationRequest::new(["a"], Language::Vietnamese));
         assert!(vietnamese.contains("Vietnamese address and subject consistency"));
-        assert!(vietnamese.contains("Vietnamese fidelity and naturalness"));
+        assert!(vietnamese.contains("Vietnamese style and fidelity"));
         let english = translation_system_prompt(&TranslationRequest::new(["a"], Language::English));
         assert!(!english.contains("Vietnamese address and subject consistency"));
+        assert!(!english.contains("Vietnamese style and fidelity"));
     }
 
     #[test]
