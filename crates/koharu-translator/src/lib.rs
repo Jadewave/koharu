@@ -640,6 +640,17 @@ impl Translator {
                 (translated, redo)
             }
         };
+        if request.target_language == Language::Vietnamese && translated.len() == total {
+            let romanized: Vec<usize> =
+                loop_guard::romanized_segments(&request.segments, &translated)
+                    .into_iter()
+                    .filter(|index| !redo.contains(index))
+                    .collect();
+            if !romanized.is_empty() {
+                self.fix_romanized(selection, generation, request, &mut translated, &romanized)
+                    .await;
+            }
+        }
         if redo.is_empty() {
             return Ok((translated, redo));
         }
@@ -726,6 +737,49 @@ impl Translator {
         }
         failed.sort_unstable();
         Ok((translated, failed))
+    }
+
+    /// Translates again, text only, the segments whose Vietnamese came back as romaji. Whatever
+    /// the second try returns is kept; a failure leaves the first answer in place.
+    async fn fix_romanized(
+        &self,
+        selection: &ModelSelection,
+        generation: GenerationConfig,
+        request: &TranslationRequest,
+        translated: &mut [String],
+        indices: &[usize],
+    ) {
+        tracing::warn!(
+            romanized = indices.len(),
+            sources = ?preview(&request.segments, indices),
+            "translation came back as romaji; translating again"
+        );
+        let mut retry = request.clone();
+        if selection.provider == Provider::Local {
+            retry.image = None;
+        }
+        retry.segments = indices
+            .iter()
+            .map(|&index| request.segments[index].clone())
+            .collect();
+        let note = prompt::VIETNAMESE_ONLY_NOTE;
+        retry.instructions = Some(match request.instructions.as_deref().map(str::trim) {
+            Some(instructions) if !instructions.is_empty() => format!("{instructions}\n\n{note}"),
+            _ => note.to_owned(),
+        });
+        let config = GenerationConfig {
+            reasoning: Some(false),
+            ..generation
+        };
+        match self.dispatch(selection, config, &retry).await {
+            Ok(retried) if retried.len() == indices.len() => {
+                for (&index, text) in indices.iter().zip(retried) {
+                    translated[index] = text;
+                }
+            }
+            Ok(_) => tracing::warn!("romaji retry returned the wrong number of segments"),
+            Err(error) => tracing::warn!(%error, "romaji retry failed; keeping the first answer"),
+        }
     }
 
     async fn dispatch(
