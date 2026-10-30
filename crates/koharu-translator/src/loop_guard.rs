@@ -69,6 +69,47 @@ pub(crate) fn untranslated_segments(sources: &[String], translations: &[String])
         .collect()
 }
 
+/// Indices of segments that look like romaji: the source is short kana (a stammer, a voiced
+/// sound), yet the translation is plain ASCII with a doubled or tripled consonant such as
+/// `Nan...nnn`, which Vietnamese words never have. Only meaningful for Vietnamese output.
+pub(crate) fn romanized_segments(sources: &[String], translations: &[String]) -> Vec<usize> {
+    sources
+        .iter()
+        .zip(translations)
+        .enumerate()
+        .filter_map(|(index, (source, translation))| {
+            is_romanized(source, translation).then_some(index)
+        })
+        .collect()
+}
+
+fn is_kana(character: char) -> bool {
+    matches!(character, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}')
+}
+
+fn is_ideograph(character: char) -> bool {
+    matches!(character, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
+}
+
+fn is_romanized(source: &str, translation: &str) -> bool {
+    let has_kana = source.chars().any(is_kana);
+    let has_ideograph = source.chars().any(is_ideograph);
+    if !has_kana || has_ideograph {
+        return false;
+    }
+    let letters: Vec<char> = translation
+        .chars()
+        .filter(|character| character.is_alphabetic())
+        .collect();
+    if letters.is_empty() || !letters.iter().all(char::is_ascii_alphabetic) {
+        return false;
+    }
+    let lowered: Vec<char> = letters.iter().map(char::to_ascii_lowercase).collect();
+    lowered
+        .windows(2)
+        .any(|pair| pair[0] == pair[1] && !"aeiouy".contains(pair[0]))
+}
+
 /// Indices of segments whose translation looks like a repetition loop.
 pub(crate) fn looping_segments(sources: &[String], translations: &[String]) -> Vec<usize> {
     sources
@@ -214,6 +255,23 @@ mod tests {
         }
         assert!(!tail_is_looping(&text));
         assert!(!tail_is_looping(""));
+    }
+
+    #[test]
+    fn romaji_for_a_kana_sound_is_flagged() {
+        let sources = [
+            "なんっんん".to_owned(),
+            "なんっんん".to_owned(),
+            "ゆうくん".to_owned(),
+            "彼女".to_owned(),
+        ];
+        let translations = [
+            "Nan...nnn".to_owned(),
+            "Ưm... hự...".to_owned(),
+            "Yuu-kun".to_owned(),
+            "Kanna".to_owned(),
+        ];
+        assert_eq!(romanized_segments(&sources, &translations), [0]);
     }
 
     #[test]
