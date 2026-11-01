@@ -239,7 +239,7 @@ pub(crate) async fn process(
         let (stopped, error) = match result {
             Ok(report) => (report.status == RunStatus::Stopped, None),
             Err(error) => {
-                tracing::error!(stage = ?error.stage, %error, "processing failed");
+                tracing::error!(stage = ?error.stage, error = %format!("{error:#}"), "processing failed");
                 (false, Some(format!("{error:#}")))
             }
         };
