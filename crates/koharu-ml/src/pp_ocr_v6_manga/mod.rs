@@ -45,7 +45,7 @@ use self::{
     session::OnnxSession,
 };
 
-crate::model_repository!("Kellenok/PP-OCRv6_manga" @ "72e97f5f9938b06bcf1dda07b4d49cd0632091ca" {
+crate::model_repository!("Kellenok/PP-OCRv6_manga" @ "main" {
     DETECTOR = "det/manga_det_v0.2.onnx",
     RECOGNIZER = "rec/manga_rec_v0.2.onnx",
     DICTIONARY = "ppocrv6_dict.txt",
