@@ -8,6 +8,27 @@ use serde_json::{Value, json};
 use crate::{GlossaryEntry, Language, TranslationContext, TranslationRequest};
 
 pub(crate) fn prompts(request: &TranslationRequest) -> anyhow::Result<(String, String)> {
+    build_prompts(request, false)
+}
+
+/// Pronouns are decided by the translating model itself, while it looks at the page: only
+/// Vietnamese needs them spelled out and remembered between pages.
+pub(crate) fn records_pronouns(target: Language) -> bool {
+    target == Language::Vietnamese
+}
+
+/// Like `prompts`, but the model is also asked to write down the pronoun pair of every
+/// speaker on the page before it translates (see `output_schema_with_pronouns`).
+pub(crate) fn prompts_recording_pronouns(
+    request: &TranslationRequest,
+) -> anyhow::Result<(String, String)> {
+    build_prompts(request, records_pronouns(request.target_language))
+}
+
+fn build_prompts(
+    request: &TranslationRequest,
+    record_pronouns: bool,
+) -> anyhow::Result<(String, String)> {
     let input = TranslationInput {
         source_language: request.source_language,
         target_language: request.target_language,
@@ -20,7 +41,7 @@ pub(crate) fn prompts(request: &TranslationRequest) -> anyhow::Result<(String, S
             .collect(),
     };
     let user = serde_json::to_string(&input).context("failed to serialize translation input")?;
-    Ok((translation_system_prompt(request), user))
+    Ok((translation_system_prompt(request, record_pronouns), user))
 }
 
 pub(crate) fn translations(
@@ -228,15 +249,31 @@ pub(crate) fn parse_glossary(text: &str) -> Vec<GlossaryEntry> {
 
 /// The glossary as a block for the translation prompt.
 pub(crate) fn render_glossary(entries: &[GlossaryEntry]) -> String {
-    let mut block = String::from(
-        "Glossary (established earlier in this work; always use exactly these renderings):",
-    );
-    for entry in entries {
-        let _ = write!(
-            block,
-            "\n- {}: {} = {}",
-            entry.kind, entry.source, entry.target
+    let (pronouns, others): (Vec<&GlossaryEntry>, Vec<&GlossaryEntry>) =
+        entries.iter().partition(|entry| entry.kind == "pronoun");
+    let mut block = String::new();
+    if !others.is_empty() {
+        block.push_str(
+            "Glossary (established earlier in this work; always use exactly these renderings):",
         );
+        for entry in others {
+            let _ = write!(
+                block,
+                "\n- {}: {} = {}",
+                entry.kind, entry.source, entry.target
+            );
+        }
+    }
+    if !pronouns.is_empty() {
+        if !block.is_empty() {
+            block.push_str("\n\n");
+        }
+        block.push_str(
+            "Pronouns already used in this work (speaker's word for self - speaker's word for listener). Use the same pair whenever those characters talk to each other, unless the relationship or tone clearly shifts:",
+        );
+        for entry in pronouns {
+            let _ = write!(block, "\n- {}: {}", entry.source, entry.target);
+        }
     }
     block
 }
@@ -273,39 +310,132 @@ pub(crate) fn snippet(text: &str) -> String {
     output
 }
 
+fn translations_property(expected: usize) -> Value {
+    json!({
+        "type": "array",
+        "minItems": expected,
+        "maxItems": expected,
+        "items": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": expected.saturating_sub(1),
+                    "description": "The ID copied from the corresponding input segment."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "The translation of the input segment with this ID."
+                }
+            },
+            "required": ["id", "text"],
+            "additionalProperties": false
+        }
+    })
+}
+
 pub(crate) fn output_schema(expected: usize) -> Value {
     json!({
         "type": "object",
         "properties": {
-            "translations": {
-                "type": "array",
-                "minItems": expected,
-                "maxItems": expected,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": expected.saturating_sub(1),
-                            "description": "The ID copied from the corresponding input segment."
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "The translation of the input segment with this ID."
-                        }
-                    },
-                    "required": ["id", "text"],
-                    "additionalProperties": false
-                }
-            }
+            "translations": translations_property(expected)
         },
         "required": ["translations"],
         "additionalProperties": false
     })
 }
 
-fn translation_system_prompt(request: &TranslationRequest) -> String {
+/// The translation schema with the pronoun pairs of the page in front of the translations,
+/// so the model commits to who speaks to whom, and with which pronouns, before it writes
+/// the first line. Keys are ordered the way they are generated: `pronoun_pairs` sorts
+/// before `translations` and `pair` before `pronouns`, so the order holds whether the
+/// schema keeps insertion order or sorts its keys.
+pub(crate) fn output_schema_with_pronouns(expected: usize) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pronoun_pairs": {
+                "type": "array",
+                "maxItems": PRONOUN_PAIRS_PER_PAGE,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "pair": { "type": "string" },
+                        "pronouns": { "type": "string" }
+                    },
+                    "required": ["pair", "pronouns"],
+                    "additionalProperties": false
+                }
+            },
+            "translations": translations_property(expected)
+        },
+        "required": ["pronoun_pairs", "translations"],
+        "additionalProperties": false
+    })
+}
+
+/// Most pronoun pairs the model writes for one page.
+const PRONOUN_PAIRS_PER_PAGE: usize = 5;
+
+#[derive(Deserialize)]
+struct PronounPair {
+    pair: String,
+    pronouns: String,
+}
+
+#[derive(Deserialize)]
+struct PronounOutput {
+    #[serde(default)]
+    pronoun_pairs: Vec<PronounPair>,
+}
+
+/// The pronoun pairs a response decided, as `pronoun` glossary entries. Reads the complete
+/// pairs even when the rest of the response was cut off, because they come first.
+pub(crate) fn parse_pronouns(text: &str) -> Vec<GlossaryEntry> {
+    let pairs = match serde_json::from_str::<PronounOutput>(text) {
+        Ok(output) => output.pronoun_pairs,
+        Err(_) => salvage_pronouns(text),
+    };
+    pairs
+        .into_iter()
+        .filter_map(|pair| {
+            let source = pair.pair.trim();
+            let target = pair.pronouns.trim();
+            (!source.is_empty() && !target.is_empty()).then(|| GlossaryEntry {
+                kind: "pronoun".to_owned(),
+                source: source.to_owned(),
+                target: target.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn salvage_pronouns(text: &str) -> Vec<PronounPair> {
+    let mut pairs = Vec::new();
+    let array = text
+        .find("\"pronoun_pairs\"")
+        .and_then(|key| text[key..].find('[').map(|offset| key + offset + 1));
+    if let Some(start) = array {
+        let mut rest = &text[start..];
+        loop {
+            rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+            if !rest.starts_with('{') {
+                break;
+            }
+            let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<PronounPair>();
+            let Some(Ok(pair)) = stream.next() else {
+                break;
+            };
+            let consumed = stream.byte_offset();
+            pairs.push(pair);
+            rest = &rest[consumed..];
+        }
+    }
+    pairs
+}
+
+fn translation_system_prompt(request: &TranslationRequest, record_pronouns: bool) -> String {
     let source = request
         .source_language
         .map(|language| language.to_string())
@@ -339,7 +469,8 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
             Vietnamese address and subject consistency:
-            - Choose the pronouns for each speaker and listener (tôi, tao, mình, tớ, cậu, anh, chị, em, ông, bà, ...) from their relationship, age, rank, and tone, and keep the same pair for the whole page.
+            - Choose the pronouns for each speaker and listener (tôi, tao, mình, tớ, cậu, anh, chị, em, ông, bà, ...) from their relationship, age, rank, and tone, and keep the same pair for the whole work. When the glossary lists the pronouns of a pair of characters, use exactly those.
+            - Do not assume one character speaks every line: consecutive speech bubbles usually have different speakers, so decide the speaker and the listener of each segment separately.
             - Change a pair only when the source clearly shifts the relationship or tone (anger, intimacy, respect).
             - Never alternate between different first-person or second-person pronouns for the same speaker or the same listener, inside one segment or across segments.
             - Source text often drops the subject. Work out who speaks and who is addressed from the context and the image, and write the subject explicitly in Vietnamese when the sentence needs it, always with the pronoun already chosen for that character.
@@ -352,6 +483,24 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them.
             - Keep each line about as long as the source allows, because Vietnamese text must fit the same speech bubble.
         "}.trim_end());
+    }
+
+    if record_pronouns {
+        prompt.push_str("\n\n");
+        prompt.push_str(
+            format!(
+                indoc! {"
+                Pronoun decisions (fill `pronoun_pairs` first, then `translations`):
+                - Before translating, decide who speaks to whom on this page, using the page image when it is attached.
+                - Write one `pair` per speaker-listener couple whose lines you translate: `pair` is \"Speaker -> Listener\", using a character name from the glossary or the lines, or a short visual label such as \"girl with glasses\" when no name is known; `pronouns` is \"what the speaker calls themselves - what the speaker calls the listener\", for example \"tôi - cậu\".
+                - If the glossary already lists the pronouns of a couple, copy them exactly and change them only when the relationship or tone clearly shifts.
+                - At most {max} pairs, only couples that appear on this page. Use an empty array when the page has no dialogue between characters.
+                - Then translate every segment with exactly the pronouns you wrote.
+                "},
+                max = PRONOUN_PAIRS_PER_PAGE,
+            )
+            .trim_end(),
+        );
     }
 
     if !request.context.is_empty() {
@@ -367,7 +516,7 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
             Image requirements:
-            Use the attached original page image as visual context for speaker identity, tone, layout, and ambiguous OCR.
+            Use the attached original page image as visual context. Follow the tail of each speech bubble to the character who speaks the segment, see who is being spoken to, and read their age, gender, rank, relationship, and mood from how they look and act. Also use it for tone, layout, and ambiguous OCR.
             Translate only the supplied segments; do not add text seen in the image that is absent from the input segments.
         "}.trim_end());
     }
@@ -548,7 +697,7 @@ mod tests {
         let request = TranslationRequest::new(["hello"], Language::Korean)
             .with_source_language(Language::Japanese)
             .with_instructions("Use informal speech.");
-        let prompt = translation_system_prompt(&request);
+        let prompt = translation_system_prompt(&request, false);
         assert!(prompt.contains("from Japanese into natural Korean"));
         assert!(prompt.contains("Copy every input ID exactly once"));
         assert!(prompt.contains("Use informal speech."));
@@ -569,14 +718,14 @@ mod tests {
     #[test]
     fn empty_custom_instructions_are_ignored() {
         let request = TranslationRequest::new(["hello"], Language::English).with_instructions("  ");
-        assert!(!translation_system_prompt(&request).contains("Additional instructions"));
+        assert!(!translation_system_prompt(&request, false).contains("Additional instructions"));
     }
 
     #[test]
     fn context_is_reference_only() {
         let request = TranslationRequest::new(["Where is she?"], Language::Japanese)
             .with_context([TranslationContext::new("I saw Alice.", "アリスを見た。")]);
-        let prompt = translation_system_prompt(&request);
+        let prompt = translation_system_prompt(&request, false);
         assert!(prompt.contains("dialogue continuity"));
         assert!(prompt.contains("Do not translate or return the context"));
     }
@@ -585,7 +734,7 @@ mod tests {
     fn image_context_does_not_expand_the_translation_scope() {
         let request = TranslationRequest::new(["text"], Language::English)
             .with_image(std::sync::Arc::new(image::DynamicImage::new_rgb8(1, 1)));
-        let prompt = translation_system_prompt(&request);
+        let prompt = translation_system_prompt(&request, false);
         assert!(prompt.contains("attached original page image"));
         assert!(prompt.contains("Translate only the supplied segments"));
     }
@@ -660,10 +809,10 @@ mod tests {
     #[test]
     fn vietnamese_prompts_carry_address_consistency_rules() {
         let vietnamese =
-            translation_system_prompt(&TranslationRequest::new(["a"], Language::Vietnamese));
+            translation_system_prompt(&TranslationRequest::new(["a"], Language::Vietnamese), false);
         assert!(vietnamese.contains("Vietnamese address and subject consistency"));
         assert!(vietnamese.contains("Vietnamese fidelity and naturalness"));
-        let english = translation_system_prompt(&TranslationRequest::new(["a"], Language::English));
+        let english = translation_system_prompt(&TranslationRequest::new(["a"], Language::English), false);
         assert!(!english.contains("Vietnamese address and subject consistency"));
     }
 
@@ -676,5 +825,77 @@ mod tests {
 
         assert_eq!(translations, ["A", "b", "C"]);
         assert_eq!(missing, [1]);
+    }
+
+    #[test]
+    fn pronoun_schema_asks_for_the_pairs_before_the_translations() {
+        let schema = output_schema_with_pronouns(2);
+        let pairs = &schema["properties"]["pronoun_pairs"];
+        assert_eq!(pairs["maxItems"], PRONOUN_PAIRS_PER_PAGE);
+        assert_eq!(pairs["items"]["required"], json!(["pair", "pronouns"]));
+        assert_eq!(schema["required"], json!(["pronoun_pairs", "translations"]));
+        assert_eq!(schema["properties"]["translations"]["minItems"], 2);
+        let text = serde_json::to_string(&schema).unwrap();
+        assert!(text.find("pronoun_pairs").unwrap() < text.find("\"translations\"").unwrap());
+        assert!(text.find("\"pair\"").unwrap() < text.find("\"pronouns\"").unwrap());
+    }
+
+    #[test]
+    fn pronoun_pairs_are_read_next_to_the_translations() {
+        let source = ["a".to_owned()];
+        let response = r#"{"pronoun_pairs":[{"pair":"田中 -> 鈴木","pronouns":"tôi - cậu"}],"translations":[{"id":0,"text":"chào"}]}"#;
+        assert_eq!(translations("test", response, &source).unwrap(), ["chào"]);
+        assert_eq!(
+            parse_pronouns(response),
+            [GlossaryEntry {
+                kind: "pronoun".to_owned(),
+                source: "田中 -> 鈴木".to_owned(),
+                target: "tôi - cậu".to_owned(),
+            }]
+        );
+        assert!(parse_pronouns(r#"{"pronoun_pairs":[],"translations":[]}"#).is_empty());
+        assert!(parse_pronouns("garbage").is_empty());
+    }
+
+    #[test]
+    fn pronoun_pairs_survive_a_truncated_response() {
+        let cut = r#"{"pronoun_pairs":[{"pair":"A -> B","pronouns":"anh - em"},{"pair":"B -> A","pronouns":"em - a"#;
+        let pairs = parse_pronouns(cut);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].source, "A -> B");
+        assert_eq!(pairs[0].target, "anh - em");
+    }
+
+    #[test]
+    fn pronouns_are_only_requested_for_vietnamese() {
+        let vietnamese = TranslationRequest::new(["a"], Language::Vietnamese);
+        let english = TranslationRequest::new(["a"], Language::English);
+        let (with, _) = prompts_recording_pronouns(&vietnamese).unwrap();
+        let (without, _) = prompts_recording_pronouns(&english).unwrap();
+        let (plain, _) = prompts(&vietnamese).unwrap();
+        assert!(with.contains("Pronoun decisions"));
+        assert!(!without.contains("Pronoun decisions"));
+        assert!(!plain.contains("Pronoun decisions"));
+    }
+
+    #[test]
+    fn pronoun_entries_are_rendered_in_their_own_block() {
+        let entries = vec![
+            GlossaryEntry {
+                kind: "name".to_owned(),
+                source: "田中".to_owned(),
+                target: "Tanaka".to_owned(),
+            },
+            GlossaryEntry {
+                kind: "pronoun".to_owned(),
+                source: "田中 -> 鈴木".to_owned(),
+                target: "tôi - cậu".to_owned(),
+            },
+        ];
+        let block = render_glossary(&entries);
+        assert!(block.contains("\n- name: 田中 = Tanaka"));
+        assert!(block.contains("Pronouns already used in this work"));
+        assert!(block.contains("\n- 田中 -> 鈴木: tôi - cậu"));
+        assert!(!block.contains("- pronoun:"));
     }
 }
