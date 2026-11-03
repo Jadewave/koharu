@@ -125,7 +125,8 @@ pub(crate) fn encode_image(image: &DynamicImage) -> anyhow::Result<EncodedImage>
 /// character profile. It is replayed to every model that translates later pages.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GlossaryEntry {
-    /// `style`, `character`, `name` or `term`.
+    /// `style`, `character`, `name` or `term`, or `pronoun`: a pair of pronouns the translating
+    /// model chose for two characters (`source` is "Speaker -> Listener").
     pub kind: String,
     pub source: String,
     pub target: String,
