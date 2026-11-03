@@ -52,9 +52,6 @@ const GLOSSARY_LINE_CHARS: usize = 120;
 /// The glossary is complete, but a page is translated with only the entries that matter to
 /// it: at most this many, most useful kinds first.
 const GLOSSARY_BLOCK_MAX_ENTRIES: usize = 50;
-/// Speakers are rarely named on a page, so the pronoun pairs decided so far are not matched
-/// against its text: the latest ones all go in, up to this many.
-const GLOSSARY_PRONOUN_MAX_ENTRIES: usize = 12;
 /// Source text of this many previous pages also counts when picking a page's entries, so
 /// characters who are only implied on the page keep their pronouns.
 const MEMORY_PAGES: usize = 3;
@@ -80,17 +77,6 @@ impl Glossary {
         self.project = Some(project.to_owned());
     }
 
-    /// Adds the pronoun pairs the translating model decided while looking at a page. They
-    /// follow the same rule as every entry: the first rendering of a pair stays.
-    fn add_pronouns(&mut self, language: Language, entries: Vec<GlossaryEntry>) {
-        match self.language {
-            None => self.language = Some(language),
-            Some(current) if current != language => return,
-            Some(_) => {}
-        }
-        self.merge(entries);
-    }
-
     /// Adds entries that are not known yet. Existing entries win, so a rendering never
     /// flips once it has been chosen.
     fn merge(&mut self, entries: Vec<GlossaryEntry>) {
@@ -110,8 +96,7 @@ impl Glossary {
 }
 
 /// `style` entries always apply; the others are ordered by how much they help a page.
-/// `pronoun` entries are written by the translating model, never by the glossary pass.
-const GLOSSARY_KINDS: [&str; 5] = ["style", "pronoun", "character", "name", "term"];
+const GLOSSARY_KINDS: [&str; 4] = ["style", "character", "name", "term"];
 
 /// The entries that matter to a page, most useful kinds first: those whose source text
 /// appears in `corpus`, plus every `style` entry.
@@ -125,16 +110,9 @@ fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntr
         .iter()
         .filter(|entry| match entry.kind.as_str() {
             "style" => true,
-            "pronoun" => false,
             _ => mentioned(&entry.source),
         })
         .collect();
-    let pronouns: Vec<&GlossaryEntry> = entries
-        .iter()
-        .filter(|entry| entry.kind == "pronoun")
-        .collect();
-    let skip = pronouns.len().saturating_sub(GLOSSARY_PRONOUN_MAX_ENTRIES);
-    selected.extend(pronouns.into_iter().skip(skip));
     selected.sort_by_key(|entry| {
         GLOSSARY_KINDS
             .iter()
@@ -511,20 +489,13 @@ impl Translator {
             let known = self
                 .glossary
                 .lock()
-                .map(|glossary| {
-                    relevant_entries(&glossary.entries, &chunk.join("\n"))
-                        .into_iter()
-                        .filter(|entry| entry.kind != "pronoun")
-                        .collect::<Vec<_>>()
-                })
+                .map(|glossary| relevant_entries(&glossary.entries, &chunk.join("\n")))
                 .unwrap_or_default();
             match translator
                 .extract_glossary(language, &known, chunk, generation)
                 .await
             {
-                Ok(mut entries) => {
-                    // Pronouns are decided later, by the model that sees the page.
-                    entries.retain(|entry| !entry.kind.trim().eq_ignore_ascii_case("pronoun"));
+                Ok(entries) => {
                     if let Ok(mut glossary) = self.glossary.lock() {
                         glossary.merge(entries);
                     }
@@ -533,16 +504,6 @@ impl Translator {
             }
         }
         Ok(())
-    }
-
-    /// Keeps the pronoun pairs the model decided on a page, so later pages reuse them.
-    fn learn_pronouns(&self, language: Language, entries: Vec<GlossaryEntry>) {
-        if entries.is_empty() {
-            return;
-        }
-        if let Ok(mut glossary) = self.glossary.lock() {
-            glossary.add_pronouns(language, entries);
-        }
     }
 
     /// Lines remembered from the previous pages, if they are still fresh.
@@ -773,10 +734,11 @@ impl Translator {
         request: &TranslationRequest,
     ) -> anyhow::Result<Vec<String>> {
         if selection.provider == Provider::Local {
-            let local = self.local(selection).await?;
-            let result = local.translate(request.clone(), generation).await;
-            self.learn_pronouns(request.target_language, local.take_pronouns());
-            Ok(result?)
+            Ok(self
+                .local(selection)
+                .await?
+                .translate(request.clone(), generation)
+                .await?)
         } else {
             let providers = self.providers.read()?.clone();
             Ok(remote::translate(&self.client, &providers, selection, &generation, request).await?)
@@ -913,51 +875,6 @@ mod tests {
         assert!(relevant_entries(&entries, "")
             .iter()
             .all(|entry| entry.kind == "style"));
-    }
-
-    #[test]
-    fn pronoun_pairs_decided_on_a_page_are_kept_for_the_next_ones() {
-        let pronoun = |source: &str, target: &str| GlossaryEntry {
-            kind: "pronoun".to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-        };
-        let mut glossary = Glossary::default();
-        glossary.add_pronouns(Language::Vietnamese, vec![pronoun("A -> B", "tôi - cậu")]);
-        // The first decision of a pair stays; a new pair is added.
-        glossary.add_pronouns(
-            Language::Vietnamese,
-            vec![pronoun("A -> B", "anh - em"), pronoun("B -> A", "tớ - cậu")],
-        );
-        assert_eq!(glossary.language, Some(Language::Vietnamese));
-        assert_eq!(
-            glossary.entries,
-            [pronoun("A -> B", "tôi - cậu"), pronoun("B -> A", "tớ - cậu")]
-        );
-        // Another target language does not mix in.
-        glossary.add_pronouns(Language::English, vec![pronoun("C -> D", "x")]);
-        assert_eq!(glossary.entries.len(), 2);
-    }
-
-    #[test]
-    fn pronoun_entries_apply_to_every_page_but_only_the_latest_ones() {
-        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
-            kind: kind.to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-        };
-        let mut entries = vec![entry("name", "田中", "Tanaka")];
-        for index in 0..GLOSSARY_PRONOUN_MAX_ENTRIES + 3 {
-            entries.push(entry("pronoun", &format!("p{index} -> q{index}"), "tôi - cậu"));
-        }
-        let selected = relevant_entries(&entries, "nothing on this page");
-        assert_eq!(selected.len(), GLOSSARY_PRONOUN_MAX_ENTRIES);
-        assert!(selected.iter().all(|entry| entry.kind == "pronoun"));
-        assert_eq!(selected[0].source, "p3 -> q3");
-        assert_eq!(
-            selected.last().map(|entry| entry.source.as_str()),
-            Some("p14 -> q14")
-        );
     }
 
     #[test]
