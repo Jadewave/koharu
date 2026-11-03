@@ -155,15 +155,14 @@ pub(crate) fn glossary_prompts(
             Return only NEW entries:
             - name: a character, place, organization, or title seen in the lines and the {target} rendering to use for it.
             - term: a recurring term, skill, item, or sound-effect convention and the rendering to use for it.
-            - character: `source` is the character's name as it appears in the lines, `target` a short profile in {target}: gender, rough age, role, how they speak (formal, casual, rough), and the first-person pronoun they use.
+            - character: `source` is the character's name as it appears in the lines, `target` a short profile in {target}: gender, rough age, role, and how they speak (formal, casual, rough). Do not choose pronouns or forms of address; the translator decides them from the page.
             - style: `source` is exactly work, `target` one short note on genre, setting, and overall register. At most one, and only if the glossary has none yet.
-            - address: how one character addresses another. `source` is \"Speaker -> Listener\" with the names used in the lines, `target` is the pronoun pair to use for the speaker and for the listener (for Vietnamese, for example \"tôi - cậu\"), chosen from their relationship, age, rank, and tone.
 
             Rules:
             - Choose natural renderings that will still fit the rest of the work.
-            - Be exhaustive: list every named character, place, organization, title, and recurring term in the lines, and every pair of speaking characters whose way of addressing each other you can tell.
+            - Be exhaustive: list every named character, place, organization, title, and recurring term in the lines.
             - Skip entries already in the glossary you were given and anything that does not appear in these lines.
-            - Write `kind` as exactly style, address, character, name, or term.
+            - Write `kind` as exactly style, character, name, or term.
             - At most 20 entries, every string short.
             - Return an empty `entries` array when there is nothing new.
         "},
@@ -647,15 +646,15 @@ mod tests {
                 target: "Tanaka".to_owned(),
             },
             GlossaryEntry {
-                kind: "address".to_owned(),
-                source: "田中 -> 鈴木".to_owned(),
-                target: "tôi - cậu".to_owned(),
+                kind: "term".to_owned(),
+                source: "霊力".to_owned(),
+                target: "linh lực".to_owned(),
             },
         ];
         let block = render_glossary(&entries);
         assert!(block.starts_with("Glossary"));
         assert!(block.contains("\n- name: 田中 = Tanaka"));
-        assert!(block.contains("\n- address: 田中 -> 鈴木 = tôi - cậu"));
+        assert!(block.contains("\n- term: 霊力 = linh lực"));
     }
 
     #[test]
