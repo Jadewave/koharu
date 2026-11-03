@@ -20,6 +20,9 @@ use crate::{
 /// How many times segments the model skipped (missing or duplicated IDs) are translated again.
 const MAX_MISSING_RETRIES: u32 = 2;
 
+/// Extra output tokens a page gets when the model also writes its pronoun pairs.
+const PRONOUN_EXTRA_TOKENS: usize = 300;
+
 /// Upper bound for the tokens of one glossary update.
 const GLOSSARY_MAX_TOKENS: usize = 900;
 
@@ -43,6 +46,9 @@ fn stop_on_loop(chunk: TokenChunk<'_>) -> anyhow::Result<GenerationControl> {
 pub struct LocalTranslator {
     descriptor: LocalModelDescriptor,
     llm: Arc<Llm>,
+    /// Pronoun pairs the model decided while translating, waiting to be taken into the
+    /// glossary by the caller.
+    pronouns: std::sync::Mutex<Vec<GlossaryEntry>>,
 }
 
 impl LocalTranslator {
@@ -73,7 +79,16 @@ impl LocalTranslator {
         Ok(Self {
             descriptor,
             llm: Arc::new(llm),
+            pronouns: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// The pronoun pairs decided since the last call.
+    pub(crate) fn take_pronouns(&self) -> Vec<GlossaryEntry> {
+        self.pronouns
+            .lock()
+            .map(|mut pronouns| std::mem::take(&mut *pronouns))
+            .unwrap_or_default()
     }
 
     pub(crate) async fn translate(
@@ -99,7 +114,9 @@ impl LocalTranslator {
         let reasoning = generation.reasoning.unwrap_or(false) && self.descriptor.reasoning;
         let options = self.descriptor.generation.options(generation);
 
-        let (mut translations, mut missing) = self.generate(&request, reasoning, &options).await?;
+        let (mut translations, mut missing) = self
+            .generate(&request, reasoning, &options, true)
+            .await?;
         for attempt in 1..=MAX_MISSING_RETRIES {
             if missing.is_empty() {
                 break;
@@ -119,7 +136,10 @@ impl LocalTranslator {
                 .collect();
             let mut retry_options = options.clone();
             retry_options.seed = retry_options.seed.wrapping_add(attempt);
-            let (retried, still_missing) = self.generate(&retry, reasoning, &retry_options).await?;
+            // A retry covers only a few segments, so it does not decide pronouns again.
+            let (retried, still_missing) = self
+                .generate(&retry, reasoning, &retry_options, false)
+                .await?;
             for (position, &index) in missing.iter().enumerate() {
                 if !still_missing.contains(&position) {
                     translations[index] = retried[position].clone();
@@ -148,12 +168,22 @@ impl LocalTranslator {
         request: &TranslationRequest,
         reasoning: bool,
         options: &GenerationOptions,
+        decide_pronouns: bool,
     ) -> Result<(Vec<String>, Vec<usize>)> {
+        let record = decide_pronouns && prompt::records_pronouns(request.target_language);
         let image = request.image.clone();
-        let prompt = self.render_prompt(request, reasoning)?;
-        let schema = prompt::output_schema(request.segments.len());
+        let prompt = self.render_prompt(request, reasoning, record)?;
+        let schema = if record {
+            prompt::output_schema_with_pronouns(request.segments.len())
+        } else {
+            prompt::output_schema(request.segments.len())
+        };
         let llm = Arc::clone(&self.llm);
-        let options = options.clone();
+        let mut options = options.clone();
+        if record {
+            // Room for the pronoun pairs that come before the translations.
+            options.max_tokens += PRONOUN_EXTRA_TOKENS;
+        }
         let output = tokio_rayon::spawn(move || {
             let input = image.as_deref().map_or_else(
                 || Input::new(&prompt),
@@ -171,6 +201,14 @@ impl LocalTranslator {
             reasoning,
             "local generation finished"
         );
+        if record {
+            let decided = prompt::parse_pronouns(&output.text);
+            if !decided.is_empty() {
+                if let Ok(mut pronouns) = self.pronouns.lock() {
+                    pronouns.extend(decided);
+                }
+            }
+        }
         Ok(prompt::parse_translations(
             "local",
             &output.text,
@@ -221,8 +259,17 @@ impl LocalTranslator {
         Ok(prompt::parse_glossary(&output.text))
     }
 
-    fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
-        let (system, payload) = prompt::prompts(request)?;
+    fn render_prompt(
+        &self,
+        request: &TranslationRequest,
+        reasoning: bool,
+        record_pronouns: bool,
+    ) -> Result<String> {
+        let (system, payload) = if record_pronouns {
+            prompt::prompts_recording_pronouns(request)?
+        } else {
+            prompt::prompts(request)?
+        };
         let payload = if request.image.is_some() {
             format!("{}\n{payload}", media_marker())
         } else {
