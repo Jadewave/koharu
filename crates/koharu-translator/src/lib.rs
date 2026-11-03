@@ -27,7 +27,7 @@ pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
 pub use provider::{Provider, ProviderConfig, ProvidersConfig};
 
-/// The model that writes the glossary (names, terms, address pairs) every other model follows.
+/// The model that writes the glossary (names, terms, character profiles) every other model follows.
 const GLOSSARY_MODEL: &str = "gemma4-26b-a4b-uncensored";
 
 /// How many recent translated lines are replayed as context for the next page, so
@@ -57,7 +57,8 @@ const GLOSSARY_BLOCK_MAX_ENTRIES: usize = 50;
 const MEMORY_PAGES: usize = 3;
 const MEMORY_PAGE_CHARS: usize = 1500;
 
-/// Names, terms and address pairs decided by the glossary model for one work.
+/// Names and terms decided by the glossary model for one work. Pronouns are not part of it:
+/// the translation model chooses them itself while looking at the page.
 #[derive(Default)]
 struct Glossary {
     language: Option<Language>,
@@ -95,10 +96,10 @@ impl Glossary {
 }
 
 /// `style` entries always apply; the others are ordered by how much they help a page.
-const GLOSSARY_KINDS: [&str; 5] = ["style", "address", "character", "name", "term"];
+const GLOSSARY_KINDS: [&str; 4] = ["style", "character", "name", "term"];
 
-/// The entries that matter to a page, most useful kinds first: those whose source text (or,
-/// for an address pair, either name) appears in `corpus`, plus every `style` entry.
+/// The entries that matter to a page, most useful kinds first: those whose source text
+/// appears in `corpus`, plus every `style` entry.
 fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntry> {
     let corpus = corpus.to_lowercase();
     let mentioned = |text: &str| {
@@ -109,11 +110,6 @@ fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntr
         .iter()
         .filter(|entry| match entry.kind.as_str() {
             "style" => true,
-            "address" => entry
-                .source
-                .split('→')
-                .flat_map(|part| part.split("->"))
-                .any(|part| mentioned(part)),
             _ => mentioned(&entry.source),
         })
         .collect();
@@ -129,6 +125,10 @@ fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntr
 
 fn clean_entry(entry: GlossaryEntry) -> Option<GlossaryEntry> {
     let kind = entry.kind.trim().to_lowercase();
+    // Pronoun pairs are left to the translation model, which sees the page.
+    if kind == "address" {
+        return None;
+    }
     let kind = if GLOSSARY_KINDS.contains(&kind.as_str()) {
         kind
     } else {
@@ -415,8 +415,7 @@ impl Translator {
     }
 
     /// Writes the glossary of a work from the OCR text of all its pages: the glossary model
-    /// reads the lines in chunks and decides the renderings of names, terms and address
-    /// pairs, then it is released so the translation model can take its place. Only local
+    /// reads the lines in chunks and decides the renderings of names and terms, then it is released so the translation model can take its place. Only local
     /// models write glossaries; any other provider translates without one.
     ///
     /// A failure leaves the glossary as it was and is reported to the caller, which is
@@ -867,18 +866,30 @@ mod tests {
             entry("term", "霊力", "linh lực"),
             entry("name", "田中", "Tanaka"),
             entry("name", "鈴木", "Suzuki"),
-            entry("address", "田中 -> 鈴木", "tôi - cậu"),
-            entry("address", "山田 → 佐藤", "anh - em"),
             entry("character", "鈴木", "nữ, 16 tuổi, lịch sự"),
             entry("style", "work", "học đường, thân mật"),
         ];
         let selected = relevant_entries(&entries, "田中: おはよう\n霊力が足りない");
         let kinds: Vec<&str> = selected.iter().map(|e| e.kind.as_str()).collect();
-        assert_eq!(kinds, ["style", "address", "name", "term"]);
-        assert!(selected.iter().all(|e| e.source != "山田 → 佐藤"));
+        assert_eq!(kinds, ["style", "name", "term"]);
         assert!(relevant_entries(&entries, "")
             .iter()
             .all(|entry| entry.kind == "style"));
+    }
+
+    #[test]
+    fn address_entries_are_dropped() {
+        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+            kind: kind.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let mut glossary = Glossary::default();
+        glossary.merge(vec![
+            entry("address", "田中 -> 鈴木", "tôi - cậu"),
+            entry("name", "田中", "Tanaka"),
+        ]);
+        assert_eq!(glossary.entries, [entry("name", "田中", "Tanaka")]);
     }
 
     #[test]
