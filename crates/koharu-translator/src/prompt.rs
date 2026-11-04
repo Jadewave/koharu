@@ -357,6 +357,8 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             Vietnamese address and subject consistency:
             - For every segment, decide who speaks and who is addressed from the story and the image, then choose the pronouns (tôi, tao, mình, tớ, cậu, anh, chị, em, ông, bà, ngươi, ...) from the characters' gender, age, rank, relationship, and mood. Do not use 'tôi - cậu' for everybody.
             - The source words help: 俺 is a casual or rough male voice (tao, tớ, mình, anh), 僕 a gentler or younger male one (tớ, mình, em to elders), 私 neutral or polite (tôi), あたし a casual female one (mình, tớ, em), お前 / 貴様 rude (mày, cậu), 君 (cậu, bạn, em), あなた (anh, chị, bạn). Honorifics (-kun, -san, -chan, -senpai, -sama, 先生) show the relationship.
+            - Never swap speaker and listener: the first-person word is the speaker and the second-person word is the listener, and every pronoun must match the gender of the person it names. For example 僕 is a man speaking; when he talks to a woman he is 'anh' or 'tôi' and she is 'em' or 'cô', never 'anh'. Check this for every line before you write it.
+            - Do not assume the bubbles alternate between two people. A bubble can continue the same speaker, answer the previous one, or come from a third character; use the bubble tails and the look of the characters in the image.
             - A character keeps the same pair of pronouns while the situation stays the same. Never switch between anh, cô, ngươi, and so on for the same person unless the relationship or tone clearly changes (anger, intimacy, respect, a change of status).
             - Never alternate between different first-person or second-person pronouns for the same speaker or the same listener, inside one segment or across segments.
             - Source text often drops the subject. Write the subject explicitly in Vietnamese when the sentence needs it, always with the pronoun already chosen for that character.
@@ -366,6 +368,9 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             Vietnamese fidelity and naturalness:
             - First get the exact meaning of each sentence right; never invent content or guess a different meaning. Check polite forms and homographs (for example Japanese 要る 'need' versus 居る 'be', 御着用ください 'please wear').
             - Then say it the way a Vietnamese speaker would in that situation: short spoken sentences, fitting sentence-final particles (nhé, nhỉ, mà, đấy, thôi, ạ) for the tone and politeness, no word-for-word calques.
+            - Translate every compound word by its real meaning, never by sounding out its parts: 本名 is 'tên thật' (not 'bản tên'), 駆け落ち is 'bỏ trốn cùng nhau' (not 'kết hôn chớp nhoáng').
+            - Keep every phrase of the source and do not replace one with a different description: 育ちが良い is 'được nuôi dạy tử tế, xuất thân tốt', not 'tính tình ngoan hiền'.
+            - On profile or label pages (lists of name, age, job), use short standard labels such as Tên thật, Tuổi, Nghề nghiệp.
             - Keep the emotion of the line (giận dữ, ngượng ngùng, mỉa mai, trêu chọc, ...) in the choice of words and particles.
             - Idioms, slang, and wordplay: use a Vietnamese idiom or colloquial phrase with the same effect; if a pun cannot carry over, keep the joke's effect with a short natural phrase instead of explaining it or translating it literally.
             - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them.
@@ -386,6 +391,7 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
             Image requirements:
+            When the attached page image shows red outlines tagged with numbers, each number is the id of the segment whose text lies inside that outline. Use the outline to find the segment's bubble, then follow its tail to the speaker; read the text itself from the input segments, not from the outlines.
             Use the attached original page image as visual context: follow each speech-bubble tail to see who speaks and who listens, tell speech bubbles from thought bubbles and narration boxes, and read the characters' gender, age, and mood from how they look. Also use it for tone, layout, and ambiguous OCR.
             Translate only the supplied segments; do not add text seen in the image that is absent from the input segments.
         "}.trim_end());
