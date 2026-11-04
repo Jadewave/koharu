@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
-use koharu_scene::{Authored, LanguageTag, Origin, SourceText, Translation};
+use image::{DynamicImage, Rgba, RgbaImage};
+use imageproc::{drawing::draw_filled_rect_mut, rect::Rect};
+use koharu_scene::{Authored, Geometry, LanguageTag, Origin, SourceText, Translation};
 use koharu_translator::{TranslationRequest, Translator};
 
 use crate::TranslationConfig;
@@ -61,6 +65,7 @@ impl StageProcessor for Processor {
 
     async fn process(&self, input: StageInput) -> Result<koharu_scene::Patch> {
         let mut targets = Vec::new();
+        let mut boxes = Vec::new();
         if let Some(group) = input.scene.page(input.page)?.text_group()? {
             for layer in group.text_layers()? {
                 if !input.contains_entity(layer.id())? {
@@ -72,6 +77,7 @@ impl StageProcessor for Processor {
                 };
                 if !source.text.value.trim().is_empty() {
                     targets.push((content.id(), source.text.value));
+                    boxes.push(layer.frame()?.as_ref().and_then(bounds));
                 }
             }
         }
@@ -85,7 +91,9 @@ impl StageProcessor for Processor {
         if Translator::supports_vision(&self.config.model, &self.config.generation)
             && let Some(image) = input.images.get(&input.scene, input.page, "source").await?
         {
-            request = request.with_image(image);
+            // The model gets no other link between a line of text and its place on the page,
+            // so every segment is outlined and tagged with its id.
+            request = request.with_image(Arc::new(mark_segments(&image, &boxes)));
         }
         let (provider, translated) = self
             .translator
@@ -121,6 +129,104 @@ impl StageProcessor for Processor {
         }
         finish(edit)
     }
+}
+
+/// The left, top, right and bottom of a geometry, in page pixels.
+fn bounds(geometry: &Geometry) -> Option<[f64; 4]> {
+    let first = geometry.points.first()?;
+    let mut bounds = [first.x, first.y, first.x, first.y];
+    for point in &geometry.points {
+        bounds[0] = bounds[0].min(point.x);
+        bounds[1] = bounds[1].min(point.y);
+        bounds[2] = bounds[2].max(point.x);
+        bounds[3] = bounds[3].max(point.y);
+    }
+    Some(bounds)
+}
+
+/// 5x7 dot patterns of the digits, used to tag the boxes without needing a font.
+const DIGITS: [[&str; 7]; 10] = [
+    ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+    ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+    ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+    ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+];
+
+/// A copy of the page with a red outline around every segment's box and a tag with the
+/// segment id above it, so a vision model can tell which bubble each line belongs to. The
+/// outline is drawn outside the box, so the text itself stays readable.
+fn mark_segments(image: &DynamicImage, boxes: &[Option<[f64; 4]>]) -> DynamicImage {
+    let mut canvas: RgbaImage = image.to_rgba8();
+    let (width, height) = canvas.dimensions();
+    let thickness = (height / 500).clamp(2, 6) as i32;
+    let dot = (height / 220).clamp(3, 10) as i32;
+    let red = Rgba([220, 20, 20, 255]);
+    let white = Rgba([255, 255, 255, 255]);
+    let clamp_x = |value: f64| value.clamp(0.0, f64::from(width.saturating_sub(1))) as i32;
+    let clamp_y = |value: f64| value.clamp(0.0, f64::from(height.saturating_sub(1))) as i32;
+    for (id, bounds) in boxes.iter().enumerate() {
+        let Some([left, top, right, bottom]) = *bounds else {
+            continue;
+        };
+        let (left, top) = (clamp_x(left), clamp_y(top));
+        let (right, bottom) = (clamp_x(right).max(left + 1), clamp_y(bottom).max(top + 1));
+        // Four bars around the box.
+        let (box_width, box_height) = ((right - left) as u32, (bottom - top) as u32);
+        let outer_width = box_width + 2 * thickness as u32;
+        for (x, y, w, h) in [
+            (left - thickness, top - thickness, outer_width, thickness as u32),
+            (left - thickness, bottom, outer_width, thickness as u32),
+            (left - thickness, top, thickness as u32, box_height),
+            (right, top, thickness as u32, box_height),
+        ] {
+            draw_filled_rect_mut(&mut canvas, Rect::at(x, y).of_size(w, h), red);
+        }
+        // The tag sits above the box, or inside its top edge when there is no room above.
+        let digits: Vec<usize> = id
+            .to_string()
+            .bytes()
+            .map(|byte| usize::from(byte - b'0'))
+            .collect();
+        let padding = dot;
+        let tag_height = 7 * dot + 2 * padding;
+        let tag_width = digits.len() as i32 * 6 * dot - dot + 2 * padding;
+        let tag_x = left - thickness;
+        let tag_y = if top - thickness - tag_height >= 0 {
+            top - thickness - tag_height
+        } else {
+            top
+        };
+        draw_filled_rect_mut(
+            &mut canvas,
+            Rect::at(tag_x, tag_y).of_size(tag_width as u32, tag_height as u32),
+            red,
+        );
+        for (index, digit) in digits.into_iter().enumerate() {
+            let origin_x = tag_x + padding + index as i32 * 6 * dot;
+            for (row, pattern) in DIGITS[digit].iter().enumerate() {
+                for (column, cell) in pattern.bytes().enumerate() {
+                    if cell == b'1' {
+                        draw_filled_rect_mut(
+                            &mut canvas,
+                            Rect::at(
+                                origin_x + column as i32 * dot,
+                                tag_y + padding + row as i32 * dot,
+                            )
+                            .of_size(dot as u32, dot as u32),
+                            white,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(canvas)
 }
 
 const PARENTHESES: [char; 4] = ['(', ')', '\u{ff08}', '\u{ff09}'];
@@ -187,7 +293,42 @@ fn clean_translation(source: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_translation;
+    use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
+
+    use super::{bounds, clean_translation, mark_segments};
+
+    #[test]
+    fn segments_are_outlined_and_tagged_on_a_copy_of_the_page() {
+        let white = Rgba([255, 255, 255, 255]);
+        let page = DynamicImage::ImageRgba8(RgbaImage::from_pixel(400, 400, white));
+        let marked = mark_segments(
+            &page,
+            &[Some([100.0, 100.0, 200.0, 200.0]), None, Some([150.0, 0.0, 250.0, 60.0])],
+        );
+        assert_eq!(marked.dimensions(), (400, 400));
+        // The outline sits just outside the box and the box itself is untouched.
+        assert_ne!(marked.get_pixel(100, 99), white);
+        assert_ne!(marked.get_pixel(99, 150), white);
+        assert_eq!(marked.get_pixel(150, 150), white);
+        // The original page is not modified.
+        assert_eq!(page.get_pixel(100, 99), white);
+        // A box at the top edge is still tagged, and unknown boxes are skipped.
+        assert_ne!(marked.get_pixel(150, 1), white);
+        assert_eq!(marked.get_pixel(350, 350), white);
+    }
+
+    #[test]
+    fn a_box_outside_the_page_does_not_panic() {
+        let page = DynamicImage::ImageRgba8(RgbaImage::new(50, 50));
+        let marked = mark_segments(&page, &[Some([-30.0, -30.0, 500.0, 500.0]), Some([10.0, 10.0, 10.0, 10.0])]);
+        assert_eq!(marked.dimensions(), (50, 50));
+    }
+
+    #[test]
+    fn bounds_cover_every_point() {
+        let geometry = koharu_scene::Geometry::rectangle(10.0, 20.0, 30.0, 40.0);
+        assert_eq!(bounds(&geometry), Some([10.0, 20.0, 40.0, 60.0]));
+    }
 
     #[test]
     fn separator_bars_become_spaces_and_line_breaks_survive() {
