@@ -52,13 +52,16 @@ const GLOSSARY_LINE_CHARS: usize = 120;
 /// The glossary is complete, but a page is translated with only the entries that matter to
 /// it: at most this many, most useful kinds first.
 const GLOSSARY_BLOCK_MAX_ENTRIES: usize = 50;
+/// Character profiles carry the ages and relationships that decide how people address each
+/// other, so every page gets them, not only the pages that happen to repeat a name. At most
+/// this many.
+const GLOSSARY_CHARACTER_MAX_ENTRIES: usize = 16;
 /// Source text of this many previous pages also counts when picking a page's entries, so
 /// characters who are only implied on the page keep their pronouns.
 const MEMORY_PAGES: usize = 3;
 const MEMORY_PAGE_CHARS: usize = 1500;
 
-/// Names and terms decided by the glossary model for one work. Pronouns are not part of it:
-/// the translation model chooses them itself while looking at the page.
+/// Names, terms and address pairs decided by the glossary model for one work.
 #[derive(Default)]
 struct Glossary {
     language: Option<Language>,
@@ -96,10 +99,11 @@ impl Glossary {
 }
 
 /// `style` entries always apply; the others are ordered by how much they help a page.
-const GLOSSARY_KINDS: [&str; 4] = ["style", "character", "name", "term"];
+const GLOSSARY_KINDS: [&str; 5] = ["style", "address", "character", "name", "term"];
 
-/// The entries that matter to a page, most useful kinds first: those whose source text
-/// appears in `corpus`, plus every `style` entry.
+/// The entries that matter to a page, most useful kinds first: those whose source text (or,
+/// for an address pair, either name) appears in `corpus`, plus every `style` and
+/// `character` entry.
 fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntry> {
     let corpus = corpus.to_lowercase();
     let mentioned = |text: &str| {
@@ -109,10 +113,23 @@ fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntr
     let mut selected: Vec<&GlossaryEntry> = entries
         .iter()
         .filter(|entry| match entry.kind.as_str() {
-            "style" => true,
+            "style" | "character" => true,
+            "address" => entry
+                .source
+                .split('→')
+                .flat_map(|part| part.split("->"))
+                .any(|part| mentioned(part)),
             _ => mentioned(&entry.source),
         })
         .collect();
+    let mut characters = 0;
+    selected.retain(|entry| {
+        if entry.kind != "character" {
+            return true;
+        }
+        characters += 1;
+        characters <= GLOSSARY_CHARACTER_MAX_ENTRIES
+    });
     selected.sort_by_key(|entry| {
         GLOSSARY_KINDS
             .iter()
@@ -125,10 +142,6 @@ fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntr
 
 fn clean_entry(entry: GlossaryEntry) -> Option<GlossaryEntry> {
     let kind = entry.kind.trim().to_lowercase();
-    // Pronoun pairs are left to the translation model, which sees the page.
-    if kind == "address" {
-        return None;
-    }
     let kind = if GLOSSARY_KINDS.contains(&kind.as_str()) {
         kind
     } else {
@@ -415,7 +428,7 @@ impl Translator {
     }
 
     /// Writes the glossary of a work from the OCR text of all its pages: the glossary model
-    /// reads the lines in chunks and decides the renderings of names and terms, then it is released so the translation model can take its place. Only local
+    /// reads the lines in chunks and decides the renderings of names and terms and the address pairs, then it is released so the translation model can take its place. Only local
     /// models write glossaries; any other provider translates without one.
     ///
     /// A failure leaves the glossary as it was and is reported to the caller, which is
@@ -457,6 +470,16 @@ impl Translator {
             .lock()
             .map(|glossary| glossary.entries.len())
             .unwrap_or(0);
+        if let Ok(glossary) = self.glossary.lock() {
+            for entry in &glossary.entries {
+                tracing::debug!(
+                    kind = %entry.kind,
+                    source = %entry.source,
+                    target = %entry.target,
+                    "glossary entry"
+                );
+            }
+        }
         tracing::info!(
             entries,
             lines = lines.len(),
@@ -868,17 +891,22 @@ mod tests {
             entry("name", "鈴木", "Suzuki"),
             entry("character", "鈴木", "nữ, 16 tuổi, lịch sự"),
             entry("style", "work", "học đường, thân mật"),
+            entry("address", "田中 -> 鈴木", "tớ - cậu"),
+            entry("address", "山田 → 佐藤", "anh - em"),
         ];
         let selected = relevant_entries(&entries, "田中: おはよう\n霊力が足りない");
         let kinds: Vec<&str> = selected.iter().map(|e| e.kind.as_str()).collect();
-        assert_eq!(kinds, ["style", "name", "term"]);
+        // Character profiles apply to every page, even when the name is not on it; an
+        // address pair applies when either of its characters is on the page.
+        assert_eq!(kinds, ["style", "address", "character", "name", "term"]);
+        assert!(selected.iter().all(|entry| entry.source != "山田 → 佐藤"));
         assert!(relevant_entries(&entries, "")
             .iter()
-            .all(|entry| entry.kind == "style"));
+            .all(|entry| entry.kind == "style" || entry.kind == "character"));
     }
 
     #[test]
-    fn address_entries_are_dropped() {
+    fn an_address_pair_keeps_its_first_wording() {
         let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
             kind: kind.to_owned(),
             source: source.to_owned(),
@@ -886,10 +914,10 @@ mod tests {
         };
         let mut glossary = Glossary::default();
         glossary.merge(vec![
-            entry("address", "田中 -> 鈴木", "tôi - cậu"),
-            entry("name", "田中", "Tanaka"),
+            entry("address", "田中 -> 鈴木", "tớ - cậu"),
+            entry("address", "田中 -> 鈴木", "anh - em"),
         ]);
-        assert_eq!(glossary.entries, [entry("name", "田中", "Tanaka")]);
+        assert_eq!(glossary.entries, [entry("address", "田中 -> 鈴木", "tớ - cậu")]);
     }
 
     #[test]
