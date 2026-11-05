@@ -149,7 +149,7 @@ pub(crate) fn glossary_prompts(
     let system = format!(
         indoc! {"
             You maintain the glossary of a manga that is being translated into {target}.
-            Other, smaller models will translate every page and must follow your glossary exactly, so you decide the renderings.
+            The translator will follow your glossary exactly on every page, so you decide the renderings.
 
             You receive the current glossary and the source lines of a stretch of the work (OCR text in reading order, page after page).
             Return only NEW entries:
@@ -316,31 +316,20 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
 
             Translation requirements:
             - Translate every input segment from {source} into natural {target}.
-            - Preserve meaning, character voice, emotional tone, relationship nuance, emphasis, and sound effects.
-            - Localize idioms and sound effects naturally while keeping wording concise enough for speech bubbles.
-            - Use surrounding segments only for disambiguation and continuity; never merge or split segments.
-            - A sentence can run across consecutive segments (for example one line split between two speech bubbles); translate each segment so that, read in order, they form one natural sentence.
+            - Preserve meaning, character voice, emotional tone, relationship nuance, emphasis, and sound effects; never invent or drop content.
+            - Sound like a native {target} speaker in that situation, not like a word-for-word translation, and keep the emotion (anger, shyness, sarcasm, teasing, ...).
+            - Localize idioms, slang, wordplay, and sound effects with an equivalent {target} expression or the same effect in other words, never literally, while keeping wording concise enough for speech bubbles.
+            - Read the segments in order as one scene and use the surrounding segments and any supplied context for disambiguation and continuity; never merge or split segments.
+            - A sentence can run across consecutive segments (for example one line split between two speech bubbles); translate each segment so that, read in order, they form one natural sentence. The subject appears only in the segment where the source states it; the continuing segment does not repeat it or add another.
             - Write every translated `text` value only in {target}; do not include source text, notes, explanations, or alternatives.
             - Never preserve or repeat original-language text; translate names, terms, and sound effects using natural {target} conventions.
 
-            Context understanding:
-            - Read the segments in order as one scene, together with any supplied context, and follow the story. Never translate each line as if it stood alone.
-            - Work out who is speaking to whom in every segment, and whether it is spoken dialogue, narration, a monologue, or a thought. Give each its fitting voice: spoken language for dialogue, plainer and more inward for monologue and thoughts.
-            - A sentence can continue over several bubbles. When a bubble is cut off (for example it ends with '…') and the next bubble completes it, translate them as one sentence split across the two bubbles. The subject belongs to the part where the source states it; the bubble that continues the sentence does not repeat it and does not add another.
-            - Take the relationship between the characters and the situation (age, rank, closeness, conflict, mood) into account in every choice of wording.
-
-            Consistency:
-            - The same character keeps the same name, pronouns, and manner of speaking as long as the situation does not change. Change them only when the relationship or mood clearly changes.
+            Speakers and consistency:
+            - For every segment work out who is speaking to whom, and whether it is spoken dialogue, narration, a monologue, or a thought. Give each its fitting voice: spoken language for dialogue, plainer and more inward for monologue and thoughts. Let age, rank, closeness, and mood shape the wording.
+            - Do not assume the speakers alternate: a segment can continue the same speaker, answer the previous one, or come from a third character.
+            - The same character keeps the same name, pronouns, and manner of speaking while the situation stays the same; change them only when the relationship or mood clearly changes.
             - Render names, places, skills, and terms the same way every time, following the glossary and context when they are supplied.
             - Keep each character's own way of speaking (polite, rough, childish, archaic, ...).
-
-            Quality:
-            - Get the exact meaning right first; never invent or drop content.
-            - Do not add what the source does not say: no subject, pronoun, honorific, or explanation that the source leaves out, unless the sentence would be wrong or unintelligible in {target} without it.
-            - Sound like a native {target} speaker in that situation, not like a word-for-word translation.
-            - Keep the emotion and tone (anger, shyness, sarcasm, teasing, ...).
-            - For idioms, slang, and wordplay, use an equivalent {target} expression or reproduce the effect in other words; never translate them literally.
-
             Output requirements:
             - Each input segment has a numeric `id`.
             - Return only a JSON object whose `translations` array contains one object with `id` and translated `text` for every input segment.
@@ -357,27 +346,18 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
             Vietnamese address and subject consistency:
-            - For every segment, decide who speaks and who is addressed from the story and the image, then choose the pronouns (tôi, tao, mình, tớ, cậu, anh, chị, em, ông, bà, ngươi, ...) from the characters' gender, age, rank, relationship, and mood. Do not use 'tôi - cậu' for everybody.
-            - The source words help: 俺 is a casual or rough male voice (tao, tớ, mình, anh), 僕 a gentler or younger male one (tớ, mình, em to elders), 私 neutral or polite (tôi), あたし a casual female one (mình, tớ, em), お前 / 貴様 rude (mày, cậu), 君 (cậu, bạn, em), あなた (anh, chị, bạn). Honorifics (-kun, -san, -chan, -senpai, -sama, 先生) show the relationship.
-            - Never swap speaker and listener: the first-person word is the speaker and the second-person word is the listener, and every pronoun must match the gender of the person it names. For example 僕 is a man speaking; when he talks to a woman he is 'anh' or 'tôi' and she is 'em' or 'cô', never 'anh'. Check this for every line before you write it.
-            - Do not assume the bubbles alternate between two people. A bubble can continue the same speaker, answer the previous one, or come from a third character; use the bubble tails and the look of the characters in the image.
-            - A character keeps the same pair of pronouns while the situation stays the same. Never switch between anh, cô, ngươi, and so on for the same person unless the relationship or tone clearly changes (anger, intimacy, respect, a change of status).
-            - Never alternate between different first-person or second-person pronouns for the same speaker or the same listener, inside one segment or across segments.
-            - Do not add a subject, pronoun, or form of address that the source does not state. When a Japanese line has no subject, translate it without one, as natural Vietnamese can (行くよ becomes 'Đi nhé', not 'Anh đi nhé'). Use a pronoun only where the source has one or where the Vietnamese sentence would be wrong without it and the speaker is certain, and then use the pronoun already chosen for that character. If the sentence continues from the previous bubble, the subject stays in that earlier bubble.
-            - Vietnamese separates the inclusive 'chúng ta' (the speaker and the listener) from the exclusive 'chúng tôi', 'bọn anh', 'bọn em' (the speaker's group without the listener). 僕たち or 私たち said to someone outside the group is the exclusive form.
-            - Giving and receiving verbs show direction: ～てくれる means the other person does it for the speaker or the speaker's side, ～てあげる means the speaker does it for the other, ～てもらう means the speaker receives it. Keep that direction.
-            - Use one way of referring to the speaker in a sentence; never mix two (such as 'anh đây' and 'tôi'), and do not refer to the speaker in the third person unless the source does.
+            - For every segment, decide who speaks and who listens from the bubble tail in the image, the story, and the speaker's way of talking, then choose the pronoun pair from their gender, age, rank, relationship, and mood. The first-person word names the speaker and the second-person word names the listener, and each must match that person's gender. Never default to 'tôi - cậu' for everybody.
+            - When the source is Japanese, its own words are evidence: 俺 is a casual or rough male voice (tao, tớ, mình, anh), 僕 a gentler or younger male one (tớ, mình, em to elders), 私 neutral or polite (tôi), あたし a casual female one (mình, tớ, em), お前 / 貴様 rude (mày, cậu), 君 (cậu, bạn, em), あなた (anh, chị, bạn). Honorifics (-kun, -san, -chan, -senpai, -sama, 先生) show the relationship.
+            - A character keeps one pronoun pair with each listener while the relationship stays the same; never switch between anh, cô, ngươi, and so on for the same person unless the relationship or tone clearly changes (anger, intimacy, respect, a change of status). Within a sentence refer to the speaker in one way only ('anh đây' and 'tôi' never together). When context entries or the glossary show the pronouns and names already used, reuse them.
+            - Do not add a subject that the source leaves out. Japanese often drops it, and natural Vietnamese can too (行くよ becomes 'Đi nhé', not 'Anh đi nhé'). Add a subject only if the sentence would be wrong without it and you are sure who is speaking, using that character's pronoun. When a sentence is split over bubbles, the subject stays in the earlier bubble.
+            - Vietnamese separates the inclusive 'chúng ta' (speaker and listener) from the exclusive 'chúng tôi', 'bọn anh', 'bọn em' (the speaker's group without the listener). 僕たち or 私たち said to someone outside the group takes the exclusive form.
+            - Giving and receiving verbs show direction: ～てくれる means the other person does it for the speaker's side, ～てあげる means the speaker does it for the other, ～てもらう means the speaker receives it. Keep that direction.
             - Render each character name, title, and the way others address them the same way every time.
-            - When context entries or the glossary show the pronouns and names already used, reuse them.
 
             Vietnamese fidelity and naturalness:
             - First get the exact meaning of each sentence right; never invent content or guess a different meaning. Check polite forms and homographs (for example Japanese 要る 'need' versus 居る 'be', 御着用ください 'please wear').
             - Then say it the way a Vietnamese speaker would in that situation: short spoken sentences, fitting sentence-final particles (nhé, nhỉ, mà, đấy, thôi, ạ) for the tone and politeness, no word-for-word calques.
-            - Translate every compound word by its real meaning, never by sounding out its parts: 本名 is 'tên thật' (not 'bản tên'), 駆け落ち is 'bỏ trốn cùng nhau' (not 'kết hôn chớp nhoáng').
-            - Keep every phrase of the source and do not replace one with a different description: 育ちが良い is 'được nuôi dạy tử tế, xuất thân tốt', not 'tính tình ngoan hiền'.
-            - On profile or label pages (lists of name, age, job), use short standard labels such as Tên thật, Tuổi, Nghề nghiệp.
-            - Keep the emotion of the line (giận dữ, ngượng ngùng, mỉa mai, trêu chọc, ...) in the choice of words and particles.
-            - Idioms, slang, and wordplay: use a Vietnamese idiom or colloquial phrase with the same effect; if a pun cannot carry over, keep the joke's effect with a short natural phrase instead of explaining it or translating it literally.
+            - Translate compound words by their real meaning, never by sounding out their parts (本名 is 'tên thật', not 'bản tên'), and keep every phrase of the source instead of replacing it with a different description. On profile or label pages use short standard labels such as Tên thật, Tuổi, Nghề nghiệp.
             - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them.
             - Keep each line about as long as the source allows, because Vietnamese text must fit the same speech bubble.
         "}.trim_end());
@@ -396,8 +376,8 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
             Image requirements:
-            When the attached page image shows red outlines tagged with numbers, each number is the id of the segment whose text lies inside that outline. Use the outline to find the segment's bubble, then follow its tail to the speaker; read the text itself from the input segments, not from the outlines.
-            Use the attached original page image as visual context: follow each speech-bubble tail to see who speaks and who listens, tell speech bubbles from thought bubbles and narration boxes, and read the characters' gender, age, and mood from how they look. Also use it for tone, layout, and ambiguous OCR.
+            When the attached original page image shows red outlines tagged with numbers, each number is the id of the segment whose text lies inside that outline: use the outline to find the segment's bubble and follow its tail to the speaker, and read the text itself from the input segments, not from the outlines.
+            Use the attached original page image as visual context for who speaks and who listens, whether a bubble is speech, thought, or narration, the characters' gender, age, and mood, and for tone, layout, and ambiguous OCR.
             Translate only the supplied segments; do not add text seen in the image that is absent from the input segments.
         "}.trim_end());
     }
@@ -707,4 +687,4 @@ mod tests {
         assert_eq!(translations, ["A", "b", "C"]);
         assert_eq!(missing, [1]);
     }
-}
+    }
