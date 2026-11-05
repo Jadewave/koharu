@@ -121,11 +121,11 @@ pub(crate) fn encode_image(image: &DynamicImage) -> anyhow::Result<EncodedImage>
     })
 }
 
-/// One entry of the glossary built while translating: a name, a recurring term, or a
-/// character profile. It is replayed to every model that translates later pages.
+/// One entry of the glossary built while translating: a name, a recurring term, a
+/// character profile, or how one character addresses another. It is replayed to every model that translates later pages.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GlossaryEntry {
-    /// `style`, `character`, `name` or `term`.
+    /// `style`, `address`, `character`, `name` or `term`.
     pub kind: String,
     pub source: String,
     pub target: String,
@@ -146,4 +146,4 @@ impl TranslationContext {
             translation: translation.into(),
         }
     }
-}
+            }
