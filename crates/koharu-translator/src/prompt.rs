@@ -155,14 +155,15 @@ pub(crate) fn glossary_prompts(
             Return only NEW entries:
             - name: a character, place, organization, or title seen in the lines and the {target} rendering to use for it.
             - term: a recurring term, skill, technique, item, or sound-effect convention and the rendering to use for it.
-            - character: `source` is the character's name as it appears in the lines, `target` a short profile in {target}: gender, rough age, role, relationship to the other main characters, and own manner of speaking (formal, casual, rough, childish, archaic, ...). Do not choose pronouns or forms of address; the translator decides them from the page.
+            - character: `source` is the character's name as it appears in the lines (for a recurring character without a name, a short description such as the regular customer), `target` a short profile in {target}: gender, age (the exact number when the work states it, otherwise rough), role, relationship to the other main characters and the age gap with them, and own manner of speaking (formal, casual, rough, childish, archaic, ...), and the first-person pronoun they use.
+            - address: how one character addresses another. `source` is \"Speaker -> Listener\" with the names used in the lines (or a short description for an unnamed recurring character), `target` is the pair of words the speaker uses for themselves and for the listener, chosen from their relationship, age gap, rank, and tone (for Vietnamese, for example \"anh - em\", \"tớ - cậu\", or \"tao - mày\"; do not give everyone the same pair). Use the ages in the character profiles you write.
             - style: `source` is exactly work, `target` one short note on genre, setting, and overall register. At most one, and only if the glossary has none yet.
 
             Rules:
             - Choose natural renderings that will still fit the rest of the work.
-            - Be exhaustive: list every named character, place, organization, title, and recurring term in the lines, and every character who speaks.
+            - Be exhaustive: list every named character, place, organization, title, and recurring term in the lines, every character who speaks, and every pair of speaking characters whose way of addressing each other you can tell. Write the character entries before the address entries.
             - Skip entries already in the glossary you were given and anything that does not appear in these lines.
-            - Write `kind` as exactly style, character, name, or term.
+            - Write `kind` as exactly style, address, character, name, or term.
             - At most 20 entries, every string short.
             - Return an empty `entries` array when there is nothing new.
         "},
@@ -346,10 +347,11 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
             Vietnamese address and subject consistency:
+            - Do not add a subject that the source leaves out. Japanese often drops it, and natural Vietnamese can too (行くよ becomes 'Đi nhé', not 'Anh đi nhé'). Add a subject only if the sentence would be wrong without it and you are sure who is speaking, using that character's pronoun. When a sentence is split over bubbles, the subject stays in the earlier bubble.
             - For every segment, decide who speaks and who listens from the bubble tail in the image, the story, and the speaker's way of talking, then choose the pronoun pair from their gender, age, rank, relationship, and mood. The first-person word names the speaker and the second-person word names the listener, and each must match that person's gender. Never default to 'tôi - cậu' for everybody.
             - When the source is Japanese, its own words are evidence: 俺 is a casual or rough male voice (tao, tớ, mình, anh), 僕 a gentler or younger male one (tớ, mình, em to elders), 私 neutral or polite (tôi), あたし a casual female one (mình, tớ, em), お前 / 貴様 rude (mày, cậu), 君 (cậu, bạn, em), あなた (anh, chị, bạn). Honorifics (-kun, -san, -chan, -senpai, -sama, 先生) show the relationship.
-            - A character keeps one pronoun pair with each listener while the relationship stays the same; never switch between anh, cô, ngươi, and so on for the same person unless the relationship or tone clearly changes (anger, intimacy, respect, a change of status). Within a sentence refer to the speaker in one way only ('anh đây' and 'tôi' never together). When context entries or the glossary show the pronouns and names already used, reuse them.
-            - Do not add a subject that the source leaves out. Japanese often drops it, and natural Vietnamese can too (行くよ becomes 'Đi nhé', not 'Anh đi nhé'). Add a subject only if the sentence would be wrong without it and you are sure who is speaking, using that character's pronoun. When a sentence is split over bubbles, the subject stays in the earlier bubble.
+            - A character keeps one pronoun pair with each listener while the relationship stays the same; never switch between anh, cô, ngươi, and so on for the same person unless the relationship or tone clearly changes (anger, intimacy, respect, a change of status). Within a sentence refer to the speaker in one way only ('anh đây' and 'tôi' never together). Glossary entries of kind address give the pair chosen for each 'Speaker -> Listener', and context entries show the pronouns and names already used: reuse them, and depart from them only when the page clearly shows that the relationship has changed.
+            - Address follows age and rank. Use the ages in the glossary profiles and the look of the characters. Someone older than the person they address calls that person 'em' (or 'cô' when formal or distant), never 'chị' or 'anh'; a younger person calls an older man 'anh' ('chú' or 'bác' when much older) and an older woman 'chị' ('cô' or 'dì' when much older); people of the same age use 'cậu', 'bạn', 'tớ', 'mình', or 'anh - em' for a couple. When ages are unknown, do not default to 'chị' or 'anh' for an adult: use the name, 'bạn', or 'cậu'.
             - Vietnamese separates the inclusive 'chúng ta' (speaker and listener) from the exclusive 'chúng tôi', 'bọn anh', 'bọn em' (the speaker's group without the listener). 僕たち or 私たち said to someone outside the group takes the exclusive form.
             - Giving and receiving verbs show direction: ～てくれる means the other person does it for the speaker's side, ～てあげる means the speaker does it for the other, ～てもらう means the speaker receives it. Keep that direction.
             - Render each character name, title, and the way others address them the same way every time.
@@ -357,7 +359,7 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             Vietnamese fidelity and naturalness:
             - First get the exact meaning of each sentence right; never invent content or guess a different meaning. Check polite forms and homographs (for example Japanese 要る 'need' versus 居る 'be', 御着用ください 'please wear').
             - Then say it the way a Vietnamese speaker would in that situation: short spoken sentences, fitting sentence-final particles (nhé, nhỉ, mà, đấy, thôi, ạ) for the tone and politeness, no word-for-word calques.
-            - Translate compound words by their real meaning, never by sounding out their parts (本名 is 'tên thật', not 'bản tên'), and keep every phrase of the source instead of replacing it with a different description. On profile or label pages use short standard labels such as Tên thật, Tuổi, Nghề nghiệp.
+            - Translate compound words by their real meaning, never by sounding out their parts, and keep every phrase of the source instead of replacing it with a different description. On profile or label pages use short standard labels such as Tên thật, Tuổi, Nghề nghiệp.
             - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them.
             - Keep each line about as long as the source allows, because Vietnamese text must fit the same speech bubble.
         "}.trim_end());
@@ -660,11 +662,17 @@ mod tests {
                 source: "霊力".to_owned(),
                 target: "linh lực".to_owned(),
             },
+            GlossaryEntry {
+                kind: "address".to_owned(),
+                source: "田中 -> 鈴木".to_owned(),
+                target: "tớ - cậu".to_owned(),
+            },
         ];
         let block = render_glossary(&entries);
         assert!(block.starts_with("Glossary"));
         assert!(block.contains("\n- name: 田中 = Tanaka"));
         assert!(block.contains("\n- term: 霊力 = linh lực"));
+        assert!(block.contains("\n- address: 田中 -> 鈴木 = tớ - cậu"));
     }
 
     #[test]
@@ -687,4 +695,4 @@ mod tests {
         assert_eq!(translations, ["A", "b", "C"]);
         assert_eq!(missing, [1]);
     }
-    }
+                }
