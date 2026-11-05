@@ -8,18 +8,6 @@ use serde_json::{Value, json};
 use crate::{GlossaryEntry, Language, TranslationContext, TranslationRequest};
 
 pub(crate) fn prompts(request: &TranslationRequest) -> anyhow::Result<(String, String)> {
-    build_prompts(request, false)
-}
-
-/// Like `prompts`, but the model is also told to write its notes in the `analysis` field
-/// (see `output_schema_with_analysis`) before it translates.
-pub(crate) fn prompts_with_analysis(
-    request: &TranslationRequest,
-) -> anyhow::Result<(String, String)> {
-    build_prompts(request, true)
-}
-
-fn build_prompts(request: &TranslationRequest, analyze: bool) -> anyhow::Result<(String, String)> {
     let input = TranslationInput {
         source_language: request.source_language,
         target_language: request.target_language,
@@ -32,7 +20,7 @@ fn build_prompts(request: &TranslationRequest, analyze: bool) -> anyhow::Result<
             .collect(),
     };
     let user = serde_json::to_string(&input).context("failed to serialize translation input")?;
-    Ok((translation_system_prompt_with(request, analyze), user))
+    Ok((translation_system_prompt(request), user))
 }
 
 pub(crate) fn translations(
@@ -285,67 +273,39 @@ pub(crate) fn snippet(text: &str) -> String {
     output
 }
 
-fn translations_property(expected: usize) -> Value {
-    json!({
-        "type": "array",
-        "minItems": expected,
-        "maxItems": expected,
-        "items": {
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": expected.saturating_sub(1),
-                    "description": "The ID copied from the corresponding input segment."
-                },
-                "text": {
-                    "type": "string",
-                    "description": "The translation of the input segment with this ID."
-                }
-            },
-            "required": ["id", "text"],
-            "additionalProperties": false
-        }
-    })
-}
-
 pub(crate) fn output_schema(expected: usize) -> Value {
     json!({
         "type": "object",
         "properties": {
-            "translations": translations_property(expected)
+            "translations": {
+                "type": "array",
+                "minItems": expected,
+                "maxItems": expected,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": expected.saturating_sub(1),
+                            "description": "The ID copied from the corresponding input segment."
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "The translation of the input segment with this ID."
+                        }
+                    },
+                    "required": ["id", "text"],
+                    "additionalProperties": false
+                }
+            }
         },
         "required": ["translations"],
         "additionalProperties": false
     })
 }
 
-/// The translation schema with a free-text `analysis` in front of the translations. Output
-/// that is constrained to a schema cannot think out loud, so this is where the model works
-/// out who speaks to whom before it translates. `analysis` sorts before `translations`, so
-/// the order holds whether the schema keeps insertion order or sorts its keys.
-pub(crate) fn output_schema_with_analysis(expected: usize) -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "analysis": {
-                "type": "string",
-                "description": "Short notes on who speaks to whom and which pronouns to use, written before translating."
-            },
-            "translations": translations_property(expected)
-        },
-        "required": ["analysis", "translations"],
-        "additionalProperties": false
-    })
-}
-
-#[cfg(test)]
 fn translation_system_prompt(request: &TranslationRequest) -> String {
-    translation_system_prompt_with(request, false)
-}
-
-fn translation_system_prompt_with(request: &TranslationRequest, analyze: bool) -> String {
     let source = request
         .source_language
         .map(|language| language.to_string())
@@ -366,7 +326,7 @@ fn translation_system_prompt_with(request: &TranslationRequest, analyze: bool) -
             Context understanding:
             - Read the segments in order as one scene, together with any supplied context, and follow the story. Never translate each line as if it stood alone.
             - Work out who is speaking to whom in every segment, and whether it is spoken dialogue, narration, a monologue, or a thought. Give each its fitting voice: spoken language for dialogue, plainer and more inward for monologue and thoughts.
-            - A sentence can continue over several bubbles. When a bubble is cut off (for example it ends with '…') and the next bubble completes it, translate them as one sentence split across the two bubbles and take the subject from the first part.
+            - A sentence can continue over several bubbles. When a bubble is cut off (for example it ends with '…') and the next bubble completes it, translate them as one sentence split across the two bubbles. The subject belongs to the part where the source states it; the bubble that continues the sentence does not repeat it and does not add another.
             - Take the relationship between the characters and the situation (age, rank, closeness, conflict, mood) into account in every choice of wording.
 
             Consistency:
@@ -376,6 +336,7 @@ fn translation_system_prompt_with(request: &TranslationRequest, analyze: bool) -
 
             Quality:
             - Get the exact meaning right first; never invent or drop content.
+            - Do not add what the source does not say: no subject, pronoun, honorific, or explanation that the source leaves out, unless the sentence would be wrong or unintelligible in {target} without it.
             - Sound like a native {target} speaker in that situation, not like a word-for-word translation.
             - Keep the emotion and tone (anger, shyness, sarcasm, teasing, ...).
             - For idioms, slang, and wordplay, use an equivalent {target} expression or reproduce the effect in other words; never translate them literally.
@@ -402,7 +363,7 @@ fn translation_system_prompt_with(request: &TranslationRequest, analyze: bool) -
             - Do not assume the bubbles alternate between two people. A bubble can continue the same speaker, answer the previous one, or come from a third character; use the bubble tails and the look of the characters in the image.
             - A character keeps the same pair of pronouns while the situation stays the same. Never switch between anh, cô, ngươi, and so on for the same person unless the relationship or tone clearly changes (anger, intimacy, respect, a change of status).
             - Never alternate between different first-person or second-person pronouns for the same speaker or the same listener, inside one segment or across segments.
-            - Source text often drops the subject. Take it from the previous bubble when a sentence continues over several bubbles; otherwise add a subject only when you are sure who is speaking, always with the pronoun already chosen for that character. When you are not sure, use wording that needs no subject.
+            - Do not add a subject, pronoun, or form of address that the source does not state. When a Japanese line has no subject, translate it without one, as natural Vietnamese can (行くよ becomes 'Đi nhé', not 'Anh đi nhé'). Use a pronoun only where the source has one or where the Vietnamese sentence would be wrong without it and the speaker is certain, and then use the pronoun already chosen for that character. If the sentence continues from the previous bubble, the subject stays in that earlier bubble.
             - Vietnamese separates the inclusive 'chúng ta' (the speaker and the listener) from the exclusive 'chúng tôi', 'bọn anh', 'bọn em' (the speaker's group without the listener). 僕たち or 私たち said to someone outside the group is the exclusive form.
             - Giving and receiving verbs show direction: ～てくれる means the other person does it for the speaker or the speaker's side, ～てあげる means the speaker does it for the other, ～てもらう means the speaker receives it. Keep that direction.
             - Use one way of referring to the speaker in a sentence; never mix two (such as 'anh đây' and 'tôi'), and do not refer to the speaker in the third person unless the source does.
@@ -419,15 +380,6 @@ fn translation_system_prompt_with(request: &TranslationRequest, analyze: bool) -
             - Idioms, slang, and wordplay: use a Vietnamese idiom or colloquial phrase with the same effect; if a pun cannot carry over, keep the joke's effect with a short natural phrase instead of explaining it or translating it literally.
             - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them.
             - Keep each line about as long as the source allows, because Vietnamese text must fit the same speech bubble.
-        "}.trim_end());
-    }
-
-    if analyze {
-        prompt.push_str("\n\n");
-        prompt.push_str(indoc! {"
-            Analysis (fill `analysis` first, then `translations`):
-            - In `analysis`, write short notes in English, at most about 120 words, before you translate. Go through the bubbles in reading order and note who speaks to whom (gender, age, relationship), which bubble continues the previous one as a single sentence, which subjects or objects the source leaves out and who they are, who does what for whom in any ～てくれる / ～てあげる / ～てもらう, whether a 'we' includes the listener, and the pronouns you will use for each pair.
-            - Then translate every segment so that it agrees with your notes.
         "}.trim_end());
     }
 
@@ -754,37 +706,5 @@ mod tests {
 
         assert_eq!(translations, ["A", "b", "C"]);
         assert_eq!(missing, [1]);
-    }
-
-    #[test]
-    fn the_analysis_schema_puts_the_notes_before_the_translations() {
-        let schema = output_schema_with_analysis(2);
-        assert_eq!(schema["required"], json!(["analysis", "translations"]));
-        assert_eq!(schema["properties"]["analysis"]["type"], "string");
-        assert_eq!(schema["properties"]["translations"]["minItems"], 2);
-        let text = serde_json::to_string(&schema).unwrap();
-        assert!(text.find("\"analysis\"").unwrap() < text.find("\"translations\"").unwrap());
-        // The plain schema is unchanged.
-        assert!(output_schema(2)["properties"].get("analysis").is_none());
-    }
-
-    #[test]
-    fn the_notes_do_not_disturb_reading_the_translations() {
-        let source = ["a".to_owned(), "b".to_owned()];
-        let response = r#"{"analysis":"Rio speaks to Yuu.","translations":[{"id":0,"text":"x"},{"id":1,"text":"y"}]}"#;
-        assert_eq!(translations("test", response, &source).unwrap(), ["x", "y"]);
-        let cut = r#"{"analysis":"Rio speaks to Yuu.","translations":[{"id":0,"text":"x"},{"id":1,"te"#;
-        let (salvaged, missing) = salvage_translations(cut, &source);
-        assert_eq!(salvaged, ["x", "b"]);
-        assert_eq!(missing, [1]);
-    }
-
-    #[test]
-    fn the_analysis_instructions_are_only_added_when_asked_for() {
-        let request = TranslationRequest::new(["a"], Language::Vietnamese);
-        let (with, _) = prompts_with_analysis(&request).unwrap();
-        let (without, _) = prompts(&request).unwrap();
-        assert!(with.contains("Analysis (fill `analysis` first"));
-        assert!(!without.contains("Analysis (fill"));
     }
 }
