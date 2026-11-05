@@ -23,9 +23,6 @@ const MAX_MISSING_RETRIES: u32 = 2;
 /// Upper bound for the tokens of one glossary update.
 const GLOSSARY_MAX_TOKENS: usize = 900;
 
-/// Extra output tokens for the `analysis` notes that come before the translations.
-const ANALYSIS_EXTRA_TOKENS: usize = 400;
-
 /// The partial output is checked for a repetition loop every 16 generated tokens.
 const LOOP_CHECK_MASK: usize = 15;
 
@@ -99,12 +96,10 @@ impl LocalTranslator {
             });
         }
 
-        // Output constrained to a schema cannot think out loud, so the "reasoning" choice
-        // gives the model an `analysis` field to work in before it translates.
-        let analyze = generation.reasoning.unwrap_or(false) && self.descriptor.reasoning;
+        let reasoning = generation.reasoning.unwrap_or(false) && self.descriptor.reasoning;
         let options = self.descriptor.generation.options(generation);
 
-        let (mut translations, mut missing) = self.generate(&request, analyze, &options).await?;
+        let (mut translations, mut missing) = self.generate(&request, reasoning, &options).await?;
         for attempt in 1..=MAX_MISSING_RETRIES {
             if missing.is_empty() {
                 break;
@@ -124,8 +119,7 @@ impl LocalTranslator {
                 .collect();
             let mut retry_options = options.clone();
             retry_options.seed = retry_options.seed.wrapping_add(attempt);
-            // A retry covers only a few segments, so it goes without notes.
-            let (retried, still_missing) = self.generate(&retry, false, &retry_options).await?;
+            let (retried, still_missing) = self.generate(&retry, reasoning, &retry_options).await?;
             for (position, &index) in missing.iter().enumerate() {
                 if !still_missing.contains(&position) {
                     translations[index] = retried[position].clone();
@@ -152,21 +146,14 @@ impl LocalTranslator {
     async fn generate(
         &self,
         request: &TranslationRequest,
-        analyze: bool,
+        reasoning: bool,
         options: &GenerationOptions,
     ) -> Result<(Vec<String>, Vec<usize>)> {
         let image = request.image.clone();
-        let prompt = self.render_prompt(request, analyze)?;
-        let schema = if analyze {
-            prompt::output_schema_with_analysis(request.segments.len())
-        } else {
-            prompt::output_schema(request.segments.len())
-        };
+        let prompt = self.render_prompt(request, reasoning)?;
+        let schema = prompt::output_schema(request.segments.len());
         let llm = Arc::clone(&self.llm);
-        let mut options = options.clone();
-        if analyze {
-            options.max_tokens += ANALYSIS_EXTRA_TOKENS;
-        }
+        let options = options.clone();
         let output = tokio_rayon::spawn(move || {
             let input = image.as_deref().map_or_else(
                 || Input::new(&prompt),
@@ -181,7 +168,7 @@ impl LocalTranslator {
             generated_tokens = output.generated_tokens,
             generation_secs = output.generation_duration.as_secs_f32(),
             finish = ?output.finish_reason,
-            analysis = analyze,
+            reasoning,
             "local generation finished"
         );
         Ok(prompt::parse_translations(
@@ -234,12 +221,8 @@ impl LocalTranslator {
         Ok(prompt::parse_glossary(&output.text))
     }
 
-    fn render_prompt(&self, request: &TranslationRequest, analyze: bool) -> Result<String> {
-        let (system, payload) = if analyze {
-            prompt::prompts_with_analysis(request)?
-        } else {
-            prompt::prompts(request)?
-        };
+    fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
+        let (system, payload) = prompt::prompts(request)?;
         let payload = if request.image.is_some() {
             format!("{}\n{payload}", media_marker())
         } else {
@@ -251,9 +234,7 @@ impl LocalTranslator {
                 &[ChatMessage::system(system), ChatMessage::user(payload)],
                 ChatTemplateOptions {
                     add_generation_prompt: true,
-                    // The schema forces JSON from the first token, so the model cannot
-                    // think in its own thinking block; `analysis` replaces it.
-                    enable_thinking: false,
+                    enable_thinking: reasoning,
                 },
             )
             .context("failed to render local translation prompt")?)
