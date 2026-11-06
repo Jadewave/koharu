@@ -149,8 +149,7 @@ impl<'a> Execution<'a> {
                     .as_ref()
                     .filter(|mask| stage == Stage::Inpainting && mask.page == page)
                     .cloned(),
-            )
-            .with_pages(self.scope.shared_pages()),
+            ),
             self.stop.clone(),
             self.progress.clone(),
         ))
@@ -344,4 +343,4 @@ fn validate_commit(previous: &Snapshot, next: &Snapshot) -> Result<()> {
         "committer did not advance the scene revision"
     );
     Ok(())
-        }
+}
