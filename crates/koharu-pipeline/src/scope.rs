@@ -143,10 +143,6 @@ impl NormalizedScope {
         &self.pages
     }
 
-    pub(crate) fn shared_pages(&self) -> Arc<[EntityId]> {
-        Arc::clone(&self.pages)
-    }
-
     pub(crate) fn entities(&self) -> Option<Arc<BTreeSet<EntityId>>> {
         self.entities.clone()
     }
@@ -232,4 +228,4 @@ pub(crate) fn geometry_extents(geometry: &Geometry) -> Option<(f64, f64, f64, f6
         max_y = max_y.max(point.y);
     }
     Some((min_x, min_y, max_x, max_y))
-        }
+}
