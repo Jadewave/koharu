@@ -153,19 +153,64 @@ pub(crate) fn glossary_prompts(
 
             You receive the current glossary and the source lines of a stretch of the work (OCR text in reading order, page after page).
             Return only NEW entries:
-            - name: a character, place, organization, or title seen in the lines and the {target} rendering to use for it.
-            - term: a recurring term, skill, technique, item, or sound-effect convention and the rendering to use for it.
-            - character: `source` is the character's name as it appears in the lines (for a recurring character without a name, a short description such as the regular customer), `target` a short profile in {target}: gender, age (the exact number when the work states it, otherwise rough), role, relationship to the other main characters and the age gap with them, and own manner of speaking (formal, casual, rough, childish, archaic, ...), and the first-person pronoun they use.
-            - address: how one character addresses another. `source` is \"Speaker -> Listener\" with the names used in the lines (or a short description for an unnamed recurring character), `target` is the pair of words the speaker uses for themselves and for the listener, chosen from their relationship, age gap, rank, and tone (for Vietnamese, for example \"anh - em\", \"tớ - cậu\", or \"tao - mày\"; do not give everyone the same pair). Use the ages in the character profiles you write.
+            - name: a character, place, organization, or title seen in the lines and the {target} rendering to use for it. Every named character gets a name entry, written without honorifics, so that the name is spelled the same way on every page.
+            - term: a recurring term, skill, technique, or item and the rendering to use for it. Leave sound effects out, because the translator renders them on each page, and never romanize anything.
+            - character: `source` is the bare name as it appears in the lines, without honorifics and never a pronoun, with one entry per character even when the lines write or call the name in several ways (for a recurring character without a name, a short description such as the regular customer); `target` a short profile in {target}: gender, age (the exact number when the work states it, otherwise rough), role, relationship to the other main characters and the age gap with them, and own manner of speaking (formal, casual, rough, childish, archaic, ...) including whether they speak politely or plainly to strangers and to the other main characters, and the first-person pronoun they use.
+            - address: how one character addresses another. `source` is \"Speaker -> Listener\" with the names used in the lines (or a short description for an unnamed recurring character), `target` is the pair of words the speaker uses for themselves and for the listener, chosen from their relationship, age gap, rank, and tone (for Vietnamese, for example \"tôi - cô\", \"anh - em\", \"tớ - cậu\", or \"tao - mày\"; do not give everyone the same pair). Formality decides first: people who speak politely to each other get a formal pair, close people a familiar one. Use the ages in the character profiles you write.
             - style: `source` is exactly work, `target` one short note on genre, setting, and overall register. At most one, and only if the glossary has none yet.
 
             Rules:
             - Choose natural renderings that will still fit the rest of the work.
             - Be exhaustive: list every named character, place, organization, title, and recurring term in the lines, every character who speaks, and every pair of speaking characters whose way of addressing each other you can tell. Write the character entries before the address entries.
-            - Skip entries already in the glossary you were given and anything that does not appear in these lines.
+            - Skip entries already in the glossary you were given and anything that does not appear in these lines. Never list the same character again under another spelling, honorific, or pronoun.
             - Write `kind` as exactly style, address, character, name, or term.
             - At most 20 entries, every string short.
             - Return an empty `entries` array when there is nothing new.
+        "},
+        target = target,
+    )
+    .trim_end()
+    .to_owned();
+    Ok((system, user))
+}
+
+/// Only Vietnamese has the many ways of saying "I" and "you" that must be fixed per pair of
+/// characters before the translation starts.
+pub(crate) fn decides_address(target: Language) -> bool {
+    target == Language::Vietnamese
+}
+
+/// The prompts of the pass that decides how the characters address each other. It reads the
+/// character profiles the first pass wrote (ages, genders, relationships), not the raw lines,
+/// because a line of OCR text does not say who speaks it.
+pub(crate) fn address_prompts(
+    target: Language,
+    characters: &[GlossaryEntry],
+) -> anyhow::Result<(String, String)> {
+    let input = json!({
+        "characters": characters
+            .iter()
+            .map(|entry| json!({ "name": entry.source, "profile": entry.target }))
+            .collect::<Vec<_>>(),
+    });
+    let user = serde_json::to_string(&input).context("failed to serialize address input")?;
+    let system = format!(
+        indoc! {"
+            You decide how the characters of a manga address each other when it is translated into {target}.
+            The translator will follow your choices exactly on every page.
+
+            You receive the characters of the work with their profiles (gender, age, role, relationships).
+            Return `address` entries, one for each direction of every pair of characters who talk to each other:
+            - `kind` is exactly address.
+            - `source` is \"Speaker -> Listener\" with the character names exactly as given.
+            - `target` is the pair of words the speaker uses for themselves and for the listener in {target} (for Vietnamese, for example \"tôi - cô\", \"anh - em\", \"tớ - cậu\", \"tao - mày\", \"em - chị\").
+
+            Rules:
+            - Formality decides first, then age gap, gender, rank, relationship, and tone. People who speak politely to each other (strangers, colleagues, a customer and a worker, a junior and a senior) get a formal pair (for Vietnamese 'tôi - cô', 'tôi - anh', 'em - anh'); close people (family, couples, old friends) get a familiar pair. Do not give everyone the same pair, and do not use 'anh - em' for people who are not close.
+            - The two directions of a pair need not mirror each other.
+            - Use only characters from the list. Skip a pair when the profiles say nothing about how the two relate, or give neither an age nor how formally they speak: leave it out rather than guess.
+            - At most 20 entries, every string short.
+            - Return an empty `entries` array when no pair can be decided.
         "},
         target = target,
     )
@@ -348,10 +393,10 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
         prompt.push_str(indoc! {"
             Vietnamese address and subject consistency:
             - Do not add a subject that the source leaves out. Japanese often drops it, and natural Vietnamese can too (行くよ becomes 'Đi nhé', not 'Anh đi nhé'). Add a subject only if the sentence would be wrong without it and you are sure who is speaking, using that character's pronoun. When a sentence is split over bubbles, the subject stays in the earlier bubble.
-            - For every segment, decide who speaks and who listens from the bubble tail in the image, the story, and the speaker's way of talking, then choose the pronoun pair from their gender, age, rank, relationship, and mood. The first-person word names the speaker and the second-person word names the listener, and each must match that person's gender. Never default to 'tôi - cậu' for everybody.
+            - For every segment, decide who speaks and who listens from the bubble tail in the image, the story, and the speaker's way of talking, then choose the pronoun pair from their gender, age, rank, relationship, and mood. The first-person word names the speaker and the second-person word names the listener, and each must match that person's gender. Never fall back on one pair for everybody ('tôi - cậu' and 'anh - em' included).
             - When the source is Japanese, its own words are evidence: 俺 is a casual or rough male voice (tao, tớ, mình, anh), 僕 a gentler or younger male one (tớ, mình, em to elders), 私 neutral or polite (tôi), あたし a casual female one (mình, tớ, em), お前 / 貴様 rude (mày, cậu), 君 (cậu, bạn, em), あなた (anh, chị, bạn). Honorifics (-kun, -san, -chan, -senpai, -sama, 先生) show the relationship.
             - A character keeps one pronoun pair with each listener while the relationship stays the same; never switch between anh, cô, ngươi, and so on for the same person unless the relationship or tone clearly changes (anger, intimacy, respect, a change of status). Within a sentence refer to the speaker in one way only ('anh đây' and 'tôi' never together). Glossary entries of kind address give the pair chosen for each 'Speaker -> Listener', and context entries show the pronouns and names already used: reuse them, and depart from them only when the page clearly shows that the relationship has changed.
-            - Address follows age and rank. Use the ages in the glossary profiles and the look of the characters. Someone older than the person they address calls that person 'em' (or 'cô' when formal or distant), never 'chị' or 'anh'; a younger person calls an older man 'anh' ('chú' or 'bác' when much older) and an older woman 'chị' ('cô' or 'dì' when much older); people of the same age use 'cậu', 'bạn', 'tớ', 'mình', or 'anh - em' for a couple. When ages are unknown, do not default to 'chị' or 'anh' for an adult: use the name, 'bạn', or 'cậu'.
+            - Address follows formality first, then age. Formality shows in the source: polite speech (です/ます forms, さん, 様, 先生) between adults, or between strangers, acquaintances, colleagues, and customers and workers, takes a formal pair such as 'tôi - cô', 'tôi - anh', 'tôi - chị', 'tôi - bạn' (or 'em - anh', 'em - chị' for a clearly younger speaker), while plain, familiar speech (だ, よ, ちゃん, くん, first names) takes a close pair such as 'anh - em', 'chị - em', 'tớ - cậu', 'tao - mày'. 'Em' belongs to a clearly younger person or to a close, familiar bond: do not use 'anh - em' between adults who speak politely or are not close. Within a register, use the ages in the glossary profiles and the look of the characters: a younger person calls an older man 'anh' ('chú' or 'bác' when much older) and an older woman 'chị' ('cô' or 'dì' when much older), an older person calls a clearly younger one 'em' or 'cháu', and people of the same age use 'cậu', 'bạn', 'tớ', 'mình'. When neither formality nor ages are known, do not guess: use the name, 'bạn', or no pronoun.
             - Vietnamese separates the inclusive 'chúng ta' (speaker and listener) from the exclusive 'chúng tôi', 'bọn anh', 'bọn em' (the speaker's group without the listener). 僕たち or 私たち said to someone outside the group takes the exclusive form.
             - Giving and receiving verbs show direction: ～てくれる means the other person does it for the speaker's side, ～てあげる means the speaker does it for the other, ～てもらう means the speaker receives it. Keep that direction.
             - Render each character name, title, and the way others address them the same way every time.
@@ -695,4 +740,21 @@ mod tests {
         assert_eq!(translations, ["A", "b", "C"]);
         assert_eq!(missing, [1]);
     }
-                }
+
+    #[test]
+    fn the_address_pass_reads_character_profiles() {
+        let characters = vec![GlossaryEntry {
+            kind: "character".to_owned(),
+            source: "田中".to_owned(),
+            target: "Nam, 56 tuổi, khách quen".to_owned(),
+        }];
+        let (system, user) = address_prompts(Language::Vietnamese, &characters).unwrap();
+        assert!(system.contains("Speaker -> Listener"));
+        assert!(system.contains("into Vietnamese"));
+        let input: serde_json::Value = serde_json::from_str(&user).unwrap();
+        assert_eq!(input["characters"][0]["name"], "田中");
+        assert_eq!(input["characters"][0]["profile"], "Nam, 56 tuổi, khách quen");
+        assert!(decides_address(Language::Vietnamese));
+        assert!(!decides_address(Language::English));
+    }
+}
