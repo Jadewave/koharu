@@ -22,8 +22,6 @@ pub(crate) struct StageInput {
     region: Option<Bounds>,
     images: Arc<ImageCache>,
     inpainting_mask: Option<InpaintingMask>,
-    /// The pages of the run in order, when the stage may look at the pages after its own.
-    pages: Option<Arc<[EntityId]>>,
 }
 
 impl StageInput {
@@ -42,14 +40,7 @@ impl StageInput {
             region,
             images,
             inpainting_mask,
-            pages: None,
         }
-    }
-
-    /// Lists the pages of the run, in order, so that translation can read ahead.
-    pub(crate) fn with_pages(mut self, pages: Arc<[EntityId]>) -> Self {
-        self.pages = Some(pages);
-        self
     }
 
     pub(crate) fn page(&self) -> EntityId {
@@ -282,4 +273,4 @@ mod tests {
         let changed_source = base.preview([&changed_source]).unwrap();
         assert!(text_patch.rebase_on(&changed_source).is_err());
     }
-        }
+}
