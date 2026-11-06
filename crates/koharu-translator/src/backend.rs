@@ -18,11 +18,6 @@ pub struct TranslationRequest {
     pub instructions: Option<String>,
     pub context: Vec<TranslationContext>,
     pub image: Option<Arc<DynamicImage>>,
-    /// One image per page when several pages are translated in one request, in page order.
-    /// Used by the local model instead of `image`.
-    pub page_images: Vec<Arc<DynamicImage>>,
-    /// For each segment, the index of its page among `page_images`. Empty for one page.
-    pub segment_pages: Vec<usize>,
 }
 
 impl TranslationRequest {
@@ -38,8 +33,6 @@ impl TranslationRequest {
             instructions: None,
             context: Vec::new(),
             image: None,
-            page_images: Vec::new(),
-            segment_pages: Vec::new(),
         }
     }
 
@@ -62,48 +55,6 @@ impl TranslationRequest {
         self
     }
 
-    /// Translates the segments of several consecutive pages in one request: `images` holds one
-    /// image per page and `segment_pages` the page of every segment.
-    #[must_use]
-    pub fn with_pages(
-        mut self,
-        images: Vec<Arc<DynamicImage>>,
-        segment_pages: Vec<usize>,
-    ) -> Self {
-        self.page_images = images;
-        self.segment_pages = segment_pages;
-        self
-    }
-
-    /// The same request restricted to the segments at `indices`, keeping their pages.
-    pub(crate) fn select(&self, indices: &[usize]) -> Self {
-        let mut subset = self.clone();
-        subset.segments = indices
-            .iter()
-            .map(|&index| self.segments[index].clone())
-            .collect();
-        if self.segment_pages.len() == self.segments.len() {
-            subset.segment_pages = indices
-                .iter()
-                .map(|&index| self.segment_pages[index])
-                .collect();
-        }
-        subset
-    }
-
-    /// Whether the model writes a `speaker` (who speaks to whom, and the pronoun pair) before
-    /// each translation. Only requests built for the local model with page images ask for it,
-    /// and only when the target is Vietnamese, the language that needs a pronoun pair.
-    pub(crate) fn wants_speaker(&self) -> bool {
-        self.target_language == Language::Vietnamese && !self.segment_pages.is_empty()
-    }
-
-    /// Drops every image: retries are text only because encoding images on a CPU is slow.
-    pub(crate) fn drop_images(&mut self) {
-        self.image = None;
-        self.page_images.clear();
-    }
-
     #[cfg(test)]
     #[must_use]
     pub fn with_context(mut self, context: impl IntoIterator<Item = TranslationContext>) -> Self {
@@ -112,44 +63,36 @@ impl TranslationRequest {
     }
 
     pub(crate) fn prepare_image(&mut self) -> anyhow::Result<()> {
-        if let Some(image) = self.image.as_ref() {
-            self.image = Some(shrink(image)?);
+        let Some(image) = self.image.as_ref() else {
+            return Ok(());
+        };
+        let (width, height) = (image.width(), image.height());
+        let longest = width.max(height);
+        if longest <= MAX_IMAGE_DIMENSION {
+            return Ok(());
         }
-        for image in &mut self.page_images {
-            *image = shrink(image)?;
-        }
+        let resized_width =
+            (u64::from(width) * u64::from(MAX_IMAGE_DIMENSION) / u64::from(longest)).max(1) as u32;
+        let resized_height =
+            (u64::from(height) * u64::from(MAX_IMAGE_DIMENSION) / u64::from(longest)).max(1) as u32;
+        let source = image.to_rgb8();
+        let mut resized = RgbImage::new(resized_width, resized_height);
+        Resizer::new()
+            .resize(
+                &source,
+                &mut resized,
+                &ResizeOptions::new()
+                    .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
+                    .use_alpha(false),
+            )
+            .context("failed to resize translation image")?;
+        self.image = Some(Arc::new(DynamicImage::ImageRgb8(resized)));
         Ok(())
     }
 
     pub(crate) fn remove_image(&mut self) {
-        self.drop_images();
-        self.segment_pages.clear();
+        self.image = None;
     }
-}
-
-/// The image scaled down so that its longest side is at most `MAX_IMAGE_DIMENSION`.
-fn shrink(image: &Arc<DynamicImage>) -> anyhow::Result<Arc<DynamicImage>> {
-    let (width, height) = (image.width(), image.height());
-    let longest = width.max(height);
-    if longest <= MAX_IMAGE_DIMENSION {
-        return Ok(Arc::clone(image));
-    }
-    let resized_width =
-        (u64::from(width) * u64::from(MAX_IMAGE_DIMENSION) / u64::from(longest)).max(1) as u32;
-    let resized_height =
-        (u64::from(height) * u64::from(MAX_IMAGE_DIMENSION) / u64::from(longest)).max(1) as u32;
-    let source = image.to_rgb8();
-    let mut resized = RgbImage::new(resized_width, resized_height);
-    Resizer::new()
-        .resize(
-            &source,
-            &mut resized,
-            &ResizeOptions::new()
-                .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
-                .use_alpha(false),
-        )
-        .context("failed to resize translation image")?;
-    Ok(Arc::new(DynamicImage::ImageRgb8(resized)))
 }
 
 pub(crate) struct EncodedImage {
