@@ -21,7 +21,7 @@ use crate::{
 const MAX_MISSING_RETRIES: u32 = 2;
 
 /// Upper bound for the tokens of one glossary update.
-const GLOSSARY_MAX_TOKENS: usize = 400;
+const GLOSSARY_MAX_TOKENS: usize = 900;
 
 /// The partial output is checked for a repetition loop every 16 generated tokens.
 const LOOP_CHECK_MASK: usize = 15;
@@ -218,7 +218,61 @@ impl LocalTranslator {
             finish = ?output.finish_reason,
             "local glossary generation finished"
         );
-        Ok(prompt::parse_glossary(&output.text))
+        // This pass sees OCR lines without page geometry or bubble tails. Never persist
+        // address pairs from it; only the dedicated profile-based address pass may create
+        // directional pairs.
+        Ok(prompt::parse_glossary(&output.text)
+            .into_iter()
+            .filter(|entry| !entry.kind.trim().eq_ignore_ascii_case("address"))
+            .collect())
+    }
+
+    /// Asks the model how the characters address each other, from their profiles. Text only,
+    /// without reasoning, with a short output. Every entry that comes back is an address pair.
+    pub(crate) async fn extract_addresses(
+        &self,
+        target: Language,
+        characters: &[GlossaryEntry],
+        generation: GenerationConfig,
+    ) -> Result<Vec<GlossaryEntry>> {
+        let (system, user) = prompt::address_prompts(target, characters)?;
+        let prompt = self
+            .llm
+            .render_chat_prompt_with_options(
+                &[ChatMessage::system(system), ChatMessage::user(user)],
+                ChatTemplateOptions {
+                    add_generation_prompt: true,
+                    enable_thinking: false,
+                },
+            )
+            .context("failed to render local address prompt")?;
+        let mut options = self.descriptor.generation.options(GenerationConfig {
+            reasoning: Some(false),
+            ..generation
+        });
+        options.max_tokens = GLOSSARY_MAX_TOKENS;
+        let schema = prompt::glossary_schema();
+        let llm = Arc::clone(&self.llm);
+        let output = tokio_rayon::spawn(move || {
+            let input = Input::new(&prompt);
+            llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
+        })
+        .await?;
+        tracing::info!(
+            prompt_tokens = output.prompt_tokens,
+            prompt_secs = output.prompt_duration.as_secs_f32(),
+            generated_tokens = output.generated_tokens,
+            generation_secs = output.generation_duration.as_secs_f32(),
+            finish = ?output.finish_reason,
+            "local address generation finished"
+        );
+        Ok(prompt::parse_glossary(&output.text)
+            .into_iter()
+            .map(|mut entry| {
+                entry.kind = "address".to_owned();
+                entry
+            })
+            .collect())
     }
 
     fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
