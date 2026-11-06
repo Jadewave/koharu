@@ -16,15 +16,7 @@ pub(crate) fn prompts(request: &TranslationRequest) -> anyhow::Result<(String, S
             .segments
             .iter()
             .enumerate()
-            .map(|(id, text)| TranslationInputSegment {
-                id,
-                text,
-                page: if request.page_images.len() > 1 {
-                    request.segment_pages.get(id).map(|page| page + 1)
-                } else {
-                    None
-                },
-            })
+            .map(|(id, text)| TranslationInputSegment { id, text })
             .collect(),
     };
     let user = serde_json::to_string(&input).context("failed to serialize translation input")?;
@@ -142,16 +134,6 @@ struct GlossaryOutput {
     entries: Vec<GlossaryEntry>,
 }
 
-/// Whether the glossary model also writes character profiles and address pairs. Both are
-/// off: they were written from OCR text alone (no speakers, no images) and were often wrong
-/// or ignored, so the translation model decides pronouns itself while it looks at the pages.
-/// The code stays so that they can be switched on again.
-pub(crate) const PROFILES: bool = false;
-
-const PROFILE_KINDS: &str = indoc! {"
-    - character: `source` is the bare name as it appears in the lines, without honorifics and never a pronoun, with one entry per character even when the lines write or call the name in several ways (for a recurring character without a name, a short description such as the regular customer); `target` a short profile: gender, age (the exact number when the work states it, otherwise rough), role, relationship to the other main characters, and own manner of speaking (formal, casual, rough, childish, archaic, ...) including whether they speak politely or plainly to strangers and to the other main characters, and the first-person pronoun they use. Put the manner of speaking and the pronoun first.
-    - address: how one character addresses another. `source` is \"Speaker -> Listener\" with the names used in the lines (or a short description for an unnamed recurring character), `target` is the pair of words the speaker uses for themselves and for the listener, chosen from their relationship, age gap, rank, and tone (for Vietnamese, for example \"tôi - cô\", \"anh - em\", \"tớ - cậu\", or \"tao - mày\"; do not give everyone the same pair). Formality decides first: people who speak politely to each other get a formal pair, close people a familiar one."};
-
 /// System and user prompts that ask a model for the new glossary entries of a stretch of the
 /// work, from its source lines alone.
 pub(crate) fn glossary_prompts(
@@ -172,33 +154,21 @@ pub(crate) fn glossary_prompts(
             You receive the current glossary and the source lines of a stretch of the work (OCR text in reading order, page after page).
             Return only NEW entries:
             - name: a character, place, organization, or title seen in the lines and the {target} rendering to use for it. Every named character gets a name entry, written without honorifics, so that the name is spelled the same way on every page.
-            - term: a recurring term, skill, technique, or item and the rendering to use for it. Leave sound effects out, because the translator renders them on each page, and never romanize anything.{profile_kinds}
+            - term: a recurring term, skill, technique, or item and the rendering to use for it. Leave sound effects out, because the translator renders them on each page, and never romanize anything.
+            - character: `source` is the bare name as it appears in the lines, without honorifics and never a pronoun, with one entry per character even when the lines write or call the name in several ways (for a recurring character without a name, a short description such as the regular customer); `target` is a short profile in {target}: gender and age only when supported by the text, role, explicitly established relationships, and manner of speaking (formal, casual, rough, childish, archaic, ...). Record a first-person pronoun only when the source text makes it clear. Mark uncertain facts as unknown instead of guessing.
             - style: `source` is exactly work, `target` one short note on genre, setting, and overall register. At most one, and only if the glossary has none yet.
 
             Rules:
             - Choose natural renderings that will still fit the rest of the work.
-            - Be exhaustive: list every named character, place, organization, title, and recurring term in the lines.{exhaustive_tail}
+            - Be exhaustive about named characters, places, organizations, titles, and recurring terms in the lines, but do not invent a speaker/listener relationship from OCR text alone.
+            - Do not infer a character's gender from their name, age from their apparent role, or closeness from casual wording alone. Prefer unknown to an unsupported guess.
+            - Do not create `address` entries in this pass. OCR lines have no reliable speaker-to-bubble mapping; directional address pairs are handled separately from the character profiles.
             - Skip entries already in the glossary you were given and anything that does not appear in these lines. Never list the same character again under another spelling, honorific, or pronoun.
-            - Write `kind` as exactly {kind_list}.
+            - Write `kind` as exactly style, character, name, or term.
             - At most 20 entries, every string short.
             - Return an empty `entries` array when there is nothing new.
         "},
         target = target,
-        profile_kinds = if PROFILES {
-            format!("\n{PROFILE_KINDS}")
-        } else {
-            String::new()
-        },
-        exhaustive_tail = if PROFILES {
-            " Also list every character who speaks, and every pair of speaking characters whose way of addressing each other you can tell. Write the character entries before the address entries."
-        } else {
-            ""
-        },
-        kind_list = if PROFILES {
-            "style, address, character, name, or term"
-        } else {
-            "style, name, or term"
-        },
     )
     .trim_end()
     .to_owned();
@@ -230,18 +200,19 @@ pub(crate) fn address_prompts(
             You decide how the characters of a manga address each other when it is translated into {target}.
             The translator will follow your choices exactly on every page.
 
-            You receive the characters of the work with their profiles (gender, age, role, relationships).
-            Return `address` entries, one for each direction of every pair of characters who talk to each other:
+            You receive character profiles extracted from OCR text; some details may be uncertain and the profiles do not prove that two characters actually speak to each other.
+            Return only directional `address` entries that are strongly supported by an explicitly stated relationship or clearly established formality:
             - `kind` is exactly address.
             - `source` is \"Speaker -> Listener\" with the character names exactly as given.
             - `target` is the pair of words the speaker uses for themselves and for the listener in {target} (for Vietnamese, for example \"tôi - cô\", \"anh - em\", \"tớ - cậu\", \"tao - mày\", \"em - chị\").
 
             Rules:
-            - Formality decides first, then age gap, gender, rank, relationship, and tone. People who speak politely to each other (strangers, colleagues, a customer and a worker, a junior and a senior) get a formal pair (for Vietnamese 'tôi - cô', 'tôi - anh', 'em - anh'); close people (family, couples, old friends) get a familiar pair. Do not give everyone the same pair, and do not use 'anh - em' for people who are not close.
-            - The two directions of a pair need not mirror each other.
-            - Use only characters from the list. Skip a pair when the profiles say nothing about how the two relate, or give neither an age nor how formally they speak: leave it out rather than guess.
-            - At most 20 entries, every string short.
-            - Return an empty `entries` array when no pair can be decided.
+            - Formality is more important than age or gender. Use age, rank, and relationship only when the profiles state them clearly.
+            - Gender or age alone is never enough to decide a pair. Do not infer that two characters are close just because they are both main characters, appear together, or use casual wording in OCR.
+            - Create a pair only when the profiles clearly establish a relationship (family, couple, close friends, teacher/student, colleagues, strangers/customer-worker, etc.) and there is enough evidence to choose its register. Otherwise leave it out.
+            - The two directions of a pair need not mirror each other. Do not create the reverse direction unless that character's way of speaking is independently supported.
+            - Use only characters from the list. Never invent a character or a relationship.
+            - At most 20 entries, every string short. Return an empty `entries` array when no pair can be decided.
         "},
         target = target,
     )
@@ -351,47 +322,6 @@ pub(crate) fn snippet(text: &str) -> String {
 }
 
 pub(crate) fn output_schema(expected: usize) -> Value {
-    output_schema_with(expected, false)
-}
-
-/// The schema for the translations of `request`: with a `speaker` string before `text` when
-/// the request asks the model to decide who speaks to whom first.
-pub(crate) fn request_schema(request: &TranslationRequest) -> Value {
-    output_schema_with(request.segments.len(), request.wants_speaker())
-}
-
-fn output_schema_with(expected: usize, speaker: bool) -> Value {
-    // Built in this order on purpose: the model writes the properties in the order they are
-    // listed, so the speaker is decided before the text.
-    let mut properties = serde_json::Map::new();
-    properties.insert(
-        "id".to_owned(),
-        json!({
-            "type": "integer",
-            "minimum": 0,
-            "maximum": expected.saturating_sub(1),
-            "description": "The ID copied from the corresponding input segment."
-        }),
-    );
-    let mut required = vec![json!("id")];
-    if speaker {
-        properties.insert(
-            "speaker".to_owned(),
-            json!({
-                "type": "string",
-                "description": "Who speaks to whom and the pronoun pair, e.g. 'Rio -> Yuu: em - anh', or 'narration' or 'thought'."
-            }),
-        );
-        required.push(json!("speaker"));
-    }
-    properties.insert(
-        "text".to_owned(),
-        json!({
-            "type": "string",
-            "description": "The translation of the input segment with this ID."
-        }),
-    );
-    required.push(json!("text"));
     json!({
         "type": "object",
         "properties": {
@@ -401,8 +331,19 @@ fn output_schema_with(expected: usize, speaker: bool) -> Value {
                 "maxItems": expected,
                 "items": {
                     "type": "object",
-                    "properties": properties,
-                    "required": required,
+                    "properties": {
+                        "id": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": expected.saturating_sub(1),
+                            "description": "The ID copied from the corresponding input segment."
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "The translation of the input segment with this ID."
+                        }
+                    },
+                    "required": ["id", "text"],
                     "additionalProperties": false
                 }
             }
@@ -453,30 +394,25 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
             Vietnamese address and subject consistency:
-            - Do not add a subject that the source leaves out. Japanese often drops it, and natural Vietnamese can too (行くよ becomes 'Đi nhé', not 'Anh đi nhé'). Add one only if the sentence would be wrong without it and you are sure who is speaking. 私, 僕, 俺 and あたし always mean the speaker, never the listener, and a sentence split over bubbles keeps its subject in the earlier bubble.
-            - For every segment decide who speaks and who listens from the bubble tail in the images, the story, and the speaker's way of talking. The first-person word names the speaker and the second-person word the listener, each matching that person's gender. Never fall back on one pair for everybody ('tôi - cậu' and 'anh - em' included).
-            - A glossary address entry 'Speaker -> Listener = pair' is the chosen pair: use it. Otherwise reuse the pronouns that the context entries and the earlier pages already show for the same two people, and decide a new pair only from the evidence below. A character keeps one pair with each listener until the relationship or tone clearly changes, and within a sentence refers to the speaker in one way only.
-            - Evidence, strongest first. (1) Formality of the source: polite speech (です/ます, さん, 様, 先生) between adults, strangers, colleagues, and customers and workers takes a formal pair ('tôi - cô', 'tôi - anh', 'tôi - chị', or 'em - anh', 'em - chị' for a clearly younger speaker); plain familiar speech (だ, よ, ちゃん, くん, first names) takes a close pair ('anh - em', 'chị - em', 'tớ - cậu', 'tao - mày'). A speaker who talks politely keeps polite endings (ạ, vâng, xin, làm ơn) and does not turn requests into 'đi', 'nhé', 'đấy'; teasing said in polite Japanese stays polite. (2) Age and look: a younger person calls an older man 'anh' ('chú', 'bác' when much older) and an older woman 'chị' ('cô', 'dì' when much older), an older person calls a clearly younger one 'em' or 'cháu', and people of the same age use 'cậu', 'bạn', 'tớ', 'mình'. 'Em' belongs to a clearly younger person or a close bond; do not use 'anh - em' between adults who speak politely or are not close. (3) The source's own words: 俺 casual or rough male (tao, tớ, mình, anh), 僕 gentler male (tớ, mình, em to elders, tôi when polite), 私 neutral or polite (tôi, em), あたし casual female (mình, tớ, em), お前 and 貴様 rude (mày, cậu), 君 (cậu, bạn, em), あなた (anh, chị, bạn). A speaker who adds くん to a man's name sees him as an equal or younger: do not make that speaker call him 'anh'.
-            - When neither formality nor age is known, do not guess: use the name, 'bạn', or no pronoun.
+            - Do not add a subject that the source leaves out. Japanese often drops it, and natural Vietnamese can too (行くよ becomes 'Đi nhé', not 'Anh đi nhé'). Add a subject only if the sentence would be wrong without it and you are sure who is speaking, using that character's pronoun. When a sentence is split over bubbles, the subject stays in the earlier bubble.
+            - For every dialogue segment, identify the speaker and listener from the tagged bubble, tail, image, and scene before choosing pronouns. Match both people to the character profiles; do not identify them from gender or appearance alone. The first word in an address pair belongs to the speaker and the second to the listener.
+            - An `address` glossary entry is directional: use it only when both speaker and listener match its two names, in that order. Never reverse it, apply it to a different pair, or use it just because one name appears in OCR. Keep a supported pair stable across pages.
+            - If either person cannot be identified confidently, or no reliable pair exists, do not guess a gendered relationship. Prefer omitting the subject when Vietnamese allows it; otherwise use a name or a neutral form such as 'bạn'. Never fall back on one pair for everybody ('tôi - cậu' and 'anh - em' included).
+            - When the source is Japanese, its own words are evidence: 俺 is a casual or rough male voice (tao, tớ, mình, anh), 僕 a gentler or younger male one (tớ, mình, em to elders), 私 neutral or polite (tôi), あたし a casual female one (mình, tớ, em), お前 / 貴様 rude (mày, cậu), 君 (cậu, bạn, em), あなた (anh, chị, bạn). Honorifics (-kun, -san, -chan, -senpai, -sama, 先生) show the relationship.
+            - When the source is Chinese, 您 is a respect/politeness cue while 你 alone does not prove intimacy; terms such as 哥、姐、老师、前辈、师父 and family titles can establish role or relationship when the scene confirms who they refer to. Distinguish 咱们 (usually inclusive) from 我们 (inclusive or exclusive by context).
+            - When the source is Korean, 저 and 나 help indicate speech level, and -요 / -습니다 usually signal polite speech. Terms such as 형、오빠、누나、언니、선배、선생님、씨 and 님 are relationship or status cues only when the speaker and listener are identified. Do not translate 당신 as a universal 'you'; Korean often omits the direct pronoun.
+            - A character keeps one pronoun pair with each listener while the relationship stays the same; never switch between anh, cô, ngươi, and so on for the same person unless the relationship or tone clearly changes (anger, intimacy, respect, a change of status). Within a sentence refer to the speaker in one way only ('anh đây' and 'tôi' never together). Use a matching address glossary entry first, then recent dialogue context; do not treat an entry for another pair as a general rule.
+            - Address follows established formality and relationship first, then age. Polite speech (です/ます forms, さん, 様, 先生) often calls for a formal pair; plain familiar speech (だ, よ, ちゃん, くん, first names) can support a closer pair, but these cues alone do not prove intimacy. Do not use 'anh - em' between adults who are polite or not close. Use ages only when the glossary establishes them; do not infer age from appearance alone. When relationship, age, and formality are unknown, do not guess: use a name, 'bạn', or no pronoun.
             - Vietnamese separates the inclusive 'chúng ta' (speaker and listener) from the exclusive 'chúng tôi', 'bọn anh', 'bọn em' (the speaker's group without the listener). 僕たち or 私たち said to someone outside the group takes the exclusive form.
             - Giving and receiving verbs show direction: ～てくれる means the other person does it for the speaker's side, ～てあげる means the speaker does it for the other, ～てもらう means the speaker receives it. Keep that direction.
             - Render each character name, title, and the way others address them the same way every time.
 
             Vietnamese fidelity and naturalness:
-            - First get the exact meaning of each sentence right; never invent content or guess a different meaning. Check polite forms, homographs, and the sense in context (for example Japanese 要る 'need' versus 居る 'be', 御着用ください 'please wear', だめ! as an exclamation is 'Không được!' and never 'hỏng rồi', さみしがってる is 'đang buồn' or 'đang cô đơn' without adding who misses whom).
+            - First get the exact meaning of each sentence right; never invent content or guess a different meaning. Check polite forms and homographs (for example Japanese 要る 'need' versus 居る 'be', 御着用ください 'please wear').
             - Then say it the way a Vietnamese speaker would in that situation: short spoken sentences, fitting sentence-final particles (nhé, nhỉ, mà, đấy, thôi, ạ) for the tone and politeness, no word-for-word calques.
             - Translate compound words by their real meaning, never by sounding out their parts, and keep every phrase of the source instead of replacing it with a different description. On profile or label pages use short standard labels such as Tên thật, Tuổi, Nghề nghiệp.
             - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them.
             - Keep each line about as long as the source allows, because Vietnamese text must fit the same speech bubble.
-        "}.trim_end());
-    }
-
-    if request.wants_speaker() {
-        prompt.push_str("\n\n");
-        prompt.push_str(indoc! {"
-            Speaker field:
-            - Each object has `id`, `speaker` and `text`, written in that order. Fill `speaker` first, in a few words: 'Speaker -> Listener: first-person word - second-person word' (for example 'Rio -> Yuu: em - anh'), or 'narration', or 'thought'. Use the name from the glossary or the context, or a short description such as 'khách' when there is no name.
-            - Then write `text` with exactly the pair you wrote, and use the same pair for the same Speaker -> Listener in every segment and on every page until the relationship clearly changes.
         "}.trim_end());
     }
 
@@ -489,19 +425,7 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
         "}.trim_end());
     }
 
-    if request.page_images.len() > 1 {
-        prompt.push_str("\n\n");
-        prompt.push_str(&format!(
-            indoc! {"
-                Image requirements:
-                {count} consecutive original page images are attached in reading order: the first image is page 1. Every input segment has a `page` number, and its text is on that page's image. The pages follow each other in the story, so a line can answer someone who spoke on an earlier page: read all the pages as one scene.
-                The red outlines on the images are tagged with numbers: each number is the id of the segment whose text lies inside that outline (ids run on from page to page). Use the outline to find the segment's bubble and follow its tail to the speaker, and read the text itself from the input segments, not from the outlines.
-                Use the images as visual context for who speaks and who listens, whether a bubble is speech, thought, or narration, the characters' gender, age, and mood, and for tone, layout, and ambiguous OCR.
-                Translate only the supplied segments; do not add text seen in the images that is absent from the input segments.
-            "},
-            count = request.page_images.len(),
-        ).trim_end());
-    } else if request.image.is_some() || request.page_images.len() == 1 {
+    if request.image.is_some() {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
             Image requirements:
@@ -535,9 +459,6 @@ struct TranslationInput<'a> {
 struct TranslationInputSegment<'a> {
     id: usize,
     text: &'a str,
-    /// 1-based page of the segment when several pages are translated together.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    page: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -549,11 +470,6 @@ struct TranslationOutput {
 struct TranslationOutputSegment {
     #[serde(deserialize_with = "deserialize_segment_id")]
     id: usize,
-    /// "Speaker -> Listener: pronoun pair", written before the text so the pronouns are
-    /// decided first. Only read back for the logs.
-    #[serde(default)]
-    #[allow(dead_code)]
-    speaker: Option<String>,
     text: String,
 }
 
@@ -832,6 +748,30 @@ mod tests {
     }
 
     #[test]
+    fn glossary_profile_pass_does_not_invent_address_pairs_from_ocr() {
+        let (system, _) = glossary_prompts(
+            Language::Vietnamese,
+            &[],
+            &["おはよう".to_owned()],
+        )
+        .unwrap();
+        assert!(system.contains("Do not create `address` entries in this pass"));
+        assert!(system.contains("Prefer unknown to an unsupported guess"));
+    }
+
+    #[test]
+    fn address_pass_requires_an_established_relationship() {
+        let characters = vec![GlossaryEntry {
+            kind: "character".to_owned(),
+            source: "田中".to_owned(),
+            target: "Nam, tuổi chưa rõ, học sinh".to_owned(),
+        }];
+        let (system, _) = address_prompts(Language::Vietnamese, &characters).unwrap();
+        assert!(system.contains("Gender or age alone is never enough"));
+        assert!(system.contains("Do not create the reverse direction"));
+    }
+
+    #[test]
     fn the_address_pass_reads_character_profiles() {
         let characters = vec![GlossaryEntry {
             kind: "character".to_owned(),
@@ -847,70 +787,4 @@ mod tests {
         assert!(decides_address(Language::Vietnamese));
         assert!(!decides_address(Language::English));
     }
-
-    fn two_pages(language: Language) -> TranslationRequest {
-        let blank = || std::sync::Arc::new(image::DynamicImage::new_rgb8(1, 1));
-        TranslationRequest::new(["a", "b", "c"], language)
-            .with_pages(vec![blank(), blank()], vec![0, 0, 1])
-    }
-
-    #[test]
-    fn pages_translated_together_carry_their_page_and_images() {
-        let request = two_pages(Language::Vietnamese);
-        let (system, user) = prompts(&request).unwrap();
-        assert!(system.contains("2 consecutive original page images"));
-        assert!(system.contains("Speaker field:"));
-        let input: serde_json::Value = serde_json::from_str(&user).unwrap();
-        assert_eq!(input["segments"][0]["page"], 1);
-        assert_eq!(input["segments"][2]["page"], 2);
-
-        let single = TranslationRequest::new(["a"], Language::Vietnamese)
-            .with_pages(vec![std::sync::Arc::new(image::DynamicImage::new_rgb8(1, 1))], vec![0]);
-        let (_, user) = prompts(&single).unwrap();
-        let input: serde_json::Value = serde_json::from_str(&user).unwrap();
-        assert!(input["segments"][0].get("page").is_none());
-    }
-
-    #[test]
-    fn the_speaker_is_written_between_the_id_and_the_text() {
-        let schema = request_schema(&two_pages(Language::Vietnamese));
-        let item = &schema["properties"]["translations"]["items"];
-        assert_eq!(item["required"], serde_json::json!(["id", "speaker", "text"]));
-        let keys: Vec<&String> = item["properties"].as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["id", "speaker", "text"]);
-
-        let plain = request_schema(&two_pages(Language::English));
-        let item = &plain["properties"]["translations"]["items"];
-        assert_eq!(item["required"], serde_json::json!(["id", "text"]));
-        let single = request_schema(&TranslationRequest::new(["a"], Language::Vietnamese));
-        assert_eq!(single, output_schema(1));
-    }
-
-    #[test]
-    fn the_speaker_in_the_output_is_accepted_and_ignored() {
-        let sources = vec!["a".to_owned(), "b".to_owned()];
-        let text = r#"{"translations":[{"id":0,"speaker":"Rio -> Yuu: em - anh","text":"A"},{"id":1,"text":"B"}]}"#;
-        let (translations, missing) = parse_translations("test", text, &sources).unwrap();
-        assert_eq!(translations, ["A", "B"]);
-        assert!(missing.is_empty());
-    }
-
-    #[test]
-    fn selecting_segments_keeps_their_pages() {
-        let subset = two_pages(Language::Vietnamese).select(&[1, 2]);
-        assert_eq!(subset.segments, ["b", "c"]);
-        assert_eq!(subset.segment_pages, [0, 1]);
-        assert_eq!(subset.page_images.len(), 2);
-    }
-
-    #[test]
-    fn the_glossary_asks_for_names_and_terms_without_profiles() {
-        let (system, _) =
-            glossary_prompts(Language::Vietnamese, &[], &["a".to_owned()]).unwrap();
-        assert!(!PROFILES);
-        assert!(system.contains("- name:"));
-        assert!(!system.contains("- character:"));
-        assert!(!system.contains("- address:"));
-        assert!(system.contains("style, name, or term"));
-    }
-            }
+}
