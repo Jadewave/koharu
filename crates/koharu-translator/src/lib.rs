@@ -22,6 +22,13 @@ use error::{Error, Result};
 use local::LocalTranslator;
 
 pub use backend::{GlossaryEntry, TranslationContext, TranslationRequest};
+
+/// Whether a segment has anything to translate: sound effects made only of punctuation or
+/// placeholder glyphs do not, and are not sent to the model.
+#[must_use]
+pub fn needs_translation(text: &str) -> bool {
+    loop_guard::needs_translation(text)
+}
 pub use language::Language;
 pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
@@ -47,7 +54,7 @@ const GLOSSARY_MAX_CHUNKS: usize = 200;
 /// Entries kept in the glossary; the oldest are dropped first.
 const GLOSSARY_MAX_ENTRIES: usize = 600;
 /// Each glossary field and each shown line is cut to this many characters.
-const GLOSSARY_FIELD_CHARS: usize = 120;
+const GLOSSARY_FIELD_CHARS: usize = 240;
 const GLOSSARY_LINE_CHARS: usize = 120;
 /// The glossary is complete, but a page is translated with only the entries that matter to
 /// it: at most this many, most useful kinds first.
@@ -59,7 +66,7 @@ const GLOSSARY_CHARACTER_MAX_ENTRIES: usize = 16;
 /// Source text of this many previous pages also counts when picking a page's entries, so
 /// characters who are only implied on the page keep their pronouns.
 const MEMORY_PAGES: usize = 3;
-const MEMORY_PAGE_CHARS: usize = 1500;
+const MEMORY_PAGE_CHARS: usize = 4500;
 
 /// Names, terms and address pairs decided by the glossary model for one work.
 #[derive(Default)]
@@ -382,11 +389,7 @@ impl Translator {
         } else if translatable.is_empty() {
             request.segments.clone()
         } else {
-            let mut subset = request.clone();
-            subset.segments = translatable
-                .iter()
-                .map(|&index| request.segments[index].clone())
-                .collect();
+            let subset = request.select(&translatable);
             let partial = self
                 .translate_segments(selection, generation, &subset)
                 .await?;
@@ -544,7 +547,7 @@ impl Translator {
         }
         // A line of OCR text does not say who speaks it, so the pairs are decided from the
         // character profiles the chunks wrote, once the whole work has been read.
-        if prompt::decides_address(language) && !stop() {
+        if prompt::PROFILES && prompt::decides_address(language) && !stop() {
             let characters = self
                 .glossary
                 .lock()
@@ -719,16 +722,12 @@ impl Translator {
             sources = ?preview(&request.segments, &redo),
             "reasoning pass produced looping segments; translating them again without reasoning"
         );
-        let mut retry = request.clone();
+        let mut retry = request.select(&redo);
         if selection.provider == Provider::Local {
-            // Encoding the page image on CPU takes minutes per call, so the local retry is
+            // Encoding the page images on CPU takes minutes per call, so the local retry is
             // text only.
-            retry.image = None;
+            retry.drop_images();
         }
-        retry.segments = redo
-            .iter()
-            .map(|&index| request.segments[index].clone())
-            .collect();
         let mut failed: Vec<usize> = Vec::new();
         let without_reasoning = GenerationConfig {
             reasoning: Some(false),
