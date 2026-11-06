@@ -22,9 +22,6 @@ const MAX_MISSING_RETRIES: u32 = 2;
 
 /// Upper bound for the tokens of one glossary update.
 const GLOSSARY_MAX_TOKENS: usize = 900;
-/// Output tokens kept per segment: its id, a speaker such as `Rio -> Yuu: em - anh`, and the
-/// translated text of a speech bubble.
-const TOKENS_PER_SEGMENT: usize = 60;
 
 /// The partial output is checked for a repetition loop every 16 generated tokens.
 const LOOP_CHECK_MASK: usize = 15;
@@ -113,9 +110,13 @@ impl LocalTranslator {
                 attempt,
                 "local translation skipped segments; translating them again"
             );
-            // Encoding the page images on CPU takes minutes, so retries are text only.
-            let mut retry = request.select(&missing);
-            retry.drop_images();
+            let mut retry = request.clone();
+            // Encoding the page image on CPU takes minutes, so retries are text only.
+            retry.image = None;
+            retry.segments = missing
+                .iter()
+                .map(|&index| request.segments[index].clone())
+                .collect();
             let mut retry_options = options.clone();
             retry_options.seed = retry_options.seed.wrapping_add(attempt);
             let (retried, still_missing) = self.generate(&retry, reasoning, &retry_options).await?;
@@ -148,25 +149,16 @@ impl LocalTranslator {
         reasoning: bool,
         options: &GenerationOptions,
     ) -> Result<(Vec<String>, Vec<usize>)> {
-        let images: Vec<_> = if request.page_images.is_empty() {
-            request.image.iter().cloned().collect()
-        } else {
-            request.page_images.clone()
-        };
+        let image = request.image.clone();
         let prompt = self.render_prompt(request, reasoning)?;
-        let schema = prompt::request_schema(request);
+        let schema = prompt::output_schema(request.segments.len());
         let llm = Arc::clone(&self.llm);
-        let mut options = options.clone();
-        // Each segment needs room for its id, its speaker and its text, so a request with
-        // many segments (several pages) must not be cut off by the single page limit.
-        options.max_tokens = options
-            .max_tokens
-            .max(request.segments.len() * TOKENS_PER_SEGMENT + 64);
+        let options = options.clone();
         let output = tokio_rayon::spawn(move || {
-            let mut input = Input::new(&prompt);
-            for image in &images {
-                input = input.with_image(&**image);
-            }
+            let input = image.as_deref().map_or_else(
+                || Input::new(&prompt),
+                |image| Input::new(&prompt).with_image(image),
+            );
             llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
         })
         .await?;
@@ -179,8 +171,6 @@ impl LocalTranslator {
             reasoning,
             "local generation finished"
         );
-        // Shows the speakers the model decided on; `parent: None` prints it right away.
-        tracing::debug!(parent: None, response = %output.text, "local translation response");
         Ok(prompt::parse_translations(
             "local",
             &output.text,
@@ -228,7 +218,13 @@ impl LocalTranslator {
             finish = ?output.finish_reason,
             "local glossary generation finished"
         );
-        Ok(prompt::parse_glossary(&output.text))
+        // This pass sees OCR lines without page geometry or bubble tails. Never persist
+        // address pairs from it; only the dedicated profile-based address pass may create
+        // directional pairs.
+        Ok(prompt::parse_glossary(&output.text)
+            .into_iter()
+            .filter(|entry| !entry.kind.trim().eq_ignore_ascii_case("address"))
+            .collect())
     }
 
     /// Asks the model how the characters address each other, from their profiles. Text only,
@@ -281,13 +277,8 @@ impl LocalTranslator {
 
     fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
         let (system, payload) = prompt::prompts(request)?;
-        let images = request
-            .page_images
-            .len()
-            .max(usize::from(request.image.is_some()));
-        let payload = if images > 0 {
-            let markers = vec![media_marker(); images].join("\n");
-            format!("{markers}\n{payload}")
+        let payload = if request.image.is_some() {
+            format!("{}\n{payload}", media_marker())
         } else {
             payload
         };
@@ -335,4 +326,4 @@ pub(crate) fn supports_vision(selection: &ModelSelection) -> bool {
             .find(|descriptor| descriptor.id == model)
             .is_some_and(|descriptor| descriptor.projector.is_some())
     })
-            }
+}
