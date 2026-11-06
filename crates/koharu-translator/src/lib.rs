@@ -27,27 +27,41 @@ pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
 pub use provider::{Provider, ProviderConfig, ProvidersConfig};
 
-/// The model that writes the glossary (names, terms, address pairs) every other model follows.
+/// The model that writes the glossary (names, terms, character profiles) every other model follows.
 const GLOSSARY_MODEL: &str = "gemma4-26b-a4b-uncensored";
 
 /// How many recent translated lines are replayed as context for the next page, so
 /// pronouns, names and tone stay the same from page to page.
-const MEMORY_PAIRS: usize = 6;
+const MEMORY_PAIRS: usize = 10;
 /// Each remembered line is cut to this many characters to keep the prompt short.
-const MEMORY_SEGMENT_CHARS: usize = 60;
+const MEMORY_SEGMENT_CHARS: usize = 80;
 /// Remembered lines are dropped after this long without a translation (a new chapter).
 const MEMORY_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// The glossary is written once per run, after OCR has read every page and before the first
 /// page is translated. The glossary model reads this many source lines at a time...
 const GLOSSARY_CHUNK_LINES: usize = 40;
-/// ...in at most this many reads (an even sample of the work when it has more lines).
-const GLOSSARY_MAX_CHUNKS: usize = 6;
+/// ...in at most this many reads. This only guards against a runaway work: the whole work is
+/// read unless it has more lines than `GLOSSARY_CHUNK_LINES * GLOSSARY_MAX_CHUNKS`.
+const GLOSSARY_MAX_CHUNKS: usize = 200;
 /// Entries kept in the glossary; the oldest are dropped first.
-const GLOSSARY_MAX_ENTRIES: usize = 40;
+const GLOSSARY_MAX_ENTRIES: usize = 600;
 /// Each glossary field and each shown line is cut to this many characters.
-const GLOSSARY_FIELD_CHARS: usize = 60;
-const GLOSSARY_LINE_CHARS: usize = 80;
+const GLOSSARY_FIELD_CHARS: usize = 120;
+const GLOSSARY_LINE_CHARS: usize = 120;
+/// The glossary is complete, but a page is translated with only the entries that matter to
+/// it: at most this many, most useful kinds first.
+const GLOSSARY_BLOCK_MAX_ENTRIES: usize = 50;
+/// Character profiles carry the visual identities and relationships used to resolve the
+/// speakers on a page. Prefer profiles whose names occur in the current/recent dialogue.
+const GLOSSARY_CHARACTER_MAX_ENTRIES: usize = 16;
+/// Address pairs are useful even when a page never spells either character's name: the page
+/// image lets the translator match the visible speakers to the character profiles.
+const GLOSSARY_ADDRESS_MAX_ENTRIES: usize = 16;
+/// Source text of this many previous pages also counts when picking a page's entries, so
+/// characters who are only implied on the page keep their pronouns.
+const MEMORY_PAGES: usize = 3;
+const MEMORY_PAGE_CHARS: usize = 1500;
 
 /// Names, terms and address pairs decided by the glossary model for one work.
 #[derive(Default)]
@@ -86,9 +100,102 @@ impl Glossary {
     }
 }
 
+/// `style` entries always apply; character profiles and address pairs are selected together
+/// so the translator can match visible speakers to the right directional pronoun pair.
+const GLOSSARY_KINDS: [&str; 5] = ["style", "character", "address", "name", "term"];
+
+fn address_names(source: &str) -> Option<(&str, &str)> {
+    source
+        .split_once("->")
+        .or_else(|| source.split_once('→'))
+        .map(|(speaker, listener)| (speaker.trim(), listener.trim()))
+}
+
+/// Treat common Japanese/Korean honorific suffixes as part of a name variant, not as a
+/// different character. Do not deduplicate by profile text: unrelated characters often share
+/// the same age, gender, and role.
+fn character_key(source: &str) -> String {
+    let source = source.trim().to_lowercase();
+    for suffix in [
+        "さん", "さま", "様", "ちゃん", "くん", "君", "先生", "先輩", "씨", "님",
+    ] {
+        if let Some(name) = source.strip_suffix(suffix) {
+            let name = name.trim();
+            if !name.is_empty() {
+                return name.to_owned();
+            }
+        }
+    }
+    source
+}
+
+/// Selects a compact page-specific glossary. Address pairs are included not only when a
+/// character name appears in OCR, but also when both endpoints have selected character
+/// profiles: speech bubbles normally contain dialogue, not the speakers' names.
+fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntry> {
+    let corpus = corpus.to_lowercase();
+    let mentioned = |text: &str| {
+        let text = text.trim().to_lowercase();
+        !text.is_empty() && corpus.contains(&text)
+    };
+
+    // Put explicitly mentioned characters first, then fill the remaining slots with the
+    // work's other known profiles. The image can identify them even when their names are
+    // absent from OCR.
+    let mut seen_characters = std::collections::HashSet::new();
+    let mut characters: Vec<&GlossaryEntry> = entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == "character" && seen_characters.insert(character_key(&entry.source))
+        })
+        .collect();
+    characters.sort_by_key(|entry| !mentioned(&entry.source));
+    characters.truncate(GLOSSARY_CHARACTER_MAX_ENTRIES);
+    let character_names: std::collections::HashSet<String> = characters
+        .iter()
+        .map(|entry| character_key(&entry.source))
+        .collect();
+
+    // Prefer pairs grounded by a name on this page/recent context. Also include pairs for
+    // two profiled characters, because the page image—not OCR text—identifies the speakers.
+    let mut addresses: Vec<(&GlossaryEntry, u8)> = entries
+        .iter()
+        .filter(|entry| entry.kind == "address")
+        .filter_map(|entry| {
+            let (speaker, listener) = address_names(&entry.source)?;
+            let name_mentioned = mentioned(speaker) || mentioned(listener);
+            let both_profiled = character_names.contains(&character_key(speaker))
+                && character_names.contains(&character_key(listener));
+            (name_mentioned || both_profiled)
+                .then_some((entry, if name_mentioned { 0 } else { 1 }))
+        })
+        .collect();
+    addresses.sort_by_key(|(_, priority)| *priority);
+    addresses.truncate(GLOSSARY_ADDRESS_MAX_ENTRIES);
+
+    let mut selected: Vec<&GlossaryEntry> = entries
+        .iter()
+        .filter(|entry| entry.kind == "style")
+        .collect();
+    selected.extend(characters);
+    selected.extend(addresses.into_iter().map(|(entry, _)| entry));
+    selected.extend(entries.iter().filter(|entry| {
+        matches!(entry.kind.as_str(), "name" | "term") && mentioned(&entry.source)
+    }));
+
+    selected.sort_by_key(|entry| {
+        GLOSSARY_KINDS
+            .iter()
+            .position(|kind| *kind == entry.kind)
+            .unwrap_or(GLOSSARY_KINDS.len())
+    });
+    selected.truncate(GLOSSARY_BLOCK_MAX_ENTRIES);
+    selected.into_iter().cloned().collect()
+}
+
 fn clean_entry(entry: GlossaryEntry) -> Option<GlossaryEntry> {
     let kind = entry.kind.trim().to_lowercase();
-    let kind = if ["name", "term", "address"].contains(&kind.as_str()) {
+    let kind = if GLOSSARY_KINDS.contains(&kind.as_str()) {
         kind
     } else {
         "term".to_owned()
@@ -131,6 +238,18 @@ fn glossary_chunks(lines: &[String]) -> Vec<&[String]> {
         .collect()
 }
 
+/// The character profiles for the address pass: one per normalized name, so honorific
+/// variants do not become separate characters while different people with similar profiles do.
+fn distinct_characters(entries: &[GlossaryEntry]) -> Vec<GlossaryEntry> {
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .iter()
+        .filter(|entry| entry.kind == "character" && seen.insert(character_key(&entry.source)))
+        .take(GLOSSARY_CHARACTER_MAX_ENTRIES)
+        .cloned()
+        .collect()
+}
+
 fn glossary_selection() -> ModelSelection {
     ModelSelection {
         provider: Provider::Local,
@@ -144,6 +263,8 @@ fn glossary_selection() -> ModelSelection {
 struct TranslationMemory {
     language: Option<Language>,
     recent: VecDeque<TranslationContext>,
+    /// Source text of the last few pages, to pick the glossary entries of implied characters.
+    recent_pages: VecDeque<String>,
     updated: Instant,
 }
 
@@ -152,6 +273,7 @@ impl Default for TranslationMemory {
         Self {
             language: None,
             recent: VecDeque::new(),
+            recent_pages: VecDeque::new(),
             updated: Instant::now(),
         }
     }
@@ -282,7 +404,7 @@ impl Translator {
         if request.context.is_empty() {
             request.context = self.recall(request.target_language);
         }
-        if let Some(block) = self.glossary_block(request.target_language) {
+        if let Some(block) = self.glossary_block(request.target_language, &request.segments) {
             request.instructions = Some(
                 match request.instructions.as_deref().map(str::trim) {
                     Some(instructions) if !instructions.is_empty() => {
@@ -348,18 +470,30 @@ impl Translator {
         Ok((provider_id, translated))
     }
 
-    /// The glossary as a prompt block, if there is one for this language.
-    fn glossary_block(&self, language: Language) -> Option<String> {
+    /// The part of the glossary that matters to this page, as a prompt block. The glossary
+    /// holds everything decided for the work; a page only carries the entries about the
+    /// names, terms and characters on it (or on the pages just before it).
+    fn glossary_block(&self, language: Language, segments: &[String]) -> Option<String> {
         let glossary = self.glossary.lock().ok()?;
         if glossary.language != Some(language) || glossary.entries.is_empty() {
             return None;
         }
-        Some(prompt::render_glossary(&glossary.entries))
+        let mut corpus = segments.join("\n");
+        if let Ok(memory) = self.memory.lock() {
+            for page in &memory.recent_pages {
+                corpus.push('\n');
+                corpus.push_str(page);
+            }
+        }
+        let selected = relevant_entries(&glossary.entries, &corpus);
+        if selected.is_empty() {
+            return None;
+        }
+        Some(prompt::render_glossary(&selected))
     }
 
     /// Writes the glossary of a work from the OCR text of all its pages: the glossary model
-    /// reads the lines in chunks and decides the renderings of names, terms and address
-    /// pairs, then it is released so the translation model can take its place. Only local
+    /// reads the lines in chunks and decides the renderings of names and terms and the address pairs, then it is released so the translation model can take its place. Only local
     /// models write glossaries; any other provider translates without one.
     ///
     /// A failure leaves the glossary as it was and is reported to the caller, which is
@@ -401,7 +535,21 @@ impl Translator {
             .lock()
             .map(|glossary| glossary.entries.len())
             .unwrap_or(0);
+        if let Ok(glossary) = self.glossary.lock() {
+            for entry in &glossary.entries {
+                // No parent span, so the line is printed at once instead of when the whole
+                // translation job (which can take hours on a CPU) finishes.
+                tracing::debug!(
+                    parent: None,
+                    kind = %entry.kind,
+                    source = %entry.source,
+                    target = %entry.target,
+                    "glossary entry"
+                );
+            }
+        }
         tracing::info!(
+            parent: None,
             entries,
             lines = lines.len(),
             secs = started.elapsed().as_secs_f32(),
@@ -433,7 +581,7 @@ impl Translator {
             let known = self
                 .glossary
                 .lock()
-                .map(|glossary| glossary.entries.clone())
+                .map(|glossary| relevant_entries(&glossary.entries, &chunk.join("\n")))
                 .unwrap_or_default();
             match translator
                 .extract_glossary(language, &known, chunk, generation)
@@ -447,6 +595,28 @@ impl Translator {
                 Err(error) => tracing::warn!(%error, "glossary chunk failed; continuing"),
             }
         }
+        // A line of OCR text does not say who speaks it, so the pairs are decided from the
+        // character profiles the chunks wrote, once the whole work has been read.
+        if prompt::decides_address(language) && !stop() {
+            let characters = self
+                .glossary
+                .lock()
+                .map(|glossary| distinct_characters(&glossary.entries))
+                .unwrap_or_default();
+            if characters.len() >= 2 {
+                match translator
+                    .extract_addresses(language, &characters, generation)
+                    .await
+                {
+                    Ok(entries) => {
+                        if let Ok(mut glossary) = self.glossary.lock() {
+                            glossary.merge(entries);
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "address pass failed; continuing"),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -457,6 +627,7 @@ impl Translator {
         };
         if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
             memory.recent.clear();
+            memory.recent_pages.clear();
             return Vec::new();
         }
         memory.recent.iter().cloned().collect()
@@ -469,6 +640,7 @@ impl Translator {
         };
         if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
             memory.recent.clear();
+            memory.recent_pages.clear();
         }
         memory.language = Some(language);
         for (source, translation) in sources.iter().zip(translations) {
@@ -486,6 +658,19 @@ impl Translator {
         while memory.recent.len() > MEMORY_PAIRS {
             memory.recent.pop_front();
         }
+        let page: String = sources
+            .iter()
+            .filter(|source| loop_guard::needs_translation(source))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .take(MEMORY_PAGE_CHARS)
+            .collect();
+        memory.recent_pages.push_back(page);
+        while memory.recent_pages.len() > MEMORY_PAGES {
+            memory.recent_pages.pop_front();
+        }
         memory.updated = Instant::now();
     }
 
@@ -493,6 +678,7 @@ impl Translator {
     pub fn forget(&self) {
         if let Ok(mut memory) = self.memory.lock() {
             memory.recent.clear();
+            memory.recent_pages.clear();
         }
         if let Ok(mut glossary) = self.glossary.lock() {
             glossary.entries.clear();
@@ -763,18 +949,130 @@ mod tests {
             target: target.to_owned(),
         };
         let mut glossary = Glossary::default();
-        glossary.merge(vec![entry("name", "田中", "Tanaka"), entry("bogus", "霊力", "linh lực")]);
+        glossary.merge(vec![
+            entry("name", "田中", "Tanaka"),
+            entry("bogus", "霊力", "linh lực"),
+            entry("character", "田中", "nam, 17 tuổi, hay nói thân mật"),
+        ]);
         glossary.merge(vec![entry("name", "田中", "Tanaca"), entry("name", "", "x")]);
-        assert_eq!(glossary.entries.len(), 2);
+        assert_eq!(glossary.entries.len(), 3);
         assert_eq!(glossary.entries[0].target, "Tanaka");
         assert_eq!(glossary.entries[1].kind, "term");
 
-        let many: Vec<GlossaryEntry> = (0..60)
+        let extra = GLOSSARY_MAX_ENTRIES + 20;
+        let many: Vec<GlossaryEntry> = (0..extra)
             .map(|index| entry("name", &format!("n{index}"), "x"))
             .collect();
         glossary.merge(many);
         assert_eq!(glossary.entries.len(), GLOSSARY_MAX_ENTRIES);
-        assert_eq!(glossary.entries.last().map(|e| e.source.as_str()), Some("n59"));
+        let last = format!("n{}", extra - 1);
+        assert_eq!(glossary.entries.last().map(|e| e.source.as_str()), Some(last.as_str()));
+    }
+
+    #[test]
+    fn a_page_only_carries_the_entries_that_matter_to_it() {
+        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+            kind: kind.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let entries = vec![
+            entry("term", "霊力", "linh lực"),
+            entry("name", "田中", "Tanaka"),
+            entry("name", "鈴木", "Suzuki"),
+            entry("character", "鈴木", "nữ, 16 tuổi, lịch sự"),
+            entry("style", "work", "học đường, thân mật"),
+            entry("address", "田中 -> 鈴木", "tớ - cậu"),
+            entry("address", "山田 → 佐藤", "anh - em"),
+        ];
+        let selected = relevant_entries(&entries, "田中: おはよう\n霊力が足りない");
+        let kinds: Vec<&str> = selected.iter().map(|e| e.kind.as_str()).collect();
+        // Character profiles precede their directional address pairs. A pair is included
+        // when one endpoint is mentioned in the recent dialogue, even if the other is not.
+        assert_eq!(kinds, ["style", "character", "address", "name", "term"]);
+        assert!(selected.iter().all(|entry| entry.source != "山田 → 佐藤"));
+        assert!(relevant_entries(&entries, "")
+            .iter()
+            .all(|entry| entry.kind == "style" || entry.kind == "character"));
+    }
+
+    #[test]
+    fn address_pass_keeps_distinct_characters_with_identical_profiles() {
+        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+            kind: kind.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let entries = vec![
+            entry("character", "りお", "Nữ, 27 tuổi"),
+            entry("character", "りおさん", "Nữ, 27 tuổi, nói nhỏ"),
+            entry("character", "常連", "Nữ, 27 tuổi"),
+            entry("name", "りお", "Rio"),
+        ];
+        let characters = distinct_characters(&entries);
+        let names: Vec<&str> = characters.iter().map(|entry| entry.source.as_str()).collect();
+        assert_eq!(names, ["りお", "常連"]);
+    }
+
+    #[test]
+    fn address_pairs_are_available_when_names_are_absent_from_page_ocr() {
+        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+            kind: kind.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let entries = vec![
+            entry("character", "田中", "nam, 17 tuổi, học sinh"),
+            entry("character", "鈴木", "nữ, 17 tuổi, học sinh"),
+            entry("character", "山田", "nam, 30 tuổi"),
+            entry("character", "佐藤", "nữ, 30 tuổi"),
+            entry("address", "田中さん -> 鈴木くん", "tớ - cậu"),
+            entry("address", "山田 -> 佐藤", "tôi - cô"),
+        ];
+
+        let selected = relevant_entries(&entries, "本当に？");
+        let address_sources: Vec<&str> = selected
+            .iter()
+            .filter(|entry| entry.kind == "address")
+            .map(|entry| entry.source.as_str())
+            .collect();
+
+        assert_eq!(address_sources, ["田中さん -> 鈴木くん", "山田 -> 佐藤"]);
+    }
+
+    #[test]
+    fn address_pairs_outside_the_selected_cast_are_not_added_without_a_name_hit() {
+        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+            kind: kind.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let entries = vec![
+            entry("character", "田中", "nam, 17 tuổi"),
+            entry("character", "鈴木", "nữ, 17 tuổi"),
+            entry("character", "山田", "nam, 30 tuổi"),
+            entry("address", "田中 -> 鈴木", "tớ - cậu"),
+            entry("address", "山田 -> 佐藤", "tôi - cô"),
+        ];
+
+        let selected = relevant_entries(&entries, "本当に？");
+        assert!(selected.iter().any(|entry| entry.source == "田中 -> 鈴木"));
+        assert!(!selected.iter().any(|entry| entry.source == "山田 -> 佐藤"));
+    }
+
+    #[test]
+    fn an_address_pair_keeps_its_first_wording() {
+        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+            kind: kind.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let mut glossary = Glossary::default();
+        glossary.merge(vec![
+            entry("address", "田中 -> 鈴木", "tớ - cậu"),
+            entry("address", "田中 -> 鈴木", "anh - em"),
+        ]);
+        assert_eq!(glossary.entries, [entry("address", "田中 -> 鈴木", "tớ - cậu")]);
     }
 
     #[test]
@@ -793,7 +1091,12 @@ mod tests {
         let short: Vec<String> = (0..100).map(|index| format!("line {index}")).collect();
         assert_eq!(glossary_chunks(&short).len(), 3);
 
-        let long: Vec<String> = (0..2000).map(|index| format!("line {index}")).collect();
+        let work: Vec<String> = (0..2000).map(|index| format!("line {index}")).collect();
+        assert_eq!(glossary_chunks(&work).len(), 50);
+
+        let long: Vec<String> = (0..GLOSSARY_CHUNK_LINES * GLOSSARY_MAX_CHUNKS * 2)
+            .map(|index| format!("line {index}"))
+            .collect();
         let chunks = glossary_chunks(&long);
         assert_eq!(chunks.len(), GLOSSARY_MAX_CHUNKS);
         assert_eq!(chunks[0][0], "line 0");
