@@ -185,6 +185,18 @@ fn glossary_chunks(lines: &[String]) -> Vec<&[String]> {
         .collect()
 }
 
+/// The character profiles for the address pass: one per distinct profile, so a character the
+/// lines name in several ways is not counted twice, and no more than a page carries.
+fn distinct_characters(entries: &[GlossaryEntry]) -> Vec<GlossaryEntry> {
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .iter()
+        .filter(|entry| entry.kind == "character" && seen.insert(entry.target.clone()))
+        .take(GLOSSARY_CHARACTER_MAX_ENTRIES)
+        .cloned()
+        .collect()
+}
+
 fn glossary_selection() -> ModelSelection {
     ModelSelection {
         provider: Provider::Local,
@@ -472,7 +484,10 @@ impl Translator {
             .unwrap_or(0);
         if let Ok(glossary) = self.glossary.lock() {
             for entry in &glossary.entries {
+                // No parent span, so the line is printed at once instead of when the whole
+                // translation job (which can take hours on a CPU) finishes.
                 tracing::debug!(
+                    parent: None,
                     kind = %entry.kind,
                     source = %entry.source,
                     target = %entry.target,
@@ -481,6 +496,7 @@ impl Translator {
             }
         }
         tracing::info!(
+            parent: None,
             entries,
             lines = lines.len(),
             secs = started.elapsed().as_secs_f32(),
@@ -524,6 +540,28 @@ impl Translator {
                     }
                 }
                 Err(error) => tracing::warn!(%error, "glossary chunk failed; continuing"),
+            }
+        }
+        // A line of OCR text does not say who speaks it, so the pairs are decided from the
+        // character profiles the chunks wrote, once the whole work has been read.
+        if prompt::decides_address(language) && !stop() {
+            let characters = self
+                .glossary
+                .lock()
+                .map(|glossary| distinct_characters(&glossary.entries))
+                .unwrap_or_default();
+            if characters.len() >= 2 {
+                match translator
+                    .extract_addresses(language, &characters, generation)
+                    .await
+                {
+                    Ok(entries) => {
+                        if let Ok(mut glossary) = self.glossary.lock() {
+                            glossary.merge(entries);
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "address pass failed; continuing"),
+                }
             }
         }
         Ok(())
@@ -903,6 +941,24 @@ mod tests {
         assert!(relevant_entries(&entries, "")
             .iter()
             .all(|entry| entry.kind == "style" || entry.kind == "character"));
+    }
+
+    #[test]
+    fn a_character_named_in_several_ways_is_counted_once_for_the_address_pass() {
+        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+            kind: kind.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let entries = vec![
+            entry("character", "りお", "Nữ, 27 tuổi"),
+            entry("character", "りおさん", "Nữ, 27 tuổi"),
+            entry("name", "りお", "Rio"),
+            entry("character", "常連さん", "Nam, 56 tuổi"),
+        ];
+        let characters = distinct_characters(&entries);
+        let names: Vec<&str> = characters.iter().map(|entry| entry.source.as_str()).collect();
+        assert_eq!(names, ["りお", "常連さん"]);
     }
 
     #[test]
