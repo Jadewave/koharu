@@ -1,346 +1,231 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeSet, VecDeque},
     sync::Arc,
-    time::Instant,
 };
 
-use anyhow::{Context as _, Result, ensure};
-use futures::{StreamExt as _, stream::FuturesUnordered};
-use koharu_scene::{EntityId, Snapshot};
-
-use crate::{
-    Committer, ErrorKind, PipelineError, Progress, ProgressSink, Report, Request, RunStatus, Stage,
-    StageOutput, StopToken,
-    images::ImageCache,
-    progress,
-    resources::ResourceMonitor,
-    scheduler::Scheduler,
-    scope::NormalizedScope,
-    stage_runner::{StageCompletion, StageJob, StageOutcome, StageRunner},
-    stages::StageInput,
+use anyhow::{Result, bail};
+use koharu_scene::{
+    EntityId, FitsTo, FlowsIn, Geometry, Inside, Presents, RecognizedFrom, RelationSpec, Snapshot,
 };
+use serde::{Deserialize, Serialize};
+use specta::Type;
 
-pub(crate) struct Execution<'a> {
-    runner: Arc<StageRunner>,
-    resources: Arc<ResourceMonitor>,
-    committer: &'a mut dyn Committer,
-    stop: StopToken,
-    progress: Option<ProgressSink>,
-    scope: NormalizedScope,
-    scheduler: Scheduler,
-    scene: Snapshot,
-    images: BTreeMap<EntityId, Arc<ImageCache>>,
-    busy_stages: BTreeSet<Stage>,
-    completed: usize,
-    failure: Option<PipelineError>,
-    base: koharu_scene::Revision,
-    started: Instant,
-    inpainting_mask: Option<crate::InpaintingMask>,
+use crate::Stage;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize, Type)]
+pub struct Bounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
-impl<'a> Execution<'a> {
-    pub(crate) fn new(
-        runner: Arc<StageRunner>,
-        resources: Arc<ResourceMonitor>,
-        snapshot: Snapshot,
-        request: Request,
-        committer: &'a mut dyn Committer,
-    ) -> std::result::Result<Self, PipelineError> {
-        let started = Instant::now();
-        let base = snapshot.revision();
-        let stages = request
-            .operation
-            .stages()
-            .map_err(|error| PipelineError::new(ErrorKind::InvalidInput, None, error))?;
-        let scope = NormalizedScope::new(&snapshot, &request.scope, &stages)
-            .map_err(|error| PipelineError::new(ErrorKind::InvalidInput, None, error))?;
-        let pages = scope.pages().to_vec();
-        if let Some(mask) = request.inpainting_mask.as_ref()
-            && (!pages.contains(&mask.page) || !stages.contains(&Stage::Inpainting))
+impl Bounds {
+    fn validate(self) -> Result<()> {
+        if self.x.is_finite()
+            && self.y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+            && self.width > 0.0
+            && self.height > 0.0
         {
-            return Err(PipelineError::new(
-                ErrorKind::InvalidInput,
-                Some(Stage::Inpainting),
-                anyhow::anyhow!("the inpainting mask page is outside the inpainting scope"),
-            ));
-        }
-        progress::emit(
-            request.progress.as_ref(),
-            Progress::Started {
-                pages: pages.clone(),
-                stages: stages.clone(),
-            },
-        );
-
-        Ok(Self {
-            runner,
-            resources,
-            committer,
-            stop: request.stop,
-            progress: request.progress,
-            scope,
-            scheduler: Scheduler::new(&pages, &stages).with_translation_gate(),
-            scene: snapshot,
-            images: BTreeMap::new(),
-            busy_stages: BTreeSet::new(),
-            completed: 0,
-            failure: None,
-            base,
-            started,
-            inpainting_mask: request.inpainting_mask,
-        })
-    }
-
-    pub(crate) async fn run(mut self) -> std::result::Result<Report, PipelineError> {
-        if self.stopped() {
-            return Ok(self.report(RunStatus::Stopped));
-        }
-
-        self.resources.start();
-        self.resources.wait_for_sample().await;
-
-        let runner = self.runner.clone();
-        let mut running = FuturesUnordered::new();
-        loop {
-            while let Some(job) = self.take_ready_job() {
-                running.push(runner.run(job));
-            }
-
-            let Some(completion) = running.next().await else {
-                if self.scheduler.translation_gated() && !self.stopped() && self.failure.is_none()
-                {
-                    self.open_translation().await;
-                    continue;
-                }
-                break;
-            };
-            self.busy_stages.remove(&completion.stage);
-            if self.stopped() || self.failure.is_some() {
-                continue;
-            }
-            if let Err(error) = self.apply_completion(completion).await {
-                self.failure = Some(error);
-            }
-        }
-
-        self.finalize()
-    }
-
-    fn take_ready_job(&mut self) -> Option<StageJob> {
-        if self.stopped() || self.failure.is_some() {
-            return None;
-        }
-        let (page, stage) = self.scheduler.start_next(&self.busy_stages)?;
-        self.busy_stages.insert(stage);
-        let images = self
-            .images
-            .entry(page)
-            .or_insert_with(|| Arc::new(ImageCache::default()))
-            .clone();
-        Some(StageJob::new(
-            stage,
-            StageInput::new(
-                self.scene.clone(),
-                page,
-                self.scope.entities(),
-                self.scope.region(page),
-                images,
-                self.inpainting_mask
-                    .as_ref()
-                    .filter(|mask| stage == Stage::Inpainting && mask.page == page)
-                    .cloned(),
-            ),
-            self.stop.clone(),
-            self.progress.clone(),
-        ))
-    }
-
-    /// Runs once every other stage has finished on every page and before the first page is
-    /// translated: the glossary model reads the OCR text of the whole work, then the
-    /// translation model takes over. A failed glossary never fails the run.
-    async fn open_translation(&mut self) {
-        let pages = self.scope.pages().to_vec();
-        let lines = match source_lines(&self.scene, &pages, self.scope.entities(), |page| {
-            self.scope.region(page)
-        }) {
-            Ok(lines) => lines,
-            Err(error) => {
-                tracing::warn!(%error, "could not read the OCR text for the glossary");
-                Vec::new()
-            }
-        };
-        if let Some(&page) = pages.first() {
-            progress::emit(
-                self.progress.as_ref(),
-                Progress::Loading {
-                    page,
-                    stage: Stage::Translation,
-                    model: "glossary".to_owned(),
-                },
-            );
-        }
-        let project = format!("{:?}", self.scene.project_id());
-        let stop = self.stop.clone();
-        if let Err(error) = self
-            .runner
-            .prepare_translation(&project, lines, move || stop.stopped())
-            .await
-        {
-            tracing::warn!(%error, "glossary phase failed; translating without a glossary");
-        }
-        self.scheduler.open_translation();
-    }
-
-    async fn apply_completion(
-        &mut self,
-        completion: StageCompletion,
-    ) -> std::result::Result<(), PipelineError> {
-        let StageCompletion {
-            page,
-            stage,
-            model,
-            elapsed,
-            outcome,
-        } = completion;
-        match outcome? {
-            StageOutcome::Stopped => {}
-            StageOutcome::Skipped => {
-                self.mark_complete(page, stage);
-                progress::emit(self.progress.as_ref(), Progress::Skipped { page, stage });
-            }
-            StageOutcome::Patch(patch) => {
-                if !self.commit_patch(page, stage, patch).await? {
-                    return Ok(());
-                }
-                self.mark_complete(page, stage);
-                progress::emit(
-                    self.progress.as_ref(),
-                    Progress::Finished {
-                        page,
-                        stage,
-                        model,
-                        elapsed,
-                    },
-                );
-            }
-        }
-        Ok(())
-    }
-
-    async fn commit_patch(
-        &mut self,
-        page: EntityId,
-        stage: Stage,
-        patch: koharu_scene::Patch,
-    ) -> std::result::Result<bool, PipelineError> {
-        let patch = patch
-            .rebase_on(&self.scene)
-            .and_then(|patch| {
-                patch.validate_on(&self.scene)?;
-                Ok(patch.with_label(format!("Pipeline {stage} for page {page}")))
-            })
-            .context("failed to rebase stage output onto the latest scene")
-            .map_err(|error| PipelineError::new(ErrorKind::InvalidOutput, Some(stage), error))?;
-        if self.stopped() {
-            return Ok(false);
-        }
-
-        let next = self
-            .committer
-            .commit(StageOutput { page, stage, patch })
-            .await
-            .with_context(|| format!("failed to commit {stage} output for page {page}"))
-            .map_err(|error| PipelineError::new(ErrorKind::Commit, Some(stage), error))?;
-        validate_commit(&self.scene, &next)
-            .map_err(|error| PipelineError::new(ErrorKind::Commit, Some(stage), error))?;
-        self.scene = next;
-        Ok(true)
-    }
-
-    fn mark_complete(&mut self, page: EntityId, stage: Stage) {
-        if self.scheduler.complete_stage(page, stage) {
-            self.images.remove(&page);
-        }
-        self.completed += 1;
-    }
-
-    fn stopped(&self) -> bool {
-        self.stop.stopped()
-    }
-
-    fn finalize(mut self) -> std::result::Result<Report, PipelineError> {
-        if let Some(error) = self.failure.take() {
-            return Err(error);
-        }
-        if !self.stopped() && self.completed != self.scheduler.total() {
-            return Err(PipelineError::new(
-                ErrorKind::InvalidOutput,
-                None,
-                anyhow::anyhow!(
-                    "pipeline scheduler stopped after {} of {} work items",
-                    self.completed,
-                    self.scheduler.total()
-                ),
-            ));
-        }
-        let status = if self.stopped() {
-            RunStatus::Stopped
+            Ok(())
         } else {
-            RunStatus::Completed
-        };
-        Ok(self.report(status))
+            bail!("region bounds must be finite and non-empty")
+        }
     }
 
-    fn report(&self, status: RunStatus) -> Report {
-        Report {
-            status,
-            base: self.base,
-            final_revision: self.scene.revision(),
-            completed: self.completed,
-            total: self.scheduler.total(),
-            elapsed: self.started.elapsed(),
-        }
+    pub(crate) fn intersects(self, geometry: &Geometry) -> bool {
+        let Some((min_x, min_y, max_x, max_y)) = geometry_extents(geometry) else {
+            return false;
+        };
+        min_x < self.x + self.width
+            && max_x > self.x
+            && min_y < self.y + self.height
+            && max_y > self.y
     }
 }
 
-/// The OCR text of every page in scope, in reading order.
-fn source_lines(
-    scene: &Snapshot,
-    pages: &[EntityId],
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, Type)]
+#[serde(tag = "scope", content = "value", rename_all = "snake_case")]
+pub enum Scope {
+    #[default]
+    Project,
+    Pages(Vec<EntityId>),
+    Region {
+        page: EntityId,
+        bounds: Bounds,
+    },
+    Entities(Vec<EntityId>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NormalizedScope {
+    pages: Arc<[EntityId]>,
     entities: Option<Arc<BTreeSet<EntityId>>>,
-    region: impl Fn(EntityId) -> Option<crate::Bounds>,
-) -> Result<Vec<String>> {
-    let mut lines = Vec::new();
-    for &page in pages {
-        let region = region(page);
-        let Some(group) = scene.page(page)?.text_group()? else {
-            continue;
-        };
-        for layer in group.text_layers()? {
-            if !crate::scope::contains_entity(scene, page, entities.as_deref(), region, layer.id())?
+    region: Option<(EntityId, Bounds)>,
+}
+
+impl NormalizedScope {
+    pub(crate) fn new(snapshot: &Snapshot, scope: &Scope, stages: &[Stage]) -> Result<Self> {
+        if matches!(scope, Scope::Entities(_))
+            && stages
+                .iter()
+                .any(|stage| matches!(stage, Stage::Detection | Stage::Inpainting))
+        {
+            bail!("detection and inpainting do not support entity-only scope");
+        }
+
+        match scope {
+            Scope::Project => Ok(Self {
+                pages: snapshot.pages().map(|page| page.id()).collect(),
+                entities: None,
+                region: None,
+            }),
+            Scope::Pages(requested) => {
+                if requested.is_empty() {
+                    bail!("page scope is empty");
+                }
+                let requested = requested.iter().copied().collect::<BTreeSet<_>>();
+                for id in &requested {
+                    snapshot.page(*id)?;
+                }
+                let pages = snapshot
+                    .pages()
+                    .map(|page| page.id())
+                    .filter(|id| requested.contains(id))
+                    .collect::<Arc<[_]>>();
+                Ok(Self {
+                    pages,
+                    entities: None,
+                    region: None,
+                })
+            }
+            Scope::Region { page, bounds } => {
+                snapshot.page(*page)?;
+                bounds.validate()?;
+                Ok(Self {
+                    pages: Arc::from([*page]),
+                    entities: None,
+                    region: Some((*page, *bounds)),
+                })
+            }
+            Scope::Entities(requested) => {
+                if requested.is_empty() {
+                    bail!("entity scope is empty");
+                }
+                let requested = requested.iter().copied().collect::<BTreeSet<_>>();
+                let mut page_set = BTreeSet::new();
+                for entity in &requested {
+                    snapshot.entity(*entity)?;
+                    page_set.insert(containing_page(snapshot, *entity)?);
+                }
+                let mut hierarchy = BTreeSet::new();
+                for entity in requested {
+                    hierarchy.extend(snapshot.subtree(entity)?.map(|entity| entity.id()));
+                }
+                let entities = semantic_closure(snapshot, hierarchy);
+                let pages = snapshot
+                    .pages()
+                    .map(|page| page.id())
+                    .filter(|id| page_set.contains(id))
+                    .collect::<Arc<[_]>>();
+                Ok(Self {
+                    pages,
+                    entities: Some(Arc::new(entities)),
+                    region: None,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn pages(&self) -> &[EntityId] {
+        &self.pages
+    }
+
+    pub(crate) fn entities(&self) -> Option<Arc<BTreeSet<EntityId>>> {
+        self.entities.clone()
+    }
+
+    pub(crate) fn region(&self, page: EntityId) -> Option<Bounds> {
+        debug_assert!(self.pages.contains(&page));
+        self.region
+            .and_then(|(candidate, bounds)| (candidate == page).then_some(bounds))
+    }
+}
+
+fn semantic_closure(snapshot: &Snapshot, mut entities: BTreeSet<EntityId>) -> BTreeSet<EntityId> {
+    let mut pending = entities.iter().copied().collect::<VecDeque<_>>();
+    while let Some(entity) = pending.pop_front() {
+        for relation in snapshot
+            .relations_from(entity, None)
+            .chain(snapshot.relations_to(entity, None))
+        {
+            let value = relation.value();
+            if ![
+                Presents::KIND,
+                RecognizedFrom::KIND,
+                FitsTo::KIND,
+                FlowsIn::KIND,
+                Inside::KIND,
+            ]
+            .contains(&value.kind.as_str())
             {
                 continue;
             }
-            let content = layer.content()?;
-            let Some(source) = content.source()? else {
-                continue;
-            };
-            if !source.text.value.trim().is_empty() {
-                lines.push(source.text.value);
+            for related in [value.source, value.target] {
+                if entities.insert(related) {
+                    pending.push_back(related);
+                }
             }
         }
     }
-    Ok(lines)
+    entities
 }
 
-fn validate_commit(previous: &Snapshot, next: &Snapshot) -> Result<()> {
-    ensure!(
-        previous.project_id() == next.project_id(),
-        "committer returned a snapshot from another project"
-    );
-    ensure!(
-        next.revision() > previous.revision(),
-        "committer did not advance the scene revision"
-    );
-    Ok(())
+pub(crate) fn contains_entity(
+    snapshot: &Snapshot,
+    page: EntityId,
+    entities: Option<&BTreeSet<EntityId>>,
+    region: Option<Bounds>,
+    entity: EntityId,
+) -> Result<bool> {
+    if containing_page(snapshot, entity)? != page {
+        return Ok(false);
+    }
+    if let Some(entities) = entities {
+        return Ok(entities.contains(&entity));
+    }
+    let Some(bounds) = region else {
+        return Ok(true);
+    };
+    Ok(snapshot
+        .component::<Geometry>(entity)?
+        .is_some_and(|geometry| bounds.intersects(&geometry)))
+}
+
+fn containing_page(snapshot: &Snapshot, mut entity: EntityId) -> Result<EntityId> {
+    loop {
+        if snapshot.page(entity).is_ok() {
+            return Ok(entity);
+        }
+        entity = snapshot
+            .parent(entity)?
+            .ok_or_else(|| anyhow::anyhow!("entity is not contained by a page"))?;
+    }
+}
+
+pub(crate) fn geometry_extents(geometry: &Geometry) -> Option<(f64, f64, f64, f64)> {
+    let first = geometry.points.first()?;
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x;
+    let mut max_y = first.y;
+    for point in &geometry.points[1..] {
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+    Some((min_x, min_y, max_x, max_y))
 }
