@@ -27,9 +27,6 @@ pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
 pub use provider::{Provider, ProviderConfig, ProvidersConfig};
 
-/// The model that writes the glossary (names, terms, character profiles) every other model follows.
-const GLOSSARY_MODEL: &str = "gemma4-26b-a4b-uncensored";
-
 /// How many recent translated lines are replayed as context for the next page, so
 /// pronouns, names and tone stay the same from page to page.
 const MEMORY_PAIRS: usize = 10;
@@ -62,6 +59,10 @@ const GLOSSARY_ADDRESS_MAX_ENTRIES: usize = 16;
 /// characters who are only implied on the page keep their pronouns.
 const MEMORY_PAGES: usize = 3;
 const MEMORY_PAGE_CHARS: usize = 1500;
+/// Keep a small amount of visual character context so IDs and pairings survive page changes.
+const VISUAL_MEMORY_PAGES: usize = 2;
+const VISUAL_MEMORY_CHARS: usize = 3000;
+const VISUAL_ADDRESS_MAX: usize = 40;
 
 /// Names, terms and address pairs decided by the glossary model for one work.
 #[derive(Default)]
@@ -250,21 +251,16 @@ fn distinct_characters(entries: &[GlossaryEntry]) -> Vec<GlossaryEntry> {
         .collect()
 }
 
-fn glossary_selection() -> ModelSelection {
-    ModelSelection {
-        provider: Provider::Local,
-        model: Some(GLOSSARY_MODEL.to_owned()),
-        quantization: None,
-        vision: false,
-        reasoning: false,
-    }
-}
 
 struct TranslationMemory {
     language: Option<Language>,
     recent: VecDeque<TranslationContext>,
     /// Source text of the last few pages, to pick the glossary entries of implied characters.
     recent_pages: VecDeque<String>,
+    /// Structured visual character/speaker analysis from the last few pages.
+    recent_visual: VecDeque<String>,
+    /// High-confidence directional pairs learned from page images; retained for the work.
+    visual_address_rules: Vec<String>,
     updated: Instant,
 }
 
@@ -274,6 +270,8 @@ impl Default for TranslationMemory {
             language: None,
             recent: VecDeque::new(),
             recent_pages: VecDeque::new(),
+            recent_visual: VecDeque::new(),
+            visual_address_rules: Vec::new(),
             updated: Instant::now(),
         }
     }
@@ -283,8 +281,6 @@ impl Default for TranslationMemory {
 pub struct Translator {
     providers: koharu_config::Config<ProvidersConfig>,
     local: Arc<tokio::sync::Mutex<Option<LoadedLocal>>>,
-    /// Holds the glossary model while another model translates, so neither evicts the other.
-    glossary_model: Arc<tokio::sync::Mutex<Option<LoadedLocal>>>,
     memory: Arc<std::sync::Mutex<TranslationMemory>>,
     glossary: Arc<std::sync::Mutex<Glossary>>,
     client: reqwest::Client,
@@ -311,7 +307,6 @@ impl Translator {
         Ok(Self {
             providers,
             local: Arc::new(tokio::sync::Mutex::new(None)),
-            glossary_model: Arc::new(tokio::sync::Mutex::new(None)),
             memory: Arc::new(std::sync::Mutex::new(TranslationMemory::default())),
             glossary: Arc::new(std::sync::Mutex::new(Glossary::default())),
             client: koharu_runtime::http_client()?,
@@ -346,17 +341,10 @@ impl Translator {
     }
 
     pub fn unload(&self) -> bool {
-        let fallback = self
-            .glossary_model
+        self.local
             .try_lock()
             .map(|mut loaded| loaded.take().is_some())
-            .unwrap_or(false);
-        let main = self
-            .local
-            .try_lock()
-            .map(|mut loaded| loaded.take().is_some())
-            .unwrap_or(false);
-        main || fallback
+            .unwrap_or(false)
     }
 
     #[tracing::instrument(skip_all)]
@@ -419,6 +407,34 @@ impl Translator {
             request.prepare_image()?;
         } else {
             request.remove_image();
+        }
+
+        // Analyze the marked page before translating it. The same model selected in the UI
+        // performs this pass, and its structured result is passed to translation.
+        if selection.provider == Provider::Local && request.image.is_some() {
+            let previous_visual = self.recall_visual(request.target_language);
+            match self.local(selection).await {
+                Ok(analyzer) => match analyzer
+                    .analyze_page(&request, &previous_visual, generation)
+                    .await
+                {
+                    Ok(Some(analysis)) => {
+                        let visual_block = format!(
+                            "VISUAL PAGE ANALYSIS (segment IDs match the red numbered boxes):\n{analysis}\nUse this mapping as evidence; do not invent speaker/listener identities."
+                        );
+                        request.instructions = Some(match request.instructions.take() {
+                            Some(existing) if !existing.trim().is_empty() => {
+                                format!("{existing}\n\n{visual_block}")
+                            }
+                            _ => visual_block,
+                        });
+                        self.remember_visual(request.target_language, analysis);
+                    }
+                    Ok(None) => tracing::warn!("visual analysis unavailable; continuing with image-aware translation"),
+                    Err(error) => tracing::warn!(%error, "visual analysis failed; continuing with image-aware translation"),
+                },
+                Err(error) => tracing::warn!(%error, "could not load selected model for visual analysis"),
+            }
         }
 
         let expected = request.segments.len();
@@ -492,9 +508,9 @@ impl Translator {
         Some(prompt::render_glossary(&selected))
     }
 
-    /// Writes the glossary of a work from the OCR text of all its pages: the glossary model
-    /// reads the lines in chunks and decides the renderings of names and terms and the address pairs, then it is released so the translation model can take its place. Only local
-    /// models write glossaries; any other provider translates without one.
+    /// Writes the glossary of a work from OCR text using the same selected local model that
+    /// performs page analysis and translation. This prevents a hidden model from influencing
+    /// benchmark results. Only local models write glossaries.
     ///
     /// A failure leaves the glossary as it was and is reported to the caller, which is
     /// expected to translate anyway.
@@ -507,8 +523,23 @@ impl Translator {
         lines: Vec<String>,
         stop: impl Fn() -> bool + Send + Sync,
     ) -> anyhow::Result<()> {
-        if let Ok(mut glossary) = self.glossary.lock() {
+        let new_work = if let Ok(mut glossary) = self.glossary.lock() {
+            let changed = glossary.language != Some(language)
+                || glossary.project.as_deref() != Some(project);
             glossary.begin(project, language);
+            changed
+        } else {
+            false
+        };
+        if new_work {
+            if let Ok(mut memory) = self.memory.lock() {
+                memory.language = Some(language);
+                memory.recent.clear();
+                memory.recent_pages.clear();
+                memory.recent_visual.clear();
+                memory.visual_address_rules.clear();
+                memory.updated = Instant::now();
+            }
         }
         if selection.provider != Provider::Local {
             return Ok(());
@@ -518,18 +549,13 @@ impl Translator {
             return Ok(());
         }
         let generation = generation.for_model(selection);
-        let shared = selection.model.as_deref() == Some(GLOSSARY_MODEL);
-        if !shared {
-            // Make room: the translation model is loaded again once the glossary is done.
-            *self.local.lock().await = None;
-        }
+        // Use the same selected model for glossary, visual analysis, and translation.
+        // This makes model comparisons honest and avoids silently running Gemma in the
+        // background when the user selected another model.
         let started = Instant::now();
         let result = self
-            .write_glossary(selection, shared, generation, language, &lines, &stop)
+            .write_glossary(selection, generation, language, &lines, &stop)
             .await;
-        if !shared {
-            *self.glossary_model.lock().await = None;
-        }
         let entries = self
             .glossary
             .lock()
@@ -561,19 +587,12 @@ impl Translator {
     async fn write_glossary(
         &self,
         selection: &ModelSelection,
-        shared: bool,
         generation: GenerationConfig,
         language: Language,
         lines: &[String],
         stop: &(impl Fn() -> bool + Send + Sync),
     ) -> anyhow::Result<()> {
-        let loaded = if shared {
-            self.local(selection).await
-        } else {
-            self.load_into(&self.glossary_model, &glossary_selection())
-                .await
-        };
-        let translator = loaded?;
+        let translator = self.local(selection).await?;
         for chunk in glossary_chunks(lines) {
             if stop() {
                 break;
@@ -595,8 +614,8 @@ impl Translator {
                 Err(error) => tracing::warn!(%error, "glossary chunk failed; continuing"),
             }
         }
-        // A line of OCR text does not say who speaks it, so the pairs are decided from the
-        // character profiles the chunks wrote, once the whole work has been read.
+        // OCR alone does not identify speakers. This pass only creates conservative pairs
+        // supported by the character profiles; page-level visual analysis resolves speakers.
         if prompt::decides_address(language) && !stop() {
             let characters = self
                 .glossary
@@ -628,9 +647,128 @@ impl Translator {
         if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
             memory.recent.clear();
             memory.recent_pages.clear();
+            memory.recent_visual.clear();
+            memory.visual_address_rules.clear();
             return Vec::new();
         }
         memory.recent.iter().cloned().collect()
+    }
+
+    /// Returns recent visual character context for the next page.
+    fn recall_visual(&self, language: Language) -> String {
+        let Ok(mut memory) = self.memory.lock() else {
+            return String::new();
+        };
+        if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
+            memory.recent_visual.clear();
+            memory.visual_address_rules.clear();
+            return String::new();
+        }
+        let mut context = memory.recent_visual.iter().cloned().collect::<Vec<_>>().join("\n");
+        if !memory.visual_address_rules.is_empty() {
+            context.push_str("\nESTABLISHED DIRECTIONAL ADDRESS RULES: ");
+            context.push_str(&format!("[{}]", memory.visual_address_rules.join(",")));
+        }
+        context
+    }
+
+    /// Stores compact visual analysis and high-confidence directional address rules.
+    fn remember_visual(&self, language: Language, analysis: String) {
+        let Ok(mut memory) = self.memory.lock() else {
+            return;
+        };
+        if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
+            memory.recent.clear();
+            memory.recent_pages.clear();
+            memory.recent_visual.clear();
+            memory.visual_address_rules.clear();
+        }
+        memory.language = Some(language);
+        // Keep the identity and directional-address facts, not every per-bubble detail.
+        // This makes the cross-page context compact and avoids cutting JSON mid-object.
+        let compact = serde_json::from_str::<serde_json::Value>(&analysis)
+            .ok()
+            .map(|value| {
+                let page_context = value
+                    .get("page_context")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .chars()
+                    .take(240)
+                    .collect::<String>();
+                let characters: Vec<serde_json::Value> = value
+                    .get("characters")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .take(12)
+                    .map(|character| serde_json::json!({
+                        "id": character.get("id").cloned().unwrap_or_default(),
+                        "visual_description": character.get("visual_description").cloned().unwrap_or_default(),
+                        "gender": character.get("gender").cloned().unwrap_or_default(),
+                        "role": character.get("role").cloned().unwrap_or_default(),
+                    }))
+                    .collect();
+                let address_rules: Vec<serde_json::Value> = value
+                    .get("address_rules")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .take(20)
+                    .map(|rule| serde_json::json!({
+                        "speaker": rule.get("speaker").cloned().unwrap_or_default(),
+                        "listener": rule.get("listener").cloned().unwrap_or_default(),
+                        "first_person": rule.get("first_person").cloned().unwrap_or_default(),
+                        "second_person": rule.get("second_person").cloned().unwrap_or_default(),
+                        "confidence": rule.get("confidence").cloned().unwrap_or_default(),
+                    }))
+                    .collect();
+                serde_json::json!({
+                    "page_context": page_context,
+                    "characters": characters,
+                    "address_rules": address_rules,
+                })
+                .to_string()
+            })
+            .unwrap_or_else(|| analysis.clone());
+        memory.recent_visual.push_back(
+            compact.chars().take(VISUAL_MEMORY_CHARS).collect::<String>(),
+        );
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&analysis) {
+            if let Some(rules) = value.get("address_rules").and_then(serde_json::Value::as_array) {
+                for rule in rules {
+                    let speaker = rule.get("speaker").and_then(serde_json::Value::as_str).unwrap_or("");
+                    let listener = rule.get("listener").and_then(serde_json::Value::as_str).unwrap_or("");
+                    let first = rule.get("first_person").and_then(serde_json::Value::as_str).unwrap_or("");
+                    let second = rule.get("second_person").and_then(serde_json::Value::as_str).unwrap_or("");
+                    let confidence = rule.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                    if speaker.is_empty() || listener.is_empty()
+                        || speaker.eq_ignore_ascii_case("unknown")
+                        || listener.eq_ignore_ascii_case("unknown")
+                        || first.is_empty() || second.is_empty() || confidence < 0.75
+                    {
+                        continue;
+                    }
+                    let exists = memory.visual_address_rules.iter().any(|saved| {
+                        serde_json::from_str::<serde_json::Value>(saved).ok().is_some_and(|saved| {
+                            saved.get("speaker").and_then(serde_json::Value::as_str) == Some(speaker)
+                                && saved.get("listener").and_then(serde_json::Value::as_str) == Some(listener)
+                        })
+                    });
+                    if !exists {
+                        memory.visual_address_rules.push(rule.to_string());
+                    }
+                }
+            }
+        }
+        if memory.visual_address_rules.len() > VISUAL_ADDRESS_MAX {
+            let excess = memory.visual_address_rules.len() - VISUAL_ADDRESS_MAX;
+            memory.visual_address_rules.drain(..excess);
+        }
+        while memory.recent_visual.len() > VISUAL_MEMORY_PAGES {
+            memory.recent_visual.pop_front();
+        }
+        memory.updated = Instant::now();
     }
 
     /// Remembers the lines that translated cleanly, newest last.
@@ -641,6 +779,8 @@ impl Translator {
         if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
             memory.recent.clear();
             memory.recent_pages.clear();
+            memory.recent_visual.clear();
+            memory.visual_address_rules.clear();
         }
         memory.language = Some(language);
         for (source, translation) in sources.iter().zip(translations) {
@@ -679,6 +819,8 @@ impl Translator {
         if let Ok(mut memory) = self.memory.lock() {
             memory.recent.clear();
             memory.recent_pages.clear();
+            memory.recent_visual.clear();
+            memory.visual_address_rules.clear();
         }
         if let Ok(mut glossary) = self.glossary.lock() {
             glossary.entries.clear();
