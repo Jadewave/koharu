@@ -221,6 +221,109 @@ pub(crate) fn address_prompts(
     Ok((system, user))
 }
 
+
+/// Builds a visual-analysis pass for one OCR page. The segment IDs correspond to the
+/// numbered boxes drawn on the image by the pipeline.
+pub(crate) fn visual_analysis_prompt(
+    request: &TranslationRequest,
+    previous_context: &str,
+) -> anyhow::Result<(String, String, Value)> {
+    let segments: Vec<Value> = request
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(id, text)| json!({ "id": id, "text": text }))
+        .collect();
+    let user = serde_json::to_string(&json!({
+        "previous_page_character_context": previous_context,
+        "segments": segments,
+    }))
+    .context("failed to serialize visual-analysis input")?;
+    let system = format!(
+        indoc! {"
+            You are a Japanese manga visual analyst. Analyze the attached manga page image and
+            the OCR segments. The image contains numbered red boxes; each number is the exact
+            segment id whose OCR text belongs to that region. Use the box and its bubble tail
+            to identify the speaker. Do not infer a speaker from dialogue wording alone.
+
+            Identify recurring characters by visible appearance and reuse their IDs from the
+            previous-page context when the evidence supports a match. If identity is uncertain,
+            use UNKNOWN rather than inventing a new identity. Distinguish spoken dialogue,
+            thoughts, narration, and sound effects. Identify the likely listener only when the
+            scene, gaze, posture, or dialogue supports it.
+
+            For Vietnamese address, recommend a directional first-person/second-person pair
+            only when speaker, listener, and relationship/register are sufficiently supported.
+            Japanese pronouns and honorifics are evidence, not a complete relationship proof.
+            Do not assume 俺, 僕, and 私 map to one fixed Vietnamese pronoun. Do not infer age
+            from appearance alone. Keep prior established pairings stable unless the image or
+            dialogue clearly shows a change. If uncertain, leave the pair blank and explain.
+
+            Return only JSON matching the schema. Include every input segment id exactly once.
+            Never translate the OCR segments. Never invent text, characters, relationships, or
+            unseen story facts. Use confidence from 0 to 1 and concise visual evidence.
+        "},
+    )
+    .trim_end()
+    .to_owned();
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "page_context": {"type": "string"},
+            "characters": {
+                "type": "array", "items": {"type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "visual_description": {"type": "string"},
+                        "gender": {"type": "string"},
+                        "role": {"type": "string"},
+                        "confidence": {"type": "number"}
+                    },
+                    "required": ["id", "visual_description", "gender", "role", "confidence"],
+                    "additionalProperties": false
+                }
+            },
+            "dialogues": {
+                "type": "array",
+                "minItems": request.segments.len(),
+                "maxItems": request.segments.len(),
+                "items": {"type": "object",
+                    "properties": {
+                        "segment_id": {"type": "integer", "minimum": 0, "maximum": request.segments.len().saturating_sub(1)},
+                        "speaker": {"type": "string"},
+                        "listener": {"type": "string"},
+                        "type": {"type": "string", "enum": ["dialogue", "thought", "narration", "sfx", "unknown"]},
+                        "emotion": {"type": "string"},
+                        "tone": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "evidence": {"type": "string"}
+                    },
+                    "required": ["segment_id", "speaker", "listener", "type", "emotion", "tone", "confidence", "evidence"],
+                    "additionalProperties": false
+                }
+            },
+            "address_rules": {
+                "type": "array", "items": {"type": "object",
+                    "properties": {
+                        "speaker": {"type": "string"},
+                        "listener": {"type": "string"},
+                        "first_person": {"type": "string"},
+                        "second_person": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "evidence": {"type": "string"}
+                    },
+                    "required": ["speaker", "listener", "first_person", "second_person", "confidence", "evidence"],
+                    "additionalProperties": false
+                }
+            },
+            "uncertainties": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["page_context", "characters", "dialogues", "address_rules", "uncertainties"],
+        "additionalProperties": false
+    });
+    Ok((system, user, schema))
+}
+
 pub(crate) fn glossary_schema() -> Value {
     json!({
         "type": "object",
@@ -396,7 +499,7 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             Vietnamese address and subject consistency:
             - Do not add a subject that the source leaves out. Japanese often drops it, and natural Vietnamese can too (行くよ becomes 'Đi nhé', not 'Anh đi nhé'). Add a subject only if the sentence would be wrong without it and you are sure who is speaking, using that character's pronoun. When a sentence is split over bubbles, the subject stays in the earlier bubble.
             - For every dialogue segment, identify the speaker and listener from the tagged bubble, tail, image, and scene before choosing pronouns. Match both people to the character profiles; do not identify them from gender or appearance alone. The first word in an address pair belongs to the speaker and the second to the listener.
-            - An `address` glossary entry is directional: use it only when both speaker and listener match its two names, in that order. Never reverse it, apply it to a different pair, or use it just because one name appears in OCR. Keep a supported pair stable across pages.
+            - An `address` glossary entry or an `address_rules` item in VISUAL PAGE ANALYSIS is directional: use it only when both speaker and listener match, in that order. Never reverse it, apply it to a different pair, or use it just because one name appears in OCR. Keep a supported pair stable across pages.
             - If either person cannot be identified confidently, or no reliable pair exists, do not guess a gendered relationship. Prefer omitting the subject when Vietnamese allows it; otherwise use a name or a neutral form such as 'bạn'. Never fall back on one pair for everybody ('tôi - cậu' and 'anh - em' included).
             - When the source is Japanese, its own words are evidence: 俺 is a casual or rough male voice (tao, tớ, mình, anh), 僕 a gentler or younger male one (tớ, mình, em to elders), 私 neutral or polite (tôi), あたし a casual female one (mình, tớ, em), お前 / 貴様 rude (mày, cậu), 君 (cậu, bạn, em), あなた (anh, chị, bạn). Honorifics (-kun, -san, -chan, -senpai, -sama, 先生) show the relationship.
             - When the source is Chinese, 您 is a respect/politeness cue while 你 alone does not prove intimacy; terms such as 哥、姐、老师、前辈、师父 and family titles can establish role or relationship when the scene confirms who they refer to. Distinguish 咱们 (usually inclusive) from 我们 (inclusive or exclusive by context).
@@ -615,6 +718,18 @@ mod tests {
         assert!(prompt.contains("from Japanese into natural Korean"));
         assert!(prompt.contains("Copy every input ID exactly once"));
         assert!(prompt.contains("Use informal speech."));
+    }
+
+    #[test]
+    fn visual_analysis_prompt_maps_numbered_page_segments() {
+        let request = TranslationRequest::new(["なぁ、ゆい", "……そっか"], Language::Vietnamese);
+        let (system, user, schema) = visual_analysis_prompt(&request, "previous character map").unwrap();
+        let input: serde_json::Value = serde_json::from_str(&user).unwrap();
+        assert!(system.contains("numbered red boxes"));
+        assert_eq!(input["segments"][0]["id"], 0);
+        assert_eq!(input["segments"][1]["text"], "……そっか");
+        assert_eq!(input["previous_page_character_context"], "previous character map");
+        assert_eq!(schema["required"].as_array().unwrap().len(), 5);
     }
 
     #[test]
