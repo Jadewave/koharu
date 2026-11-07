@@ -8,15 +8,6 @@ use serde_json::{Value, json};
 use crate::{GlossaryEntry, Language, TranslationContext, TranslationRequest};
 
 pub(crate) fn prompts(request: &TranslationRequest) -> anyhow::Result<(String, String)> {
-    prompts_with_address_observations(request, false)
-}
-
-/// Local Vision translation can learn directional address pairs from the same response.
-/// Remote providers keep the original prompt and JSON schema unless explicitly opted in.
-pub(crate) fn prompts_with_address_observations(
-    request: &TranslationRequest,
-    include_address_observations: bool,
-) -> anyhow::Result<(String, String)> {
     let input = TranslationInput {
         source_language: request.source_language,
         target_language: request.target_language,
@@ -29,10 +20,7 @@ pub(crate) fn prompts_with_address_observations(
             .collect(),
     };
     let user = serde_json::to_string(&input).context("failed to serialize translation input")?;
-    Ok((
-        translation_system_prompt_with_address_observations(request, include_address_observations),
-        user,
-    ))
+    Ok((translation_system_prompt(request), user))
 }
 
 pub(crate) fn translations(
@@ -50,19 +38,6 @@ pub(crate) fn parse_translations(
     text: &str,
     source_segments: &[String],
 ) -> anyhow::Result<(Vec<String>, Vec<usize>)> {
-    let (translations, missing, _) =
-        parse_translations_with_addresses(provider, text, source_segments)?;
-    Ok((translations, missing))
-}
-
-/// Parses translations and any address observations emitted by the local image-grounded pass.
-/// Observations are kept only when they point to an existing input segment and contain complete,
-/// finite confidence/evidence fields. Character-name validation happens in the glossary owner.
-pub(crate) fn parse_translations_with_addresses(
-    provider: &str,
-    text: &str,
-    source_segments: &[String],
-) -> anyhow::Result<(Vec<String>, Vec<usize>, Vec<AddressObservation>)> {
     let output = serde_json::from_str::<TranslationOutput>(text).with_context(|| {
         InvalidTranslationOutput {
             message: format!(
@@ -88,22 +63,7 @@ pub(crate) fn parse_translations_with_addresses(
         .enumerate()
         .filter_map(|(index, done)| (!done).then_some(index))
         .collect();
-    let observations = output
-        .address_observations
-        .into_iter()
-        .filter(|item| {
-            item.segment_id < source_segments.len()
-                && translated.get(item.segment_id).copied().unwrap_or(false)
-                && item.confidence.is_finite()
-                && (0.85..=1.0).contains(&item.confidence)
-                && !item.speaker.trim().is_empty()
-                && !item.listener.trim().is_empty()
-                && !item.first_person.trim().is_empty()
-                && !item.second_person.trim().is_empty()
-                && item.evidence.trim().chars().count() >= 8
-        })
-        .collect();
-    Ok((translations, missing, observations))
+    Ok((translations, missing))
 }
 
 /// Context attached to a response that is not valid translation JSON. It keeps the raw
@@ -202,7 +162,7 @@ pub(crate) fn glossary_prompts(
             - Choose natural renderings that will still fit the rest of the work.
             - Be exhaustive about named characters, places, organizations, titles, and recurring terms in the lines, but do not invent a speaker/listener relationship from OCR text alone.
             - Do not infer a character's gender from their name, age from their apparent role, or closeness from casual wording alone. Prefer unknown to an unsupported guess.
-            - Do not create `address` entries here. This OCR-only pass has no reliable speaker-to-bubble mapping; address pairs are learned only during an image-grounded translation when both people and the relationship are supported.
+            - Do not create `address` entries. OCR lines and character profiles alone do not prove who is speaking to whom or the correct Vietnamese pronouns. Leave uncertain forms neutral; recent translated dialogue may be used as context.
             - Skip entries already in the glossary you were given and anything that does not appear in these lines. Never list the same character again under another spelling, honorific, or pronoun.
             - Write `kind` as exactly style, character, name, or term.
             - At most 20 entries, every string short.
@@ -316,81 +276,38 @@ pub(crate) fn snippet(text: &str) -> String {
 }
 
 pub(crate) fn output_schema(expected: usize) -> Value {
-    output_schema_with_addresses(expected, false)
-}
-
-/// Local image translation may additionally return a small set of strongly grounded,
-/// directional address observations. Remote providers retain the legacy schema.
-pub(crate) fn output_schema_with_addresses(expected: usize, include_addresses: bool) -> Value {
-    let mut properties = json!({
-        "translations": {
-            "type": "array",
-            "minItems": expected,
-            "maxItems": expected,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": expected.saturating_sub(1),
-                        "description": "The ID copied from the corresponding input segment."
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "The translation of the input segment with this ID."
-                    }
-                },
-                "required": ["id", "text"],
-                "additionalProperties": false
-            }
-        }
-    });
-    let mut required = vec!["translations"];
-
-    if include_addresses {
-        properties["address_observations"] = json!({
-            "type": "array",
-            "maxItems": 8,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "segment_id": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": expected.saturating_sub(1),
-                        "description": "The input dialogue segment that grounds this observation."
-                    },
-                    "speaker": { "type": "string" },
-                    "listener": { "type": "string" },
-                    "first_person": { "type": "string" },
-                    "second_person": { "type": "string" },
-                    "confidence": { "type": "number", "minimum": 0.85, "maximum": 1.0 },
-                    "evidence": { "type": "string" }
-                },
-                "required": ["segment_id", "speaker", "listener", "first_person", "second_person", "confidence", "evidence"],
-                "additionalProperties": false
-            }
-        });
-        required.push("address_observations");
-    }
-
     json!({
         "type": "object",
-        "properties": properties,
-        "required": required,
+        "properties": {
+            "translations": {
+                "type": "array",
+                "minItems": expected,
+                "maxItems": expected,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": expected.saturating_sub(1),
+                            "description": "The ID copied from the corresponding input segment."
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "The translation of the input segment with this ID."
+                        }
+                    },
+                    "required": ["id", "text"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["translations"],
         "additionalProperties": false
     })
 }
 
 fn translation_system_prompt(request: &TranslationRequest) -> String {
-    translation_system_prompt_with_address_observations(request, false)
-}
-
-fn translation_system_prompt_with_address_observations(
-    request: &TranslationRequest,
-    include_address_observations: bool,
-) -> String {
     let source = request
         .source_language
         .map(|language| language.to_string())
@@ -401,7 +318,7 @@ fn translation_system_prompt_with_address_observations(
 
             Translation requirements:
             - Translate every input segment from {source} into natural {target}.
-            - Preserve meaning, character voice, emotional tone, relationship nuance, emphasis, and sound effects; never invent or drop content.
+            - Preserve the exact meaning, character voice, emotional tone, relationship nuance, and emphasis; never invent, soften, strengthen, omit, or add information. Preserve negation, questions, commands, conditions, uncertainty, quantities, and who did what to whom.
             - Sound like a native {target} speaker in that situation, not like a word-for-word translation, and keep the emotion (anger, shyness, sarcasm, teasing, ...).
             - Localize idioms, slang, wordplay, and sound effects with an equivalent {target} expression or the same effect in other words, never literally, while keeping wording concise enough for speech bubbles.
             - Read the segments in order as one scene and use the surrounding segments and any supplied context for disambiguation and continuity; never merge or split segments.
@@ -433,12 +350,12 @@ fn translation_system_prompt_with_address_observations(
             Vietnamese address and subject consistency:
             - Do not add a subject that the source leaves out. Japanese often drops it, and natural Vietnamese can too (行くよ becomes 'Đi nhé', not 'Anh đi nhé'). Add a subject only if the sentence would be wrong without it and you are sure who is speaking, using that character's pronoun. When a sentence is split over bubbles, the subject stays in the earlier bubble.
             - For every dialogue segment, identify the speaker and listener from the tagged bubble, tail, image, and scene before choosing pronouns. Match both people to the character profiles; do not identify them from gender or appearance alone. The first word in an address pair belongs to the speaker and the second to the listener.
-            - An existing `address` glossary entry is directional: use it only when both speaker and listener match, in that order. Never reverse it, apply it to a different pair, or use it just because one name appears in OCR. Keep a supported pair stable across pages.
+            - A supplied `address` glossary entry is directional: use it only when both speaker and listener match, in that order. Never reverse it, apply it to a different pair, or use it just because one name appears in OCR. Keep a supported pair stable across pages.
             - If either person cannot be identified confidently, or no reliable pair exists, do not guess a gendered relationship. Prefer omitting the subject when Vietnamese allows it; otherwise use a name or a neutral form such as 'bạn'. Never fall back on one pair for everybody ('tôi - cậu' and 'anh - em' included).
-            - When the source is Japanese, its own words are evidence: 俺 is a casual or rough male voice (tao, tớ, mình, anh), 僕 a gentler or younger male one (tớ, mình, em to elders), 私 neutral or polite (tôi), あたし a casual female one (mình, tớ, em), お前 / 貴様 rude (mày, cậu), 君 (cậu, bạn, em), あなた (anh, chị, bạn). Honorifics (-kun, -san, -chan, -senpai, -sama, 先生) show the relationship.
+            - When the source is Japanese, treat 俺, 僕, 私, and あたし as clues to the speaker's voice/register, not fixed Vietnamese pronouns. お前, 貴様, 君, and あなた are context-dependent; do not map them mechanically to 'mày', 'cậu', 'anh', 'chị', or 'bạn'. Honorifics (-kun, -san, -chan, -senpai, -sama, 先生) are relationship/status clues, not automatic age or intimacy labels. Choose Vietnamese address only after identifying both people and the established relationship; otherwise omit the pronoun when natural or use a neutral name/form.
             - When the source is Chinese, 您 is a respect/politeness cue while 你 alone does not prove intimacy; terms such as 哥、姐、老师、前辈、师父 and family titles can establish role or relationship when the scene confirms who they refer to. Distinguish 咱们 (usually inclusive) from 我们 (inclusive or exclusive by context).
             - When the source is Korean, 저 and 나 help indicate speech level, and -요 / -습니다 usually signal polite speech. Terms such as 형、오빠、누나、언니、선배、선생님、씨 and 님 are relationship or status cues only when the speaker and listener are identified. Do not translate 당신 as a universal 'you'; Korean often omits the direct pronoun.
-            - A character keeps one pronoun pair with each listener while the relationship stays the same. A matching directional `address` glossary entry is a HARD RULE: if it says `tôi - cậu`, use `tôi` for that speaker and `cậu` for that listener consistently; do not replace either word with `anh`, `chị`, `em`, `mày`, or another alternative just because a source pronoun could be translated that way. Change the pair only when a clearly established relationship/status change is present. Within a sentence refer to the speaker in one way only ('anh đây' and 'tôi' never together). Use recent dialogue context only when there is no matching pair; never treat an entry for another pair as a general rule.
+            - A character should keep the same Vietnamese pronoun pair with the same listener while the relationship and situation stay the same. Prefer a supplied matching address entry, then the actual recent translated dialogue for that same pair. Do not copy a pair from a different listener. Change it only when the source or scene clearly establishes a change in relationship, status, or tone. Within one sentence, do not mix ways of referring to the same speaker (for example, 'anh đây' and 'tôi'). If the evidence is insufficient, do not invent a gendered pair merely to fill the sentence.
             - Address follows established formality and relationship first, then age. Polite speech (です/ます forms, さん, 様, 先生) often calls for a formal pair; plain familiar speech (だ, よ, ちゃん, くん, first names) can support a closer pair, but these cues alone do not prove intimacy. Do not use 'anh - em' between adults who are polite or not close. Use ages only when the glossary establishes them; do not infer age from appearance alone. When relationship, age, and formality are unknown, do not guess: use a name, 'bạn', or no pronoun.
             - Vietnamese separates the inclusive 'chúng ta' (speaker and listener) from the exclusive 'chúng tôi', 'bọn anh', 'bọn em' (the speaker's group without the listener). 僕たち or 私たち said to someone outside the group takes the exclusive form.
             - Giving and receiving verbs show direction: ～てくれる means the other person does it for the speaker's side, ～てあげる means the speaker does it for the other, ～てもらう means the speaker receives it. Keep that direction.
@@ -459,27 +376,6 @@ fn translation_system_prompt_with_address_observations(
             Context requirements:
             Use the supplied context to follow the story and to preserve terminology, character voice, pronouns, and dialogue continuity.
             Do not translate or return the context entries.
-        "}.trim_end());
-    }
-
-    if include_address_observations
-        && request.image.is_some()
-        && request.target_language == Language::Vietnamese
-    {
-        prompt.push_str("\n\n");
-        prompt.push_str(indoc! {"
-            Address learning in this same image-grounded pass:
-            - Before writing translations, decide whether this page contains any supported directional address pairs. Apply each chosen pair consistently to all matching dialogue segments on this page.
-            - Return an `address_observations` array in the JSON. It may be empty; do not invent observations to fill it.
-            - Each observation must refer to one supplied dialogue segment using `segment_id`, and identify `speaker` and `listener` by the exact character names in the supplied character profiles. Do not use visual descriptions as names.
-            - The image/bubble tail may establish who is speaking, but image, age, gender, or apparent seniority alone cannot establish how they address each other.
-            - Record a directional pair only when BOTH speaker and listener are identified with high confidence AND the Vietnamese first-/second-person choice is supported by explicit address language, an already established relationship/context, or a clear recurring speech pattern. Japanese omission of pronouns is not evidence for a new pair.
-            - `first_person` is how this speaker refers to themselves; `second_person` is how this same speaker addresses this listener. Never reverse the pair or infer the reverse direction. When the same pair speaks again on this page, reuse the same choice instead of switching pronouns mid-page.
-            - `evidence` must briefly name the concrete source cue and/or visual linkage for this exact segment. Do not use vague evidence such as 'context' or 'they seem close'.
-            - Use confidence only from 0.85 to 1.0. If any part is uncertain, omit the observation. Never turn a guess into a permanent glossary rule.
-            - Do not emit observations for narration, internal thoughts, sound effects, or speech with an unknown addressee.
-            - Before returning, perform a consistency check across this page: whenever a known or confidently inferred directional address pair applies, make every translated bubble between that speaker and listener follow the exact same pair. Correct inconsistent pronouns before emitting the final translations, but do not insert pronouns that the source omits.
-            - Include `address_observations` in the JSON response, even when there are no supported observations; use an empty array in that case.
         "}.trim_end());
     }
 
@@ -522,22 +418,6 @@ struct TranslationInputSegment<'a> {
 #[derive(Debug, Deserialize)]
 struct TranslationOutput {
     translations: Vec<TranslationOutputSegment>,
-    #[serde(default)]
-    address_observations: Vec<AddressObservation>,
-}
-
-/// A directional address choice observed during the same image-grounded translation pass.
-/// It is only persisted after the caller checks both names against known character profiles.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct AddressObservation {
-    #[serde(deserialize_with = "deserialize_segment_id")]
-    pub(crate) segment_id: usize,
-    pub(crate) speaker: String,
-    pub(crate) listener: String,
-    pub(crate) first_person: String,
-    pub(crate) second_person: String,
-    pub(crate) confidence: f32,
-    pub(crate) evidence: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -692,6 +572,18 @@ mod tests {
     }
 
     #[test]
+    fn visual_analysis_prompt_maps_numbered_page_segments() {
+        let request = TranslationRequest::new(["なぁ、ゆい", "……そっか"], Language::Vietnamese);
+        let (system, user, schema) = visual_analysis_prompt(&request, "previous character map").unwrap();
+        let input: serde_json::Value = serde_json::from_str(&user).unwrap();
+        assert!(system.contains("numbered red boxes"));
+        assert_eq!(input["segments"][0]["id"], 0);
+        assert_eq!(input["segments"][1]["text"], "……そっか");
+        assert_eq!(input["previous_page_character_context"], "previous character map");
+        assert_eq!(schema["required"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
     fn schema_requires_the_expected_number_of_id_text_pairs() {
         let schema = output_schema(3);
         let translations = &schema["properties"]["translations"];
@@ -806,7 +698,6 @@ mod tests {
             translation_system_prompt(&TranslationRequest::new(["a"], Language::Vietnamese));
         assert!(vietnamese.contains("Vietnamese address and subject consistency"));
         assert!(vietnamese.contains("Vietnamese fidelity and naturalness"));
-        assert!(vietnamese.contains("HARD RULE"));
         let english = translation_system_prompt(&TranslationRequest::new(["a"], Language::English));
         assert!(!english.contains("Vietnamese address and subject consistency"));
     }
@@ -830,57 +721,9 @@ mod tests {
             &["おはよう".to_owned()],
         )
         .unwrap();
-        assert!(system.contains("Do not create `address` entries here"));
+        assert!(system.contains("Do not create `address` entries"));
         assert!(system.contains("Prefer unknown to an unsupported guess"));
     }
 
-
-    #[test]
-    fn local_vision_schema_includes_optional_directional_address_observations() {
-        let schema = output_schema_with_addresses(2, true);
-        assert!(schema["required"].as_array().unwrap().iter().any(|v| v == "address_observations"));
-        assert_eq!(schema["properties"]["address_observations"]["items"]["properties"]["confidence"]["minimum"], 0.85);
-        assert!(output_schema_with_addresses(2, false)["properties"].get("address_observations").is_none());
-    }
-
-    #[test]
-    fn parser_keeps_only_high_confidence_address_observations_for_valid_segments() {
-        let sources = vec!["お前がやれ".to_owned(), "ありがとう".to_owned()];
-        let response = r#"{
-            "translations":[{"id":0,"text":"Cậu làm đi"},{"id":1,"text":"Cảm ơn"}],
-            "address_observations":[
-                {"segment_id":0,"speaker":"Tanaka","listener":"Suzuki","first_person":"tôi","second_person":"cậu","confidence":0.93,"evidence":"đuôi bong bóng trỏ về Tanaka; dùng お前"},
-                {"segment_id":1,"speaker":"Tanaka","listener":"Suzuki","first_person":"tôi","second_person":"anh","confidence":0.70,"evidence":"không rõ"},
-                {"segment_id":9,"speaker":"Tanaka","listener":"Suzuki","first_person":"tôi","second_person":"cậu","confidence":0.98,"evidence":"bằng chứng cụ thể"}
-            ]
-        }"#;
-
-        let (translations, missing, observations) =
-            parse_translations_with_addresses("test", response, &sources).unwrap();
-        assert_eq!(translations, ["Cậu làm đi", "Cảm ơn"]);
-        assert!(missing.is_empty());
-        assert_eq!(observations.len(), 1);
-        assert_eq!(observations[0].speaker, "Tanaka");
-        assert_eq!(observations[0].second_person, "cậu");
-    }
-
-    #[test]
-    fn ordinary_prompt_does_not_request_address_observations_even_with_an_image() {
-        let request = TranslationRequest::new(["お前がやれ"], Language::Vietnamese)
-            .with_image(std::sync::Arc::new(image::DynamicImage::new_rgb8(1, 1)));
-        let prompt = translation_system_prompt(&request);
-        assert!(!prompt.contains("Address learning in this same image-grounded pass"));
-        assert!(prompt.contains("Image requirements"));
-    }
-
-    #[test]
-    fn image_vietnamese_prompt_explains_conservative_address_learning() {
-        let request = TranslationRequest::new(["お前がやれ"], Language::Vietnamese)
-            .with_image(std::sync::Arc::new(image::DynamicImage::new_rgb8(1, 1)));
-        let prompt = translation_system_prompt_with_address_observations(&request, true);
-        assert!(prompt.contains("Address learning in this same image-grounded pass"));
-        assert!(prompt.contains("image, age, gender, or apparent seniority alone"));
-        assert!(prompt.contains("address_observations"));
-    }
 
 }
