@@ -80,10 +80,10 @@ impl LocalTranslator {
         &self,
         request: TranslationRequest,
         generation: GenerationConfig,
-    ) -> Result<(Vec<String>, Vec<prompt::AddressObservation>)> {
+    ) -> Result<Vec<String>> {
         let expected = request.segments.len();
         if expected == 0 {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
         if !self
             .descriptor
@@ -99,8 +99,7 @@ impl LocalTranslator {
         let reasoning = generation.reasoning.unwrap_or(false) && self.descriptor.reasoning;
         let options = self.descriptor.generation.options(generation);
 
-        let (mut translations, mut missing, address_observations) =
-            self.generate(&request, reasoning, &options).await?;
+        let (mut translations, mut missing) = self.generate(&request, reasoning, &options).await?;
         for attempt in 1..=MAX_MISSING_RETRIES {
             if missing.is_empty() {
                 break;
@@ -120,8 +119,7 @@ impl LocalTranslator {
                 .collect();
             let mut retry_options = options.clone();
             retry_options.seed = retry_options.seed.wrapping_add(attempt);
-            let (retried, still_missing, _) =
-                self.generate(&retry, reasoning, &retry_options).await?;
+            let (retried, still_missing) = self.generate(&retry, reasoning, &retry_options).await?;
             for (position, &index) in missing.iter().enumerate() {
                 if !still_missing.contains(&position) {
                     translations[index] = retried[position].clone();
@@ -140,31 +138,20 @@ impl LocalTranslator {
                 "local translation still skipped segments after retries; keeping source text"
             );
         }
-        // Keep only observations from the first full-page call. Missing-segment retries are
-        // text-only and must never create or overwrite persistent address rules.
-        let address_observations = if request.image.is_some()
-            && request.target_language == Language::Vietnamese
-        {
-            address_observations
-        } else {
-            Vec::new()
-        };
-        Ok((translations, address_observations))
+        Ok(translations)
     }
 
-    /// Runs one constrained generation and returns translations, missing segment indices,
-    /// and any image-grounded address observations from this exact response.
+    /// Runs one constrained generation and returns the parsed translations plus the
+    /// indices of segments the model did not return.
     async fn generate(
         &self,
         request: &TranslationRequest,
         reasoning: bool,
         options: &GenerationOptions,
-    ) -> Result<(Vec<String>, Vec<usize>, Vec<prompt::AddressObservation>)> {
+    ) -> Result<(Vec<String>, Vec<usize>)> {
         let image = request.image.clone();
         let prompt = self.render_prompt(request, reasoning)?;
-        let learn_addresses = request.image.is_some()
-            && request.target_language == Language::Vietnamese;
-        let schema = prompt::output_schema_with_addresses(request.segments.len(), learn_addresses);
+        let schema = prompt::output_schema(request.segments.len());
         let llm = Arc::clone(&self.llm);
         let options = options.clone();
         let output = tokio_rayon::spawn(move || {
@@ -184,7 +171,7 @@ impl LocalTranslator {
             reasoning,
             "local generation finished"
         );
-        Ok(prompt::parse_translations_with_addresses(
+        Ok(prompt::parse_translations(
             "local",
             &output.text,
             &request.segments,
@@ -231,9 +218,8 @@ impl LocalTranslator {
             finish = ?output.finish_reason,
             "local glossary generation finished"
         );
-        // This pass sees OCR lines without page geometry or bubble tails. It may create
-        // character profiles, but never address pairs. Address rules are learned only from
-        // the image-grounded translation response.
+        // OCR-only glossary extraction cannot reliably identify speaker/listener pairs.
+        // Address is therefore not generated from character profiles alone.
         Ok(prompt::parse_glossary(&output.text)
             .into_iter()
             .filter(|entry| !entry.kind.trim().eq_ignore_ascii_case("address"))
@@ -241,10 +227,7 @@ impl LocalTranslator {
     }
 
     fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
-        let learn_addresses = request.image.is_some()
-            && request.target_language == Language::Vietnamese;
-        let (system, payload) =
-            prompt::prompts_with_address_observations(request, learn_addresses)?;
+        let (system, payload) = prompt::prompts(request)?;
         let payload = if request.image.is_some() {
             format!("{}\n{payload}", media_marker())
         } else {
@@ -294,4 +277,4 @@ pub(crate) fn supports_vision(selection: &ModelSelection) -> bool {
             .find(|descriptor| descriptor.id == model)
             .is_some_and(|descriptor| descriptor.projector.is_some())
     })
-            }
+}
