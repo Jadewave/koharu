@@ -141,6 +141,83 @@ impl LocalTranslator {
         Ok(translations)
     }
 
+    /// Analyzes the marked manga page before translation. The selected translation model
+    /// performs this pass too, so changing the model in the UI changes the visual analyst;
+    /// no hidden Gemma model is used for page-level speaker identification.
+    pub(crate) async fn analyze_page(
+        &self,
+        request: &TranslationRequest,
+        previous_context: &str,
+        generation: GenerationConfig,
+    ) -> Result<Option<String>> {
+        let Some(image) = request.image.clone() else {
+            return Ok(None);
+        };
+        if !self.llm.capabilities().vision {
+            return Ok(None);
+        }
+        let (system, user, schema) = prompt::visual_analysis_prompt(request, previous_context)?;
+        let prompt = self
+            .llm
+            .render_chat_prompt_with_options(
+                &[ChatMessage::system(system), ChatMessage::user(user)],
+                ChatTemplateOptions {
+                    add_generation_prompt: true,
+                    enable_thinking: false,
+                },
+            )
+            .context("failed to render visual-analysis prompt")?;
+        let mut options = self.descriptor.generation.options(GenerationConfig {
+            reasoning: Some(false),
+            ..generation
+        });
+        options.max_tokens = (request.segments.len() * 80 + 500).clamp(1400, 3000);
+        let llm = Arc::clone(&self.llm);
+        let output = tokio_rayon::spawn(move || {
+            let input = Input::new(&prompt).with_image(image.as_ref());
+            llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
+        })
+        .await?;
+        tracing::info!(
+            prompt_tokens = output.prompt_tokens,
+            generated_tokens = output.generated_tokens,
+            generation_secs = output.generation_duration.as_secs_f32(),
+            finish = ?output.finish_reason,
+            "local visual analysis finished"
+        );
+        let value: serde_json::Value = match serde_json::from_str(&output.text) {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => {
+                tracing::warn!("visual analysis returned JSON that was not an object; continuing without it");
+                return Ok(None);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "visual analysis returned invalid JSON; continuing without it");
+                return Ok(None);
+            }
+        };
+        let Some(dialogues) = value.get("dialogues").and_then(serde_json::Value::as_array) else {
+            tracing::warn!("visual analysis omitted the dialogue mapping; continuing without it");
+            return Ok(None);
+        };
+        let ids: std::collections::HashSet<u64> = dialogues
+            .iter()
+            .filter_map(|dialogue| dialogue.get("segment_id").and_then(serde_json::Value::as_u64))
+            .collect();
+        if dialogues.len() != request.segments.len()
+            || ids.len() != request.segments.len()
+            || (0..request.segments.len()).any(|id| !ids.contains(&(id as u64)))
+        {
+            tracing::warn!(
+                expected = request.segments.len(),
+                actual = dialogues.len(),
+                "visual analysis did not map every OCR segment exactly once; continuing without it"
+            );
+            return Ok(None);
+        }
+        Ok(Some(value.to_string()))
+    }
+
     /// Runs one constrained generation and returns the parsed translations plus the
     /// indices of segments the model did not return.
     async fn generate(
@@ -178,7 +255,7 @@ impl LocalTranslator {
         )?)
     }
 
-    /// Asks the model for the glossary entries of one page, from its source lines. Text only,
+    /// Asks the selected model for glossary entries from OCR source lines. Text only,
     /// without reasoning, with a short output.
     pub(crate) async fn extract_glossary(
         &self,
@@ -227,8 +304,8 @@ impl LocalTranslator {
             .collect())
     }
 
-    /// Asks the model how the characters address each other, from their profiles. Text only,
-    /// without reasoning, with a short output. Every entry that comes back is an address pair.
+    /// Asks the selected model how characters address each other from supported profiles.
+    /// Text only, without reasoning, with a short output.
     pub(crate) async fn extract_addresses(
         &self,
         target: Language,
