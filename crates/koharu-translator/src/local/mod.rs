@@ -80,10 +80,10 @@ impl LocalTranslator {
         &self,
         request: TranslationRequest,
         generation: GenerationConfig,
-    ) -> Result<Vec<String>> {
+    ) -> Result<(Vec<String>, Vec<prompt::AddressObservation>)> {
         let expected = request.segments.len();
         if expected == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         if !self
             .descriptor
@@ -99,7 +99,8 @@ impl LocalTranslator {
         let reasoning = generation.reasoning.unwrap_or(false) && self.descriptor.reasoning;
         let options = self.descriptor.generation.options(generation);
 
-        let (mut translations, mut missing) = self.generate(&request, reasoning, &options).await?;
+        let (mut translations, mut missing, address_observations) =
+            self.generate(&request, reasoning, &options).await?;
         for attempt in 1..=MAX_MISSING_RETRIES {
             if missing.is_empty() {
                 break;
@@ -119,7 +120,8 @@ impl LocalTranslator {
                 .collect();
             let mut retry_options = options.clone();
             retry_options.seed = retry_options.seed.wrapping_add(attempt);
-            let (retried, still_missing) = self.generate(&retry, reasoning, &retry_options).await?;
+            let (retried, still_missing, _) =
+                self.generate(&retry, reasoning, &retry_options).await?;
             for (position, &index) in missing.iter().enumerate() {
                 if !still_missing.contains(&position) {
                     translations[index] = retried[position].clone();
@@ -138,97 +140,31 @@ impl LocalTranslator {
                 "local translation still skipped segments after retries; keeping source text"
             );
         }
-        Ok(translations)
-    }
-
-    /// Analyzes the marked manga page before translation. The selected translation model
-    /// performs this pass too, so changing the model in the UI changes the visual analyst;
-    /// no hidden Gemma model is used for page-level speaker identification.
-    pub(crate) async fn analyze_page(
-        &self,
-        request: &TranslationRequest,
-        previous_context: &str,
-        generation: GenerationConfig,
-    ) -> Result<Option<String>> {
-        let Some(image) = request.image.clone() else {
-            return Ok(None);
-        };
-        if !self.llm.capabilities().vision {
-            return Ok(None);
-        }
-        let (system, user, schema) = prompt::visual_analysis_prompt(request, previous_context)?;
-        let prompt = self
-            .llm
-            .render_chat_prompt_with_options(
-                &[ChatMessage::system(system), ChatMessage::user(user)],
-                ChatTemplateOptions {
-                    add_generation_prompt: true,
-                    enable_thinking: false,
-                },
-            )
-            .context("failed to render visual-analysis prompt")?;
-        let mut options = self.descriptor.generation.options(GenerationConfig {
-            reasoning: Some(false),
-            ..generation
-        });
-        options.max_tokens = (request.segments.len() * 80 + 500).clamp(1400, 3000);
-        let llm = Arc::clone(&self.llm);
-        let output = tokio_rayon::spawn(move || {
-            let input = Input::new(&prompt).with_image(image.as_ref());
-            llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
-        })
-        .await?;
-        tracing::info!(
-            prompt_tokens = output.prompt_tokens,
-            generated_tokens = output.generated_tokens,
-            generation_secs = output.generation_duration.as_secs_f32(),
-            finish = ?output.finish_reason,
-            "local visual analysis finished"
-        );
-        let value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&output.text) {
-            Ok(value) if value.is_object() => value,
-            Ok(_) => {
-                tracing::warn!("visual analysis returned JSON that was not an object; continuing without it");
-                return Ok(None);
-            }
-            Err(error) => {
-                tracing::warn!(%error, "visual analysis returned invalid JSON; continuing without it");
-                return Ok(None);
-            }
-        };
-        let Some(dialogues) = value.get("dialogues").and_then(serde_json::Value::as_array) else {
-            tracing::warn!("visual analysis omitted the dialogue mapping; continuing without it");
-            return Ok(None);
-        };
-        let ids: std::collections::HashSet<u64> = dialogues
-            .iter()
-            .filter_map(|dialogue| dialogue.get("segment_id").and_then(serde_json::Value::as_u64))
-            .collect();
-        if dialogues.len() != request.segments.len()
-            || ids.len() != request.segments.len()
-            || (0..request.segments.len()).any(|id| !ids.contains(&(id as u64)))
+        // Keep only observations from the first full-page call. Missing-segment retries are
+        // text-only and must never create or overwrite persistent address rules.
+        let address_observations = if request.image.is_some()
+            && request.target_language == Language::Vietnamese
         {
-            tracing::warn!(
-                expected = request.segments.len(),
-                actual = dialogues.len(),
-                "visual analysis did not map every OCR segment exactly once; continuing without it"
-            );
-            return Ok(None);
-        }
-        Ok(Some(value.to_string()))
+            address_observations
+        } else {
+            Vec::new()
+        };
+        Ok((translations, address_observations))
     }
 
-    /// Runs one constrained generation and returns the parsed translations plus the
-    /// indices of segments the model did not return.
+    /// Runs one constrained generation and returns translations, missing segment indices,
+    /// and any image-grounded address observations from this exact response.
     async fn generate(
         &self,
         request: &TranslationRequest,
         reasoning: bool,
         options: &GenerationOptions,
-    ) -> Result<(Vec<String>, Vec<usize>)> {
+    ) -> Result<(Vec<String>, Vec<usize>, Vec<prompt::AddressObservation>)> {
         let image = request.image.clone();
         let prompt = self.render_prompt(request, reasoning)?;
-        let schema = prompt::output_schema(request.segments.len());
+        let learn_addresses = request.image.is_some()
+            && request.target_language == Language::Vietnamese;
+        let schema = prompt::output_schema_with_addresses(request.segments.len(), learn_addresses);
         let llm = Arc::clone(&self.llm);
         let options = options.clone();
         let output = tokio_rayon::spawn(move || {
@@ -248,7 +184,7 @@ impl LocalTranslator {
             reasoning,
             "local generation finished"
         );
-        Ok(prompt::parse_translations(
+        Ok(prompt::parse_translations_with_addresses(
             "local",
             &output.text,
             &request.segments,
@@ -295,65 +231,20 @@ impl LocalTranslator {
             finish = ?output.finish_reason,
             "local glossary generation finished"
         );
-        // This pass sees OCR lines without page geometry or bubble tails. Never persist
-        // address pairs from it; only the dedicated profile-based address pass may create
-        // directional pairs.
+        // This pass sees OCR lines without page geometry or bubble tails. It may create
+        // character profiles, but never address pairs. Address rules are learned only from
+        // the image-grounded translation response.
         Ok(prompt::parse_glossary(&output.text)
             .into_iter()
             .filter(|entry| !entry.kind.trim().eq_ignore_ascii_case("address"))
             .collect())
     }
 
-    /// Asks the selected model how characters address each other from supported profiles.
-    /// Text only, without reasoning, with a short output.
-    pub(crate) async fn extract_addresses(
-        &self,
-        target: Language,
-        characters: &[GlossaryEntry],
-        generation: GenerationConfig,
-    ) -> Result<Vec<GlossaryEntry>> {
-        let (system, user) = prompt::address_prompts(target, characters)?;
-        let prompt = self
-            .llm
-            .render_chat_prompt_with_options(
-                &[ChatMessage::system(system), ChatMessage::user(user)],
-                ChatTemplateOptions {
-                    add_generation_prompt: true,
-                    enable_thinking: false,
-                },
-            )
-            .context("failed to render local address prompt")?;
-        let mut options = self.descriptor.generation.options(GenerationConfig {
-            reasoning: Some(false),
-            ..generation
-        });
-        options.max_tokens = GLOSSARY_MAX_TOKENS;
-        let schema = prompt::glossary_schema();
-        let llm = Arc::clone(&self.llm);
-        let output = tokio_rayon::spawn(move || {
-            let input = Input::new(&prompt);
-            llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
-        })
-        .await?;
-        tracing::info!(
-            prompt_tokens = output.prompt_tokens,
-            prompt_secs = output.prompt_duration.as_secs_f32(),
-            generated_tokens = output.generated_tokens,
-            generation_secs = output.generation_duration.as_secs_f32(),
-            finish = ?output.finish_reason,
-            "local address generation finished"
-        );
-        Ok(prompt::parse_glossary(&output.text)
-            .into_iter()
-            .map(|mut entry| {
-                entry.kind = "address".to_owned();
-                entry
-            })
-            .collect())
-    }
-
     fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
-        let (system, payload) = prompt::prompts(request)?;
+        let learn_addresses = request.image.is_some()
+            && request.target_language == Language::Vietnamese;
+        let (system, payload) =
+            prompt::prompts_with_address_observations(request, learn_addresses)?;
         let payload = if request.image.is_some() {
             format!("{}\n{payload}", media_marker())
         } else {
@@ -403,4 +294,4 @@ pub(crate) fn supports_vision(selection: &ModelSelection) -> bool {
             .find(|descriptor| descriptor.id == model)
             .is_some_and(|descriptor| descriptor.projector.is_some())
     })
-}
+            }
