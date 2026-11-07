@@ -60,7 +60,7 @@ const GLOSSARY_ADDRESS_MAX_ENTRIES: usize = 16;
 const MEMORY_PAGES: usize = 3;
 const MEMORY_PAGE_CHARS: usize = 1500;
 
-/// Names, terms and image-grounded directional address pairs remembered for one work.
+/// Names, terms and character profiles collected for one work. Address is not guessed.
 #[derive(Default)]
 struct Glossary {
     language: Option<Language>,
@@ -80,23 +80,14 @@ impl Glossary {
     }
 
     /// Adds entries that are not known yet. Existing entries win, so a rendering never
-    /// flips once a high-confidence directional choice has been stored. Address identity is
-    /// compared by normalized speaker/listener names, not by the arrow glyph or honorific.
+    /// flips once it has been chosen.
     fn merge(&mut self, entries: Vec<GlossaryEntry>) {
         for entry in entries.into_iter().filter_map(clean_entry) {
-            let known = self.entries.iter().any(|known| {
-                if known.kind != entry.kind {
-                    return false;
-                }
-                if entry.kind == "address" {
-                    match (address_pair_key(&known.source), address_pair_key(&entry.source)) {
-                        (Some(known_key), Some(incoming_key)) => known_key == incoming_key,
-                        _ => known.source.eq_ignore_ascii_case(&entry.source),
-                    }
-                } else {
-                    known.source.eq_ignore_ascii_case(&entry.source)
-                }
-            });
+            let source = entry.source.to_lowercase();
+            let known = self
+                .entries
+                .iter()
+                .any(|known| known.kind == entry.kind && known.source.to_lowercase() == source);
             if !known {
                 self.entries.push(entry);
             }
@@ -115,16 +106,6 @@ fn address_names(source: &str) -> Option<(&str, &str)> {
         .split_once("->")
         .or_else(|| source.split_once('→'))
         .map(|(speaker, listener)| (speaker.trim(), listener.trim()))
-}
-
-/// A canonical key for a directional address pair. Arrow style and honorific variants do
-/// not create a second rule for the same speaker/listener direction.
-fn address_pair_key(source: &str) -> Option<String> {
-    let (speaker, listener) = address_names(source)?;
-    let speaker = character_key(speaker);
-    let listener = character_key(listener);
-    (!speaker.is_empty() && !listener.is_empty())
-        .then(|| format!("{speaker} -> {listener}"))
 }
 
 /// Treat common Japanese/Korean honorific suffixes as part of a name variant, not as a
@@ -207,107 +188,6 @@ fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntr
     });
     selected.truncate(GLOSSARY_BLOCK_MAX_ENTRIES);
     selected.into_iter().cloned().collect()
-}
-
-fn address_entries_from_observations(
-    observations: Vec<prompt::AddressObservation>,
-    entries: &[GlossaryEntry],
-    segment_count: usize,
-) -> Vec<GlossaryEntry> {
-    let characters: Vec<&GlossaryEntry> = entries
-        .iter()
-        .filter(|entry| entry.kind == "character")
-        .collect();
-    if characters.len() < 2 {
-        return Vec::new();
-    }
-
-    let mut accepted = std::collections::HashMap::<String, GlossaryEntry>::new();
-    let mut conflicted = std::collections::HashSet::<String>::new();
-    for observation in observations {
-        let speaker = observation.speaker.trim();
-        let listener = observation.listener.trim();
-        let first_person = observation.first_person.trim();
-        let second_person = observation.second_person.trim();
-        let evidence = observation.evidence.trim();
-
-        if observation.segment_id >= segment_count
-            || !observation.confidence.is_finite()
-            || !(0.85..=1.0).contains(&observation.confidence)
-            || evidence.chars().count() < 8
-            || evidence.chars().count() > 240
-            || first_person.is_empty()
-            || second_person.is_empty()
-            || first_person.chars().count() > 24
-            || second_person.chars().count() > 24
-            || first_person.contains('\n')
-            || first_person.contains('\r')
-            || second_person.contains('\n')
-            || second_person.contains('\r')
-            || first_person.contains("->")
-            || second_person.contains("->")
-            || first_person.contains('|')
-            || second_person.contains('|')
-            || first_person.contains('/')
-            || second_person.contains('/')
-            || first_person.contains('?')
-            || second_person.contains('?')
-        {
-            continue;
-        }
-
-        let speaker_key = character_key(speaker);
-        let listener_key = character_key(listener);
-        if speaker_key.is_empty() || listener_key.is_empty() || speaker_key == listener_key {
-            continue;
-        }
-
-        // The model must refer to the exact character roster from the glossary. Names that
-        // merely look plausible, visual descriptions, and unknown addressees are not saved.
-        let Some(speaker_entry) = characters
-            .iter()
-            .find(|entry| character_key(&entry.source) == speaker_key)
-        else {
-            continue;
-        };
-        let Some(listener_entry) = characters
-            .iter()
-            .find(|entry| character_key(&entry.source) == listener_key)
-        else {
-            continue;
-        };
-
-        let source = format!("{} -> {}", speaker_entry.source.trim(), listener_entry.source.trim());
-        let target = format!("{first_person} - {second_person}");
-        let Some(key) = address_pair_key(&source) else {
-            continue;
-        };
-        if conflicted.contains(&key) {
-            continue;
-        }
-        let entry = GlossaryEntry {
-            kind: "address".to_owned(),
-            source,
-            target,
-        };
-
-        match accepted.get(&key) {
-            Some(existing) if existing.target == entry.target => {}
-            Some(_) => {
-                // Conflicting choices for the same direction on one page are ambiguous;
-                // drop that pair rather than letting the last segment win.
-                accepted.remove(&key);
-                conflicted.insert(key);
-            }
-            None => {
-                accepted.insert(key, entry);
-            }
-        }
-    }
-
-    let mut result: Vec<GlossaryEntry> = accepted.into_values().collect();
-    result.sort_by(|left, right| left.source.cmp(&right.source));
-    result
 }
 
 fn clean_entry(entry: GlossaryEntry) -> Option<GlossaryEntry> {
@@ -513,7 +393,6 @@ impl Translator {
         // generates a separate, long visual JSON report for every page.
 
         let expected = request.segments.len();
-        let mut address_observations = Vec::new();
         let translatable: Vec<usize> = request
             .segments
             .iter()
@@ -522,25 +401,19 @@ impl Translator {
             .map(|(index, _)| index)
             .collect();
         let translated = if translatable.len() == expected {
-            let (translated, observations) =
-                self.translate_segments(selection, generation, &request).await?;
-            address_observations = observations;
-            translated
+            self.translate_segments(selection, generation, &request)
+                .await?
         } else if translatable.is_empty() {
             request.segments.clone()
         } else {
             let mut subset = request.clone();
-            // Removing non-translatable segments changes the IDs, while the marked source image
-            // still contains the original IDs. Avoid misattributing speakers in this rare path.
-            subset.image = None;
             subset.segments = translatable
                 .iter()
                 .map(|&index| request.segments[index].clone())
                 .collect();
-            let (partial, observations) = self
+            let partial = self
                 .translate_segments(selection, generation, &subset)
                 .await?;
-            address_observations = observations;
             if partial.len() != translatable.len() {
                 return Err(Error::SegmentCount {
                     provider: provider_id,
@@ -563,7 +436,6 @@ impl Translator {
             }
             .into());
         }
-        self.remember_addresses(address_observations, expected);
         self.remember(request.target_language, &request.segments, &translated);
         tracing::Span::current().record("outcome", "completed");
         Ok((provider_id, translated))
@@ -592,8 +464,8 @@ impl Translator {
     }
 
     /// Writes the glossary of a work from OCR text using the same selected local model that
-    /// performs translation. This prevents a hidden model from influencing benchmark results.
-    /// Only local models write glossaries; address pairs are learned later from page images.
+    /// performs page analysis and translation. This prevents a hidden model from influencing
+    /// benchmark results. Only local models write glossaries.
     ///
     /// A failure leaves the glossary as it was and is reported to the caller, which is
     /// expected to translate anyway.
@@ -630,7 +502,7 @@ impl Translator {
             return Ok(());
         }
         let generation = generation.for_model(selection);
-        // Use the same selected model for glossary and translation.
+        // Use the same selected model for glossary, visual analysis, and translation.
         // This makes model comparisons honest and avoids silently running Gemma in the
         // background when the user selected another model.
         let started = Instant::now();
@@ -695,35 +567,10 @@ impl Translator {
                 Err(error) => tracing::warn!(%error, "glossary chunk failed; continuing"),
             }
         }
+        // No automatic Address guessing: OCR does not identify the speaker/listener reliably.
+        // Keep character profiles and recent translation memory; use Address only when a
+        // future explicit, evidence-backed source is available.
         Ok(())
-    }
-
-    /// Persists only high-confidence address observations that name two characters already
-    /// present in this work's glossary. No additional model call is made for this update.
-    fn remember_addresses(
-        &self,
-        observations: Vec<prompt::AddressObservation>,
-        segment_count: usize,
-    ) {
-        if observations.is_empty() {
-            return;
-        }
-        let Ok(mut glossary) = self.glossary.lock() else {
-            return;
-        };
-        let accepted =
-            address_entries_from_observations(observations, &glossary.entries, segment_count);
-        if accepted.is_empty() {
-            return;
-        }
-        for entry in &accepted {
-            tracing::debug!(
-                source = %entry.source,
-                target = %entry.target,
-                "learned image-grounded directional address rule"
-            );
-        }
-        glossary.merge(accepted);
     }
 
     /// Lines remembered from the previous pages, if they are still fresh.
@@ -797,10 +644,10 @@ impl Translator {
         selection: &ModelSelection,
         generation: GenerationConfig,
         request: &TranslationRequest,
-    ) -> anyhow::Result<(Vec<String>, Vec<prompt::AddressObservation>)> {
+    ) -> anyhow::Result<Vec<String>> {
         self.translate_guarded(selection, generation, request)
             .await
-            .map(|(translated, _kept, observations)| (translated, observations))
+            .map(|(translated, _kept)| translated)
     }
 
     /// Translates every segment with the main model. With reasoning enabled the first pass
@@ -814,14 +661,13 @@ impl Translator {
         selection: &ModelSelection,
         generation: GenerationConfig,
         request: &TranslationRequest,
-    ) -> anyhow::Result<(Vec<String>, Vec<usize>, Vec<prompt::AddressObservation>)> {
+    ) -> anyhow::Result<(Vec<String>, Vec<usize>)> {
         let reasoning = generation.reasoning == Some(true);
         let total = request.segments.len();
-        let (mut translated, redo, address_observations) =
-            match self.dispatch(selection, generation, request).await {
-            Ok((translated, observations)) => {
+        let (mut translated, redo) = match self.dispatch(selection, generation, request).await {
+            Ok(translated) => {
                 if translated.len() != total {
-                    return Ok((translated, Vec::new(), observations));
+                    return Ok((translated, Vec::new()));
                 }
                 let mut redo = if reasoning {
                     loop_guard::looping_segments(&request.segments, &translated)
@@ -834,11 +680,7 @@ impl Translator {
                     }
                 }
                 redo.sort_unstable();
-                let observations = observations
-                    .into_iter()
-                    .filter(|item| !redo.contains(&item.segment_id))
-                    .collect();
-                (translated, redo, observations)
+                (translated, redo)
             }
             Err(error) => {
                 let recovered = invalid_output(&error).map(|output| {
@@ -861,11 +703,11 @@ impl Translator {
                     total,
                     "translation failed; unrecovered segments need another pass"
                 );
-                (translated, redo, Vec::new())
+                (translated, redo)
             }
         };
         if redo.is_empty() {
-            return Ok((translated, redo, address_observations));
+            return Ok((translated, redo));
         }
         if !reasoning {
             tracing::warn!(
@@ -874,7 +716,7 @@ impl Translator {
                 sources = ?preview(&request.segments, &redo),
                 "segments could not be translated; keeping source text"
             );
-            return Ok((translated, redo, address_observations));
+            return Ok((translated, redo));
         }
 
         tracing::warn!(
@@ -899,7 +741,7 @@ impl Translator {
             ..generation
         };
         let retried = match self.dispatch(selection, without_reasoning, &retry).await {
-            Ok((retried, _retry_observations)) => {
+            Ok(retried) => {
                 if retried.len() != redo.len() {
                     let provider: &'static str = selection.provider.into();
                     return Err(Error::SegmentCount {
@@ -949,7 +791,7 @@ impl Translator {
             }
         }
         failed.sort_unstable();
-        Ok((translated, failed, address_observations))
+        Ok((translated, failed))
     }
 
     async fn dispatch(
@@ -957,7 +799,7 @@ impl Translator {
         selection: &ModelSelection,
         generation: GenerationConfig,
         request: &TranslationRequest,
-    ) -> anyhow::Result<(Vec<String>, Vec<prompt::AddressObservation>)> {
+    ) -> anyhow::Result<Vec<String>> {
         if selection.provider == Provider::Local {
             Ok(self
                 .local(selection)
@@ -966,9 +808,7 @@ impl Translator {
                 .await?)
         } else {
             let providers = self.providers.read()?.clone();
-            let translated =
-                remote::translate(&self.client, &providers, selection, &generation, request).await?;
-            Ok((translated, Vec::new()))
+            Ok(remote::translate(&self.client, &providers, selection, &generation, request).await?)
         }
     }
 
@@ -1156,21 +996,6 @@ mod tests {
     }
 
     #[test]
-    fn address_merge_normalizes_arrow_and_honorific_variants() {
-        let entry = |source: &str, target: &str| GlossaryEntry {
-            kind: "address".to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-        };
-        let mut glossary = Glossary::default();
-        glossary.merge(vec![entry("田中さん -> 鈴木くん", "tôi - cậu")]);
-        glossary.merge(vec![entry("田中 → 鈴木", "anh - em")]);
-
-        assert_eq!(glossary.entries.len(), 1);
-        assert_eq!(glossary.entries[0].target, "tôi - cậu");
-    }
-
-    #[test]
     fn an_address_pair_keeps_its_first_wording() {
         let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
             kind: kind.to_owned(),
@@ -1277,64 +1102,4 @@ mod tests {
             }
         ));
     }
-    #[test]
-    fn address_observations_require_known_distinct_characters_and_high_confidence() {
-        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
-            kind: kind.to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-        };
-        let characters = vec![
-            entry("character", "田中", "nam, học sinh"),
-            entry("character", "鈴木", "nữ, học sinh"),
-        ];
-        let observation = |speaker: &str, listener: &str, confidence: f32, second: &str| {
-            prompt::AddressObservation {
-                segment_id: 0,
-                speaker: speaker.to_owned(),
-                listener: listener.to_owned(),
-                first_person: "tôi".to_owned(),
-                second_person: second.to_owned(),
-                confidence,
-                evidence: "bong bóng có đuôi hướng về Tanaka và có từ お前".to_owned(),
-            }
-        };
-        let accepted = address_entries_from_observations(
-            vec![
-                observation("田中", "鈴木", 0.93, "cậu"),
-                observation("田中", "người lạ", 0.99, "anh"),
-                observation("鈴木", "田中", 0.70, "anh"),
-                observation("田中", "田中", 0.99, "mày"),
-            ],
-            &characters,
-            1,
-        );
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(accepted[0].source, "田中 -> 鈴木");
-        assert_eq!(accepted[0].target, "tôi - cậu");
-    }
-
-    #[test]
-    fn conflicting_address_observations_on_one_page_are_discarded() {
-        let characters = vec![
-            GlossaryEntry { kind: "character".into(), source: "A".into(), target: "profile".into() },
-            GlossaryEntry { kind: "character".into(), source: "B".into(), target: "profile".into() },
-        ];
-        let observation = |second: &str| prompt::AddressObservation {
-            segment_id: 0,
-            speaker: "A".into(),
-            listener: "B".into(),
-            first_person: "tôi".into(),
-            second_person: second.into(),
-            confidence: 0.95,
-            evidence: "có dấu hiệu xưng hô rõ ràng trong câu".into(),
-        };
-        let accepted = address_entries_from_observations(
-            vec![observation("cậu"), observation("anh")],
-            &characters,
-            1,
-        );
-        assert!(accepted.is_empty());
-    }
-
 }
