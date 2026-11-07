@@ -185,7 +185,7 @@ impl LocalTranslator {
             finish = ?output.finish_reason,
             "local visual analysis finished"
         );
-        let value: serde_json::Value = match serde_json::from_str(&output.text) {
+        let value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&output.text) {
             Ok(value) if value.is_object() => value,
             Ok(_) => {
                 tracing::warn!("visual analysis returned JSON that was not an object; continuing without it");
