@@ -212,6 +212,7 @@ impl Capabilities {
 pub struct Input<'a> {
     prompt: &'a str,
     media: Vec<Media<'a>>,
+    shared_prefix: usize,
 }
 
 impl<'a> Input<'a> {
@@ -220,7 +221,23 @@ impl<'a> Input<'a> {
         Self {
             prompt,
             media: Vec::new(),
+            shared_prefix: 0,
         }
+    }
+
+    /// Marks the first `bytes` bytes of the prompt as a prefix that stays the same from call to
+    /// call (for example the instructions of a translation prompt). The model keeps what it
+    /// computed for that prefix and reuses it, so only the rest of the prompt is read again.
+    /// The prefix must end before the first media marker; `0` turns this off.
+    #[must_use]
+    pub fn with_shared_prefix(mut self, bytes: usize) -> Self {
+        self.shared_prefix = bytes;
+        self
+    }
+
+    #[must_use]
+    pub fn shared_prefix(&self) -> usize {
+        self.shared_prefix
     }
 
     #[must_use]
