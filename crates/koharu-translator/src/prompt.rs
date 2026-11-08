@@ -31,6 +31,93 @@ pub(crate) fn prompts(request: &TranslationRequest) -> anyhow::Result<(String, S
     Ok((translation_system_prompt(request), user))
 }
 
+/// The speaker of every segment a response holds, as the model wrote it. Also reads what a
+/// truncated response got as far as writing.
+pub(crate) fn speakers(text: &str) -> Vec<String> {
+    if let Ok(output) = serde_json::from_str::<TranslationOutput>(text) {
+        return output
+            .translations
+            .into_iter()
+            .filter_map(|segment| segment.speaker)
+            .collect();
+    }
+    let mut speakers = Vec::new();
+    let array = text
+        .find("\"translations\"")
+        .and_then(|key| text[key..].find('[').map(|offset| key + offset + 1));
+    if let Some(start) = array {
+        let mut rest = &text[start..];
+        loop {
+            rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+            if !rest.starts_with('{') {
+                break;
+            }
+            let mut stream =
+                serde_json::Deserializer::from_str(rest).into_iter::<TranslationOutputSegment>();
+            let Some(Ok(segment)) = stream.next() else {
+                break;
+            };
+            let consumed = stream.byte_offset();
+            speakers.extend(segment.speaker);
+            rest = &rest[consumed..];
+        }
+    }
+    speakers
+}
+
+/// Vietnamese words that open a line with a subject: pronouns and the words that stand for one.
+const VIETNAMESE_SUBJECTS: [&str; 34] = [
+    "chúng ta", "chúng tôi", "chúng mình", "bọn anh", "bọn em", "bọn tôi", "bọn mình",
+    "anh ấy", "chị ấy", "cô ấy", "cậu ấy", "tôi", "tớ", "mình", "em", "anh", "chị", "cậu",
+    "bạn", "cô", "chú", "bác", "cháu", "tao", "mày", "ông", "bà", "con", "thầy", "ta", "họ",
+    "hắn", "nó", "chúng",
+];
+
+/// Japanese words that give a line a subject or a form of address: a pronoun, a name's
+/// honorific, or a family title. A line with one of them may rightly start with a subject.
+const SUBJECT_CUES: [&str; 51] = [
+    "私", "わたし", "わたくし", "あたし", "あたくし", "僕", "ぼく", "ボク", "俺", "おれ", "オレ",
+    "うち", "自分", "あなた", "あんた", "貴方", "貴様", "お前", "おまえ", "てめえ", "君", "きみ",
+    "キミ", "彼", "かれ", "かのじょ", "さん", "くん", "ちゃん", "様", "さま", "先生", "先輩",
+    "せんぱい", "殿", "兄", "姉", "にい", "ねえ", "お父", "お母", "パパ", "ママ", "父", "母",
+    "みんな", "皆", "あいつ", "こいつ", "そいつ", "奴",
+];
+
+/// Whether the line is written in Japanese: it has hiragana or katakana.
+fn is_japanese(text: &str) -> bool {
+    text.chars()
+        .any(|c| matches!(c, '\u{3041}'..='\u{30ff}' | '\u{31f0}'..='\u{31ff}'))
+}
+
+/// Whether a Vietnamese translation opens with a subject that its Japanese source line does
+/// not have: the model invented it. A line whose source has a pronoun, an honorific, a family
+/// title, or one of the names in `names` is never reported, because a subject may be right
+/// there. Lines in other languages are never judged: the word lists are Japanese.
+pub(crate) fn invented_subject(source: &str, translation: &str, names: &[String]) -> bool {
+    if !is_japanese(source) {
+        return false;
+    }
+    let lead = translation
+        .trim_start_matches(|c: char| !c.is_alphabetic())
+        .to_lowercase();
+    let opens_with_subject = VIETNAMESE_SUBJECTS.iter().any(|word| {
+        lead.strip_prefix(word).is_some_and(|rest| {
+            let whole_word = rest.chars().next().is_none_or(|c| !c.is_alphabetic());
+            // 'Cô ơi' and 'Anh, ...' call someone; they do not make a subject.
+            let call = rest.starts_with(',') || rest.trim_start().starts_with("ơi");
+            whole_word && !call
+        })
+    });
+    if !opens_with_subject {
+        return false;
+    }
+    let has_cue = SUBJECT_CUES.iter().any(|cue| source.contains(cue))
+        || names
+            .iter()
+            .any(|name| !name.is_empty() && source.contains(name.as_str()));
+    !has_cue
+}
+
 pub(crate) fn translations(
     provider: &str,
     text: &str,
@@ -142,34 +229,106 @@ struct GlossaryOutput {
     entries: Vec<GlossaryEntry>,
 }
 
-/// Builds a reusable glossary from OCR text without inferring character biographies or
-/// relationships that OCR alone cannot establish.
+/// Whether the glossary model also writes character profiles and address pairs. Both are
+/// off: they were written from OCR text alone (no speakers, no images) and were often wrong
+/// or ignored, so the translation model decides pronouns itself while it looks at the pages.
+/// The code stays so that they can be switched on again.
+pub(crate) const PROFILES: bool = false;
+
+const PROFILE_KINDS: &str = indoc! {"
+    - character: `source` is the bare name as it appears in the lines, without honorifics and never a pronoun, with one entry per character even when the lines write or call the name in several ways (for a recurring character without a name, a short description such as the regular customer); `target` a short profile: gender, age (the exact number when the work states it, otherwise rough), role, relationship to the other main characters, and own manner of speaking (formal, casual, rough, childish, archaic, ...) including whether they speak politely or plainly to strangers and to the other main characters, and the first-person pronoun they use. Put the manner of speaking and the pronoun first.
+    - address: how one character addresses another. `source` is \"Speaker -> Listener\" with the names used in the lines (or a short description for an unnamed recurring character), `target` is the pair of words the speaker uses for themselves and for the listener, chosen from their relationship, age gap, rank, and tone (for Vietnamese, for example \"tôi - cô\", \"anh - em\", \"tớ - cậu\", or \"tao - mày\"; do not give everyone the same pair). Formality decides first: people who speak politely to each other get a formal pair, close people a familiar one."};
+
+/// System and user prompts that ask a model for the new glossary entries of a stretch of the
+/// work, from its source lines alone.
 pub(crate) fn glossary_prompts(
     target: Language,
     glossary: &[GlossaryEntry],
     lines: &[String],
 ) -> anyhow::Result<(String, String)> {
-    let input = GlossaryInput { glossary, lines };
+    let input = GlossaryInput {
+        glossary,
+        lines,
+    };
     let user = serde_json::to_string(&input).context("failed to serialize glossary input")?;
     let system = format!(
         indoc! {"
-            You maintain a reusable glossary for an illustrated story translated into {target}.
-            It may be a comic, manga, manhwa, manhua, webtoon, graphic novel, or another visual narrative.
-            Do not assume any particular country, source language, culture, genre, audience, or reading direction.
+            You maintain the glossary of a manga that is being translated into {target}.
+            The translator will follow your glossary exactly on every page, so you decide the renderings.
 
-            You receive the current glossary and OCR source lines in the order supplied. Return only useful NEW entries:
-            - name: a named character, place, organization, group, title, rank, or recurring named entity, with a stable {target} rendering. Keep a core name separate from honorifics, titles, ranks, kinship terms, and temporary forms of address. Do not invent a full name from a partial one.
-            - term: a recurring story-specific term, ability, technique, object, species, faction, place type, or world-building concept and its stable {target} rendering. Do not add ordinary vocabulary or one-off sound effects.
-            - style: `source` is exactly `work`; `target` is a concise note about register, genre, or setting only when the supplied lines provide clear evidence. Do not guess from one isolated line.
+            You receive the current glossary and the source lines of a stretch of the work (OCR text in reading order, page after page).
+            Return only NEW entries:
+            - name: a character, place, organization, or title seen in the lines and the {target} rendering to use for it. Every named character gets a name entry, written without honorifics, so that the name is spelled the same way on every page.
+            - term: a recurring term, skill, technique, or item and the rendering to use for it. Leave sound effects out, because the translator renders them on each page, and never romanize anything.{profile_kinds}
+            - style: `source` is exactly work, `target` one short note on genre, setting, and overall register. At most one, and only if the glossary has none yet.
 
             Rules:
-            - Identify the actual source language or writing system from the supplied text; a work may contain more than one language or code-switching. Preserve source distinctions rather than applying conventions from another language.
-            - Use natural, stable {target} renderings. Transliterate or retain names according to established {target} conventions. Do not translate a person's name by its dictionary meaning unless the story clearly uses wordplay or a meaningful alias.
-            - Distinguish names, aliases, titles, ranks, kinship terms, pronouns, nicknames, and honorifics. Do not store a temporary form of address as a character's name.
-            - Do not infer gender, exact age, family ties, romance, hierarchy, personality, or relationships from OCR text alone. These require direct story evidence and are considered during page translation.
-            - Leave sound effects out of the glossary; translate them in their local visual and narrative context.
-            - Skip entries already present and anything not supported by the supplied lines. Merge spelling variants only when they clearly refer to the same entity.
-            - Write `kind` as exactly `style`, `name`, or `term`. Return at most 20 concise entries; return an empty `entries` array when there is nothing new.
+            - Choose natural renderings that will still fit the rest of the work.
+            - Be exhaustive: list every named character, place, organization, title, and recurring term in the lines.{exhaustive_tail}
+            - Skip entries already in the glossary you were given and anything that does not appear in these lines. Never list the same character again under another spelling, honorific, or pronoun.
+            - Write `kind` as exactly {kind_list}.
+            - At most 20 entries, every string short.
+            - Return an empty `entries` array when there is nothing new.
+        "},
+        target = target,
+        profile_kinds = if PROFILES {
+            format!("\n{PROFILE_KINDS}")
+        } else {
+            String::new()
+        },
+        exhaustive_tail = if PROFILES {
+            " Also list every character who speaks, and every pair of speaking characters whose way of addressing each other you can tell. Write the character entries before the address entries."
+        } else {
+            ""
+        },
+        kind_list = if PROFILES {
+            "style, address, character, name, or term"
+        } else {
+            "style, name, or term"
+        },
+    )
+    .trim_end()
+    .to_owned();
+    Ok((system, user))
+}
+
+/// Only Vietnamese has the many ways of saying "I" and "you" that must be fixed per pair of
+/// characters before the translation starts.
+pub(crate) fn decides_address(target: Language) -> bool {
+    target == Language::Vietnamese
+}
+
+/// The prompts of the pass that decides how the characters address each other. It reads the
+/// character profiles the first pass wrote (ages, genders, relationships), not the raw lines,
+/// because a line of OCR text does not say who speaks it.
+pub(crate) fn address_prompts(
+    target: Language,
+    characters: &[GlossaryEntry],
+) -> anyhow::Result<(String, String)> {
+    let input = json!({
+        "characters": characters
+            .iter()
+            .map(|entry| json!({ "name": entry.source, "profile": entry.target }))
+            .collect::<Vec<_>>(),
+    });
+    let user = serde_json::to_string(&input).context("failed to serialize address input")?;
+    let system = format!(
+        indoc! {"
+            You decide how the characters of a manga address each other when it is translated into {target}.
+            The translator will follow your choices exactly on every page.
+
+            You receive the characters of the work with their profiles (gender, age, role, relationships).
+            Return `address` entries, one for each direction of every pair of characters who talk to each other:
+            - `kind` is exactly address.
+            - `source` is \"Speaker -> Listener\" with the character names exactly as given.
+            - `target` is the pair of words the speaker uses for themselves and for the listener in {target} (for Vietnamese, for example \"tôi - cô\", \"anh - em\", \"tớ - cậu\", \"tao - mày\", \"em - chị\").
+
+            Rules:
+            - Formality decides first, then age gap, gender, rank, relationship, and tone. People who speak politely to each other (strangers, colleagues, a customer and a worker, a junior and a senior) get a formal pair (for Vietnamese 'tôi - cô', 'tôi - anh', 'em - anh'); close people (family, couples, old friends) get a familiar pair. Do not give everyone the same pair, and do not use 'anh - em' for people who are not close.
+            - The two directions of a pair need not mirror each other.
+            - Use only characters from the list. Skip a pair when the profiles say nothing about how the two relate, or give neither an age nor how formally they speak: leave it out rather than guess.
+            - At most 20 entries, every string short.
+            - Return an empty `entries` array when no pair can be decided.
         "},
         target = target,
     )
@@ -234,7 +393,7 @@ pub(crate) fn parse_glossary(text: &str) -> Vec<GlossaryEntry> {
 /// The glossary as a block for the translation prompt.
 pub(crate) fn render_glossary(entries: &[GlossaryEntry]) -> String {
     let mut block = String::from(
-        "Work glossary (use stable names and recurring terms when the context confirms they refer to the same entity):",
+        "Glossary (established earlier in this work; always use exactly these renderings):",
     );
     for entry in entries {
         let _ = write!(
@@ -279,6 +438,47 @@ pub(crate) fn snippet(text: &str) -> String {
 }
 
 pub(crate) fn output_schema(expected: usize) -> Value {
+    output_schema_with(expected, false)
+}
+
+/// The schema for the translations of `request`: with a `speaker` string before `text` when
+/// the request asks the model to decide who speaks to whom first.
+pub(crate) fn request_schema(request: &TranslationRequest) -> Value {
+    output_schema_with(request.segments.len(), request.wants_speaker())
+}
+
+fn output_schema_with(expected: usize, speaker: bool) -> Value {
+    // Built in this order on purpose: the model writes the properties in the order they are
+    // listed, so the speaker is decided before the text.
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "id".to_owned(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "maximum": expected.saturating_sub(1),
+            "description": "The ID copied from the corresponding input segment."
+        }),
+    );
+    let mut required = vec![json!("id")];
+    if speaker {
+        properties.insert(
+            "speaker".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Who speaks to whom and the pronoun pair, e.g. 'A>B: em - anh', or 'narration' or 'thought'."
+            }),
+        );
+        required.push(json!("speaker"));
+    }
+    properties.insert(
+        "text".to_owned(),
+        json!({
+            "type": "string",
+            "description": "The translation of the input segment with this ID."
+        }),
+    );
+    required.push(json!("text"));
     json!({
         "type": "object",
         "properties": {
@@ -288,19 +488,8 @@ pub(crate) fn output_schema(expected: usize) -> Value {
                 "maxItems": expected,
                 "items": {
                     "type": "object",
-                    "properties": {
-                        "id": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": expected.saturating_sub(1),
-                            "description": "The ID copied from the corresponding input segment."
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "The translation of the input segment with this ID."
-                        }
-                    },
-                    "required": ["id", "text"],
+                    "properties": properties,
+                    "required": required,
                     "additionalProperties": false
                 }
             }
@@ -316,39 +505,28 @@ fn translation_rules(request: &TranslationRequest) -> String {
     let source = request
         .source_language
         .map(|language| language.to_string())
-        .unwrap_or_else(|| "the source language detected from each segment".to_owned());
+        .unwrap_or_else(|| "the detected source language".to_owned());
     let mut prompt = format!(
         indoc! {"
-            You are a professional translator of comics and illustrated stories.
-            Work only from the supplied material. Do not assume a particular country, language family, culture, genre, character archetype, or reading direction.
+            You are a professional manga translator.
 
-            Translation priorities, in order:
-            1. Preserve the exact meaning, facts, participants, intent, and logical relationships of the source.
-            2. Preserve the speaker's tone, emotion, register, voice, humor, and subtext when supported by context.
-            3. Express the same meaning naturally, concisely, and fluently in {target}.
+            Translation requirements:
+            - Translate every input segment from {source} into natural {target}, the way a native speaker would say it in that situation: keep meaning, character voice, emotion (anger, shyness, sarcasm, teasing), emphasis, and sound effects; never invent or drop content, and never translate word for word.
+            - A page may mix languages, and the source language named here is only the default: translate each segment from the language it is actually written in, and never force a segment into the language of its neighbours.
+            - Localize idioms, slang, wordplay, and sound effects with an equivalent {target} expression, never literally, and keep the wording short enough for speech bubbles.
+            - Read the segments in order as one scene and use the surrounding segments and any supplied context for continuity; never merge or split segments. A sentence split over consecutive segments (one line in two bubbles) must read as one natural sentence; the subject appears only in the segment where the source states it.
+            - Write every `text` only in {target}: no source text, notes, explanations, or alternatives. Translate names, terms, and sound effects with natural {target} conventions and never repeat original-language text.
 
-            Core translation rules:
-            - Translate primarily from {source} into {target}. Treat a declared source language as the default, not as proof that every segment uses only that language. Recognize quotations, mixed languages, dialects, names, loanwords, and code-switching within a work. If no source language is specified, identify the language of each segment from its actual text and script; never infer it from the work's presumed country or genre.
-            - Do not summarize, censor, embellish, explain, or add information not supported by the source and context. Do not omit meaningful details, negation, modality, tense/aspect, quantities, names, or who performs an action and who receives it.
-            - Avoid unnatural word-for-word calques, but do not paraphrase away distinctions or details. Localize idioms, humor, slang, and wordplay only when the intended meaning is clear; preserve the same implication and emotional effect.
-            - Treat the supplied OCR segments as the text to translate. Use images to understand layout, scene, speaker, listener, expression, action, and genuinely ambiguous OCR. Never invent unreadable text or translate other text visible in an image when it is not included in the input segments.
-            - Keep each input segment separate and in supplied reading order. Do not assume left-to-right or right-to-left order, and do not merge or split segments. If a sentence continues across bubbles, make each part read naturally while preserving its contribution to the full sentence.
-            - Distinguish dialogue, inner thought, narration, captions, signs, letters, interface text, labels, and sound effects. Do not turn narration into dialogue or sound effects into spoken sentences.
-            - Render names, aliases, titles, ranks, organizations, recurring terms, and world-specific concepts consistently with the glossary. Keep the distinction between a name, title, rank, kinship term, nickname, and honorific. Do not translate a proper name by dictionary meaning unless the story clearly makes it wordplay or a meaningful alias.
-            - Translate sound effects according to the depicted action, texture, intensity, and tone. Do not force every source sound into one fixed equivalent; retain the original only when that is the most natural choice or the effect is intentionally stylized.
-
-            Character and visual continuity:
-            - Use bubble tails, panel composition, visual action, expressions, dialogue content, and prior context together to identify the speaker and listener. Characters do not necessarily alternate.
-            - A character's apparent gender, body shape, clothing, screen position, or proximity alone is not sufficient proof of exact age, identity, relationship, social rank, or who is speaking.
-            - Maintain a consistent voice and way of addressing others while the same relationship and situation continue. Change them only when the story provides evidence of a change in role, relationship, distance, formality, conflict, intimacy, or disguise.
-            - Do not invent character biographies or relationships. Do not assume characters are relatives, romantic partners, friends, or enemies based only on appearance or one isolated exchange.
-            - When identity or intent is genuinely uncertain, preserve the source ambiguity and choose a neutral natural construction instead of fabricating a fact.
+            Speakers and consistency:
+            - For every segment work out who speaks to whom, and whether it is dialogue, narration, a monologue, or a thought; give it a fitting voice (spoken for dialogue, plainer and inward for monologue and thoughts). Speakers do not necessarily alternate.
+            - The same character keeps the same name, pronouns, and manner of speaking (polite, rough, childish, archaic, ...) while the situation stays the same; change them only when the relationship or mood clearly changes.
+            - Render names, places, skills, and terms the same way every time, following the glossary and context.
+            - Never decide that characters are lovers, relatives, or of a given age or rank from a name, a guess, or the text alone; take it only from what the lines or the image clearly show, and otherwise keep the wording neutral.
 
             Output requirements:
-            - Every input segment has a numeric `id`.
-            - Return only a JSON object whose `translations` array contains exactly one object for every input segment.
-            - Copy each input ID exactly once. Do not duplicate, omit, merge, split, or add segments.
-            - Every `text` value must contain only the {target} translation, without source text, notes, explanations, or alternatives.
+            - Each input segment has a numeric `id`.
+            - Return only a JSON object whose `translations` array contains one object with `id` and translated `text` for every input segment.
+            - Copy every input ID exactly once; order does not matter. Never merge, split, omit, duplicate, or add segments.
         "},
         source = source,
         target = request.target_language,
@@ -359,16 +537,29 @@ fn translation_rules(request: &TranslationRequest) -> String {
     if request.target_language == Language::Vietnamese {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
-            Vietnamese dialogue and address consistency:
-            - Vietnamese pronouns and forms of address encode the relationship between a specific speaker and listener. Treat the choice as context-dependent; do not force one fixed pair on all characters or works.
-            - Base a choice on evidence in this work: prior dialogue between the same people, explicit self-reference or direct forms of address in the source, relationships or roles established by the story, and conversational register. Use visual cues as supporting evidence for identity and scene interpretation, not as the sole basis for age, gender, rank, or relationship.
-            - Do not mechanically map a pronoun, suffix, honorific, grammatical marker, or politeness form from the source language to a Vietnamese pronoun. First determine its function in that specific language and context. Never apply a language-specific rule to a different source language.
-            - Distinguish the speaker's self-reference from the way the speaker addresses the listener. The two directions between two characters need not be symmetrical.
-            - Use a name, an address term, or omit a pronoun only when it preserves the source meaning and sounds natural. Do not add a subject, listener, or relationship that changes who acts, feels, requests, gives, receives, benefits, or is affected.
-            - Keep address choices consistent for the same people under the same circumstances, but change them when the story establishes a real change in relationship, role, distance, formality, or emotion.
-            - If the speaker, listener, or relationship is uncertain, do not fabricate an address pair. Prefer a natural neutral construction that preserves the source ambiguity.
-            - Preserve distinctions such as whether a group includes the listener whenever the source makes them clear.
-            - Source fidelity is more important than forcing a preferred Vietnamese pronoun pair. Rephrase naturally without changing the participants or intent.
+            Vietnamese address and subject consistency:
+            - NEVER add a subject, pronoun, or name that the source line does not contain, however much the Vietnamese sounds as if it needs one. Many languages (Japanese, Chinese, Korean) drop the subject, and Vietnamese can too, so translate only what is written: Japanese 行くよ and Korean 갈게 are 'Đi nhé' or 'Đi đây' (not 'Anh đi nhé'), and ごめんね is 'Xin lỗi nhé' (not 'Em xin lỗi nhé'). When a sentence is wrong without a subject, rephrase it without one instead of inventing one. A first-person word the source does state (I, 私, 我, 나) means the speaker, never the listener.
+            - For every segment decide who speaks and who listens from the bubble tail in the image, the story, and the speaker's way of talking. The first-person word names the speaker and the second-person word the listener, each matching that person's gender. Never carry over the pronoun of the source language, and never fall back on one pair for everybody ('tôi - cậu' and 'anh - em' included).
+            - A glossary address entry 'Speaker -> Listener = pair' was given for those two people in that direction only: use it there, and never reverse it for the other direction. Otherwise reuse the words that the context entries and the earlier lines already show for that person speaking to that listener, and decide a new pair only from the evidence below. Within a sentence refer to the speaker in one way only, and change a pair only when the relationship or mood clearly changes.
+            - Evidence, strongest first. (1) Formality of the speech: polite speech between adults, strangers, colleagues, and customers and workers takes a formal pair ('tôi - cô', 'tôi - anh', 'tôi - chị', or 'em - anh', 'em - chị' for a clearly younger speaker); plain familiar speech between friends, family, and equals takes a close pair ('anh - em', 'chị - em', 'tớ - cậu', 'tao - mày'). A polite speaker keeps polite endings (ạ, vâng, xin, làm ơn) and never turns requests into 'đi', 'nhé', 'đấy'; teasing said politely stays polite. (2) Age and rank, only when the lines or the image clearly show them: a younger person calls an older man 'anh' ('chú', 'bác' when much older) and an older woman 'chị' ('cô', 'dì' when much older), an older person calls a clearly younger one 'em' or 'cháu', and people of the same age use 'cậu', 'bạn', 'tớ', 'mình'. Do not use 'anh - em' between adults who speak politely or are not close. (3) The words of the source: its own pronouns, titles, and honorifics tell the relationship and the register.
+            - Cues in the source language, for lines written in it. Japanese: です/ます polite versus だ/よ plain; 俺 rough male, 僕 gentler male, 私 neutral or polite, あたし casual female; お前 and 貴様 rude ('mày'); さん and 様 formal, ちゃん and くん familiar (くん for a man means an equal or a younger one, so the speaker does not call him 'anh'). Korean: 합쇼체 and 해요체 polite versus 반말 plain; 오빠, 형, 누나, 언니 are what a younger person calls an older one, so they show age and sex. Chinese: 您 formal versus 你 plain; titles such as 老师, 先生, 哥, 姐 show rank and age.
+            - When neither formality nor age is known, use the name, 'bạn', or no pronoun; do not guess.
+            - 'chúng ta' includes the listener; 'chúng tôi', 'bọn anh', 'bọn em' leave the listener out (we said to an outsider). Giving verbs keep their direction: the other does it for the speaker's side, the speaker does it for the other, or the speaker receives it.
+
+            Vietnamese fidelity and naturalness:
+            - First get the exact meaning right; never guess a different meaning. Check polite forms, homographs, and the sense in context (要る 'need' versus 居る 'be'; だめ! as an exclamation is 'Không được!', never 'hỏng rồi'; a verb that reports what another person feels (Japanese ～がる) is never the speaker's own feeling and never gets an object the source does not name).
+            - Then say it as a Vietnamese speaker would: short spoken sentences, fitting sentence-final particles (nhé, nhỉ, mà, đấy, thôi, ạ) for tone and politeness, no calques.
+            - Translate compound words by their real meaning, keep every phrase of the source, and use short standard labels (Tên thật, Tuổi, Nghề nghiệp) on profile pages.
+            - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them. Keep each line about as long as the source allows, so it fits the bubble.
+        "}.trim_end());
+    }
+
+    if request.wants_speaker() {
+        prompt.push_str("\n\n");
+        prompt.push_str(indoc! {"
+            Speaker field:
+            - Each object has `id`, `speaker` and `text`, in that order. Fill `speaker` first, in a few words: 'Speaker>Listener: I-word - you-word' such as 'A>B: em - anh' where A and B are the two characters (or 'narration', or 'thought'); use the name from the glossary or the context, or a short description such as 'khách hàng' when there is no name.
+            - Then write `text` with exactly that pair, and keep the pair of the same Speaker>Listener that the context entries and the earlier lines already show, until the relationship clearly changes.
         "}.trim_end());
     }
 
@@ -377,10 +568,10 @@ fn translation_rules(request: &TranslationRequest) -> String {
         prompt.push_str(&format!(
             indoc! {"
                 Image requirements:
-                {count} consecutive page images are attached in the same order as the supplied page indices. Each input segment has a `page` number. Read the pages together as one continuous scene only when their sequence supports that interpretation.
-                Red outlines and numeric tags, when present, associate a segment ID with its text region. Use them only to locate the matching supplied text region, not as story text.
-                Use images as visual context for dialogue ownership, panel sequence, expression, action, mood, and OCR ambiguity. Visual interpretation must not override clear source wording without strong evidence of OCR error.
-                Translate only the supplied segments. Do not add or omit text merely because other text appears in the images.
+                {count} consecutive original page images are attached in reading order: the first image is page 1. Every input segment has a `page` number, and its text is on that page's image. The pages follow each other in the story, so a line can answer someone who spoke on an earlier page: read all the pages as one scene.
+                The red outlines on the images are tagged with numbers: each number is the id of the segment whose text lies inside that outline (ids run on from page to page). Use the outline to find the segment's bubble and follow its tail to the speaker, and read the text itself from the input segments, not from the outlines.
+                Use the images as visual context for who speaks and who listens, whether a bubble is speech, thought, or narration, the characters' gender, age, and mood, and for tone, layout, and ambiguous OCR.
+                Translate only the supplied segments; do not add text seen in the images that is absent from the input segments.
             "},
             count = request.page_images.len(),
         ).trim_end());
@@ -388,8 +579,9 @@ fn translation_rules(request: &TranslationRequest) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
             Image requirements:
-            Use the attached original page as context for panel sequence, dialogue ownership, tails, expressions, actions, tone, and genuinely ambiguous OCR. If red outlines and numeric segment tags are present, use them only to locate the matching supplied segment.
-            Do not assume a fixed reading direction, and do not add text visible in the image that is absent from the supplied segments. The supplied OCR segments remain the scope of translation.
+            When the attached original page image shows red outlines tagged with numbers, each number is the id of the segment whose text lies inside that outline: use the outline to find the segment's bubble and follow its tail to the speaker, and read the text itself from the input segments, not from the outlines.
+            Use the attached original page image as visual context for who speaks and who listens, whether a bubble is speech, thought, or narration, the characters' gender, age, and mood, and for tone, layout, and ambiguous OCR.
+            Translate only the supplied segments; do not add text seen in the image that is absent from the input segments.
         "}.trim_end());
     }
     prompt
@@ -451,6 +643,10 @@ struct TranslationOutput {
 struct TranslationOutputSegment {
     #[serde(deserialize_with = "deserialize_segment_id")]
     id: usize,
+    /// "Speaker>Listener: pronoun pair", written before the text so the pronouns are decided
+    /// first; the pairs are kept as the pronouns chosen for the work.
+    #[serde(default)]
+    speaker: Option<String>,
     text: String,
 }
 
@@ -478,8 +674,10 @@ mod tests {
     #[test]
     fn snippet_keeps_a_response_on_one_line() {
         let flattened = snippet("{\n  \"translations\": [\n\t\"hello\"\n  ]\n}");
+
         assert!(!flattened.contains('\n'), "{flattened}");
         assert!(!flattened.contains('\t'), "{flattened}");
+        assert_eq!(flattened, r#"{\n  "translations": [\n\t"hello"\n  ]\n}"#);
     }
 
     #[test]
@@ -490,159 +688,155 @@ mod tests {
     #[test]
     fn snippet_reports_the_length_it_elided() {
         let flattened = snippet(&"x".repeat(2_500));
+
         assert!(flattened.starts_with(&"x".repeat(2_000)));
-        assert!(flattened.ends_with("… (2500 bytes total)"));
+        assert!(
+            flattened.ends_with("\u{2026} (2500 bytes total)"),
+            "{flattened}"
+        );
     }
 
     #[test]
-    fn parses_plain_translation_json() {
+    fn parses_plain_json() {
         let source = ["one".to_owned(), "two".to_owned()];
         let response = r#"{"translations":[{"id":0,"text":"hello"},{"id":1,"text":"world"}]}"#;
-        assert_eq!(translations("test", response, &source).unwrap(), ["hello", "world"]);
+
+        assert_eq!(
+            translations("test", response, &source).unwrap(),
+            ["hello", "world"]
+        );
     }
 
     #[test]
     fn rejects_wrapped_and_malformed_json() {
         let source = ["one".to_owned(), "two".to_owned()];
         for response in [
-            r#"```json
-{"translations":[{"id":0,"text":"hello"},{"id":1,"text":"world"}]}
-```"#,
+            "```json\n{\"translations\":[{\"id\":0,\"text\":\"hello\"},{\"id\":1,\"text\":\"world\"}]}\n```",
             r#"{translations: [{id: 0, text: 'hello'}, {id: 1, text: 'world'},],}"#,
             r#"Here is the result: {"translations": [{"id": 0, "text": "hello"}, {"id": 1, "text": "world"},]}"#,
-            r#"{"translations":[{"id":0,"text":"hello"},{"id":1,"text":"world"#,
+            "{\"translations\":[{\"id\":0,\"text\":\"hello\"},{\"id\":1,\"text\":\"world\"",
         ] {
-            assert!(translations("test", response, &source).is_err(), "{response}");
+            assert!(
+                translations("test", response, &source).is_err(),
+                "{response}"
+            );
         }
     }
 
     #[test]
-    fn parse_error_preserves_response() {
+    fn parse_error_preserves_the_root_failure_and_response() {
         let source = ["one".to_owned()];
-        let response = r#"{
-  "translations": [{"id": 0}]
-}"#;
-        let error = translations("test", response, &source).expect_err("missing text should fail");
-        let invalid = error.downcast_ref::<InvalidTranslationOutput>().expect("typed context");
-        assert_eq!(invalid.response, response);
+        let response = "{\n  \"translations\": [{\"id\": 0}]\n}";
+        let error = format!(
+            "{:#}",
+            translations("test", response, &source).expect_err("missing text should fail")
+        );
+
+        assert!(error.contains("missing field `text`"), "{error}");
+        assert!(
+            error.contains(r#"response was: {\n  "translations": [{"id": 0}]\n}"#),
+            "{error}"
+        );
     }
 
     #[test]
-    fn parses_glossary_even_when_response_is_truncated() {
-        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
-            kind: kind.to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-        };
-        let full = r#"{"entries":[{"kind":"name","source":"CHAR_A","target":"Character A"}]}"#;
-        assert_eq!(parse_glossary(full), [entry("name", "CHAR_A", "Character A")]);
-        let cut = r#"{"entries":[{"kind":"name","source":"CHAR_A","target":"Character A"},{"kind":"term","source":"TERM_X","target":"term"#;
-        assert_eq!(parse_glossary(cut), [entry("name", "CHAR_A", "Character A")]);
-        assert!(parse_glossary("garbage").is_empty());
+    fn restores_input_order_from_ids() {
+        let source = ["one".to_owned(), "two".to_owned()];
+        let response = r#"{"translations":[{"id":1,"text":"world"},{"id":0,"text":"hello"}]}"#;
+        assert_eq!(
+            translations("test", response, &source).unwrap(),
+            ["hello", "world"]
+        );
     }
 
     #[test]
-    fn glossary_is_rendered_one_entry_per_line() {
-        let entries = vec![
-            GlossaryEntry {
-                kind: "name".to_owned(),
-                source: "CHAR_A".to_owned(),
-                target: "Character A".to_owned(),
-            },
-            GlossaryEntry {
-                kind: "term".to_owned(),
-                source: "TERM_X".to_owned(),
-                target: "term X".to_owned(),
-            },
-        ];
-        let block = render_glossary(&entries);
-        assert!(block.starts_with("Work glossary"));
-        assert!(block.contains("\n- name: CHAR_A = Character A"));
-        assert!(block.contains("\n- term: TERM_X = term X"));
+    fn tolerates_duplicate_missing_and_out_of_range_ids() {
+        let source = ["one".to_owned(), "two".to_owned()];
+        let short = r#"{"translations":[{"id":1,"text":"world"}]}"#;
+        assert_eq!(
+            translations("test", short, &source).unwrap(),
+            ["one", "world"]
+        );
+
+        let response = concat!(
+            r#"{"translations":["#,
+            r#"{"id":0,"text":"hello"},"#,
+            r#"{"id":0,"text":"duplicate"},"#,
+            r#"{"id":9,"text":"extra"}"#,
+            "]}"
+        );
+        assert_eq!(
+            translations("test", response, &source).unwrap(),
+            ["hello", "two"]
+        );
     }
 
     #[test]
-    fn vietnamese_prompt_has_contextual_address_guidance_only_for_vietnamese() {
-        let vi = translation_system_prompt(&TranslationRequest::new(["hello"], Language::Vietnamese));
-        assert!(vi.contains("Vietnamese dialogue and address consistency"));
-        assert!(vi.contains("Do not mechanically map a pronoun"));
-        let en = translation_system_prompt(&TranslationRequest::new(["hello"], Language::English));
-        assert!(!en.contains("Vietnamese dialogue and address consistency"));
-    }
-
-    #[test]
-    fn output_schema_requires_only_id_and_translation_text() {
-        let schema = output_schema(2);
-        let item = &schema["properties"]["translations"]["items"];
-        assert_eq!(item["required"], serde_json::json!(["id", "text"]));
-        let properties = item["properties"].as_object().unwrap();
-        assert_eq!(properties.len(), 2);
-        assert!(properties.contains_key("id"));
-        assert!(properties.contains_key("text"));
-    }
-
-    #[test]
-    fn parse_translations_reports_missing_and_duplicate_ids() {
-        let sources = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
-        let text = r#"{"translations":[{"id":0,"text":"A"},{"id":0,"text":"duplicate"},{"id":2,"text":"C"}]}"#;
-        let (translations, missing) = parse_translations("test", text, &sources).unwrap();
-        assert_eq!(translations, ["A", "b", "C"]);
-        assert_eq!(missing, [1]);
-    }
-
-    fn two_pages(language: Language) -> TranslationRequest {
-        let blank = || std::sync::Arc::new(image::DynamicImage::new_rgb8(1, 1));
-        TranslationRequest::new(["a", "b", "c"], language)
-            .with_pages(vec![blank(), blank()], vec![0, 0, 1])
-    }
-
-    #[test]
-    fn pages_translated_together_carry_page_numbers_and_visual_instructions() {
-        let request = two_pages(Language::Vietnamese);
-        let (system, user) = prompts(&request).unwrap();
-        assert!(system.contains("2 consecutive page images"));
+    fn prompt_payload_contains_ordered_context() {
+        let request = TranslationRequest::new(["new"], Language::English)
+            .with_context([TranslationContext::new("old", "previous")]);
+        let (_, user) = prompts(&request).unwrap();
         let input: serde_json::Value = serde_json::from_str(&user).unwrap();
-        assert_eq!(input["segments"][0]["page"], 1);
-        assert_eq!(input["segments"][2]["page"], 2);
-
-        let single = TranslationRequest::new(["a"], Language::Vietnamese)
-            .with_pages(vec![std::sync::Arc::new(image::DynamicImage::new_rgb8(1, 1))], vec![0]);
-        let (_, user) = prompts(&single).unwrap();
-        let input: serde_json::Value = serde_json::from_str(&user).unwrap();
-        assert!(input["segments"][0].get("page").is_none());
+        assert_eq!(input["context"][0]["source"], "old");
+        assert_eq!(input["context"][0]["translation"], "previous");
+        assert_eq!(input["segments"][0]["id"], 0);
+        assert_eq!(input["segments"][0]["text"], "new");
     }
 
     #[test]
-    fn glossary_requests_only_general_name_term_and_evidenced_style_entries() {
-        let (system, _) = glossary_prompts(Language::Vietnamese, &[], &["line".to_owned()]).unwrap();
-        assert!(system.contains("- name:"));
-        assert!(system.contains("- term:"));
-        assert!(system.contains("- style:"));
-        assert!(system.contains("Do not assume any particular country"));
-        assert!(!system.contains("Speaker -> Listener"));
+    fn system_prompt_encodes_invariants_and_custom_instructions() {
+        let request = TranslationRequest::new(["hello"], Language::Korean)
+            .with_source_language(Language::Japanese)
+            .with_instructions("Use informal speech.");
+        let prompt = translation_system_prompt(&request);
+        assert!(prompt.contains("from Japanese into natural Korean"));
+        assert!(prompt.contains("Copy every input ID exactly once"));
+        assert!(prompt.contains("Use informal speech."));
     }
 
     #[test]
-    fn the_stable_instructions_come_first_in_the_system_prompt() {
-        let mut request = two_pages(Language::Vietnamese);
-        request.context = vec![TranslationContext {
-            source: "a".to_owned(),
-            translation: "b".to_owned(),
-        }];
-        request.instructions = Some("Work glossary (x)".to_owned());
-        let stable = stable_system(&request);
-        let system = translation_system_prompt(&request);
-        assert!(system.starts_with(&stable));
-        assert!(system.len() > stable.len());
-        assert!(!stable.contains("Context requirements"));
-        assert!(!stable.contains("Additional instructions"));
+    fn schema_requires_the_expected_number_of_id_text_pairs() {
+        let schema = output_schema(3);
+        let translations = &schema["properties"]["translations"];
+        assert_eq!(translations["minItems"], 3);
+        assert_eq!(translations["maxItems"], 3);
+        assert_eq!(translations["items"]["properties"]["id"]["minimum"], 0);
+        assert_eq!(translations["items"]["properties"]["id"]["maximum"], 2);
+        assert_eq!(translations["items"]["additionalProperties"], false);
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn empty_custom_instructions_are_ignored() {
+        let request = TranslationRequest::new(["hello"], Language::English).with_instructions("  ");
+        assert!(!translation_system_prompt(&request).contains("Additional instructions"));
+    }
+
+    #[test]
+    fn context_is_reference_only() {
+        let request = TranslationRequest::new(["Where is she?"], Language::Japanese)
+            .with_context([TranslationContext::new("I saw Alice.", "アリスを見た。")]);
+        let prompt = translation_system_prompt(&request);
+        assert!(prompt.contains("dialogue continuity"));
+        assert!(prompt.contains("Do not translate or return the context"));
+    }
+
+    #[test]
+    fn image_context_does_not_expand_the_translation_scope() {
+        let request = TranslationRequest::new(["text"], Language::English)
+            .with_image(std::sync::Arc::new(image::DynamicImage::new_rgb8(1, 1)));
+        let prompt = translation_system_prompt(&request);
+        assert!(prompt.contains("attached original page image"));
+        assert!(prompt.contains("Translate only the supplied segments"));
     }
 
     #[test]
     fn salvage_keeps_complete_segments_from_a_truncated_response() {
         let sources = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
-        let text = r#"{"translations":[{"id":0,"text":"Xin chào"},{"id":1,"text":"cut"#;
+        let text = r#"{"translations":[{"id":0,"text":"Xin chào"},{"id":1,"text":"lặp lặp lặp lặp"#;
+
         let (translations, missing) = salvage_translations(text, &sources);
+
         assert_eq!(translations, ["Xin chào", "b", "c"]);
         assert_eq!(missing, [1, 2]);
     }
@@ -655,5 +849,207 @@ mod tests {
             assert_eq!(translations, ["a", "b"], "{text}");
             assert_eq!(missing, [0, 1], "{text}");
         }
+    }
+
+    #[test]
+    fn invalid_output_keeps_the_raw_response() {
+        let sources = vec!["a".to_owned()];
+        let response = r#"{"translations":[{"id":0,"text":"cut"#;
+        let error = translations("test", response, &sources).unwrap_err();
+        let invalid = error
+            .downcast_ref::<InvalidTranslationOutput>()
+            .expect("typed context");
+        assert_eq!(invalid.response, response);
+    }
+
+    #[test]
+    fn glossary_output_is_parsed_even_when_truncated() {
+        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+            kind: kind.to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let full = r#"{"entries":[{"kind":"name","source":"田中","target":"Tanaka"}]}"#;
+        assert_eq!(parse_glossary(full), [entry("name", "田中", "Tanaka")]);
+        let cut = r#"{"entries":[{"kind":"name","source":"田中","target":"Tanaka"},{"kind":"term","source":"霊力","target":"linh"#;
+        assert_eq!(parse_glossary(cut), [entry("name", "田中", "Tanaka")]);
+        assert!(parse_glossary("garbage").is_empty());
+        assert!(parse_glossary(r#"{"entries":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn glossary_is_rendered_one_entry_per_line() {
+        let entries = vec![
+            GlossaryEntry {
+                kind: "name".to_owned(),
+                source: "田中".to_owned(),
+                target: "Tanaka".to_owned(),
+            },
+            GlossaryEntry {
+                kind: "term".to_owned(),
+                source: "霊力".to_owned(),
+                target: "linh lực".to_owned(),
+            },
+            GlossaryEntry {
+                kind: "address".to_owned(),
+                source: "田中 -> 鈴木".to_owned(),
+                target: "tớ - cậu".to_owned(),
+            },
+        ];
+        let block = render_glossary(&entries);
+        assert!(block.starts_with("Glossary"));
+        assert!(block.contains("\n- name: 田中 = Tanaka"));
+        assert!(block.contains("\n- term: 霊力 = linh lực"));
+        assert!(block.contains("\n- address: 田中 -> 鈴木 = tớ - cậu"));
+    }
+
+    #[test]
+    fn vietnamese_prompts_carry_address_consistency_rules() {
+        let vietnamese =
+            translation_system_prompt(&TranslationRequest::new(["a"], Language::Vietnamese));
+        assert!(vietnamese.contains("Vietnamese address and subject consistency"));
+        assert!(vietnamese.contains("Vietnamese fidelity and naturalness"));
+        let english = translation_system_prompt(&TranslationRequest::new(["a"], Language::English));
+        assert!(!english.contains("Vietnamese address and subject consistency"));
+    }
+
+    #[test]
+    fn parse_translations_reports_missing_and_duplicate_ids() {
+        let sources = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let text = r#"{"translations":[{"id":0,"text":"A"},{"id":0,"text":"dup"},{"id":2,"text":"C"}]}"#;
+
+        let (translations, missing) = parse_translations("test", text, &sources).unwrap();
+
+        assert_eq!(translations, ["A", "b", "C"]);
+        assert_eq!(missing, [1]);
+    }
+
+    #[test]
+    fn the_address_pass_reads_character_profiles() {
+        let characters = vec![GlossaryEntry {
+            kind: "character".to_owned(),
+            source: "田中".to_owned(),
+            target: "Nam, 40 tuổi, chủ quán".to_owned(),
+        }];
+        let (system, user) = address_prompts(Language::Vietnamese, &characters).unwrap();
+        assert!(system.contains("Speaker -> Listener"));
+        assert!(system.contains("into Vietnamese"));
+        let input: serde_json::Value = serde_json::from_str(&user).unwrap();
+        assert_eq!(input["characters"][0]["name"], "田中");
+        assert_eq!(input["characters"][0]["profile"], "Nam, 40 tuổi, chủ quán");
+        assert!(decides_address(Language::Vietnamese));
+        assert!(!decides_address(Language::English));
+    }
+
+    fn two_pages(language: Language) -> TranslationRequest {
+        let blank = || std::sync::Arc::new(image::DynamicImage::new_rgb8(1, 1));
+        TranslationRequest::new(["a", "b", "c"], language)
+            .with_pages(vec![blank(), blank()], vec![0, 0, 1])
+    }
+
+    #[test]
+    fn pages_translated_together_carry_their_page_and_images() {
+        let request = two_pages(Language::Vietnamese);
+        let (system, user) = prompts(&request).unwrap();
+        assert!(system.contains("2 consecutive original page images"));
+        assert!(system.contains("Speaker field:"));
+        let input: serde_json::Value = serde_json::from_str(&user).unwrap();
+        assert_eq!(input["segments"][0]["page"], 1);
+        assert_eq!(input["segments"][2]["page"], 2);
+
+        let single = TranslationRequest::new(["a"], Language::Vietnamese)
+            .with_pages(vec![std::sync::Arc::new(image::DynamicImage::new_rgb8(1, 1))], vec![0]);
+        let (_, user) = prompts(&single).unwrap();
+        let input: serde_json::Value = serde_json::from_str(&user).unwrap();
+        assert!(input["segments"][0].get("page").is_none());
+    }
+
+    #[test]
+    fn the_speaker_is_written_between_the_id_and_the_text() {
+        let schema = request_schema(&two_pages(Language::Vietnamese));
+        let item = &schema["properties"]["translations"]["items"];
+        assert_eq!(item["required"], serde_json::json!(["id", "speaker", "text"]));
+        let keys: Vec<&String> = item["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["id", "speaker", "text"]);
+
+        let plain = request_schema(&two_pages(Language::English));
+        let item = &plain["properties"]["translations"]["items"];
+        assert_eq!(item["required"], serde_json::json!(["id", "text"]));
+        let single = request_schema(&TranslationRequest::new(["a"], Language::Vietnamese));
+        assert_eq!(single, output_schema(1));
+    }
+
+    #[test]
+    fn the_speaker_in_the_output_is_accepted_and_ignored() {
+        let sources = vec!["a".to_owned(), "b".to_owned()];
+        let text = r#"{"translations":[{"id":0,"speaker":"A -> B: em - anh","text":"A"},{"id":1,"text":"B"}]}"#;
+        let (translations, missing) = parse_translations("test", text, &sources).unwrap();
+        assert_eq!(translations, ["A", "B"]);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn selecting_segments_keeps_their_pages() {
+        let subset = two_pages(Language::Vietnamese).select(&[1, 2]);
+        assert_eq!(subset.segments, ["b", "c"]);
+        assert_eq!(subset.segment_pages, [0, 1]);
+        assert_eq!(subset.page_images.len(), 2);
+    }
+
+    #[test]
+    fn the_glossary_asks_for_names_and_terms_without_profiles() {
+        let (system, _) =
+            glossary_prompts(Language::Vietnamese, &[], &["a".to_owned()]).unwrap();
+        assert!(!PROFILES);
+        assert!(system.contains("- name:"));
+        assert!(!system.contains("- character:"));
+        assert!(!system.contains("- address:"));
+        assert!(system.contains("style, name, or term"));
+    }
+
+    #[test]
+    fn the_stable_instructions_come_first_in_the_system_prompt() {
+        let mut request = two_pages(Language::Vietnamese);
+        request.context = vec![TranslationContext {
+            source: "a".to_owned(),
+            translation: "b".to_owned(),
+        }];
+        request.instructions = Some("Glossary (x)".to_owned());
+        let stable = stable_system(&request);
+        let system = translation_system_prompt(&request);
+        assert!(system.starts_with(&stable));
+        assert!(system.len() > stable.len());
+        assert!(!stable.contains("Context requirements"));
+        assert!(!stable.contains("Additional instructions"));
+    }
+
+    #[test]
+    fn speakers_are_read_from_whole_and_cut_off_responses() {
+        let whole = r#"{"translations":[{"id":0,"speaker":"A>B: em - anh","text":"A"},{"id":1,"speaker":"narration","text":"B"}]}"#;
+        assert_eq!(speakers(whole), ["A>B: em - anh", "narration"]);
+        let cut = r#"{"translations":[{"id":0,"speaker":"A>B: em - anh","text":"A"},{"id":1,"spea"#;
+        assert_eq!(speakers(cut), ["A>B: em - anh"]);
+        assert!(speakers("not json").is_empty());
+    }
+
+    #[test]
+    fn a_subject_the_source_does_not_have_is_caught() {
+        let none: [String; 0] = [];
+        assert!(invented_subject("食べてるよ？", "Anh đang ăn đấy?", &none));
+        assert!(invented_subject("何してるの", "Cậu đang làm gì đấy?", &none));
+        assert!(invented_subject("お願い…", "Em xin anh…", &none));
+        // No subject, a subject the source states, a form of address, or a name.
+        assert!(!invented_subject("行くよ", "Đi nhé", &none));
+        assert!(!invented_subject("私も…", "Em cũng…", &none));
+        assert!(!invented_subject("鈴木くん、ありがとう", "Cậu giúp em nhiều quá", &none));
+        assert!(!invented_subject("田中は寝てる…", "Anh đang ngủ…", &["田中".to_owned()]));
+        // A call is not a subject, and a longer word is not a pronoun.
+        assert!(!invented_subject("早く", "Cô ơi, nhanh lên", &none));
+        assert!(!invented_subject("早く", "Anh, nhanh lên", &none));
+        assert!(!invented_subject("来た", "Cảnh sát tới rồi", &none));
+        assert!(!invented_subject("来た", "Tại sao lại thế", &none));
+        // Only Japanese lines are judged.
+        assert!(!invented_subject("我走了", "Anh đi đây", &none));
+        assert!(!invented_subject("갈게", "Anh đi đây", &none));
     }
 }
