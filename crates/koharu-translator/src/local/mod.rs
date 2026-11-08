@@ -22,6 +22,13 @@ const MAX_MISSING_RETRIES: u32 = 2;
 
 /// Upper bound for the tokens of one glossary update.
 const GLOSSARY_MAX_TOKENS: usize = 900;
+/// Output tokens reserved per segment for its numeric ID and translated text.
+const TOKENS_PER_SEGMENT: usize = 60;
+
+/// A page image costs about this many tokens at most. Encoding the image is the slowest part
+/// of a page on a CPU and the cost grows with the token count; the image only has to show who
+/// speaks, because the text comes from the OCR.
+const IMAGE_MAX_TOKENS: i32 = 700;
 
 /// The partial output is checked for a repetition loop every 16 generated tokens.
 const LOOP_CHECK_MASK: usize = 15;
@@ -58,7 +65,9 @@ impl LocalTranslator {
             .with_context(|| format!("unknown local translator '{model}'"))?;
         let resolved = descriptor.resolve(selection).await?;
         let options = LoadOptions {
-            mtmd: resolved.projector.map(MtmdOptions::new),
+            mtmd: resolved
+                .projector
+                .map(|projector| MtmdOptions::new(projector).with_image_token_range(-1, IMAGE_MAX_TOKENS)),
             ..LoadOptions::default()
         };
         let llm = Llm::load_with_options(device, resolved.model, options)
@@ -75,6 +84,7 @@ impl LocalTranslator {
             llm: Arc::new(llm),
         })
     }
+
 
     pub(crate) async fn translate(
         &self,
@@ -110,13 +120,9 @@ impl LocalTranslator {
                 attempt,
                 "local translation skipped segments; translating them again"
             );
-            let mut retry = request.clone();
-            // Encoding the page image on CPU takes minutes, so retries are text only.
-            retry.image = None;
-            retry.segments = missing
-                .iter()
-                .map(|&index| request.segments[index].clone())
-                .collect();
+            // Encoding the page images on CPU takes minutes, so retries are text only.
+            let mut retry = request.select(&missing);
+            retry.drop_images();
             let mut retry_options = options.clone();
             retry_options.seed = retry_options.seed.wrapping_add(attempt);
             let (retried, still_missing) = self.generate(&retry, reasoning, &retry_options).await?;
@@ -149,16 +155,27 @@ impl LocalTranslator {
         reasoning: bool,
         options: &GenerationOptions,
     ) -> Result<(Vec<String>, Vec<usize>)> {
-        let image = request.image.clone();
-        let prompt = self.render_prompt(request, reasoning)?;
+        let images: Vec<_> = if request.page_images.is_empty() {
+            request.image.iter().cloned().collect()
+        } else {
+            request.page_images.clone()
+        };
+        let (prompt, shared_prefix) = self.render_prompt(request, reasoning)?;
         let schema = prompt::output_schema(request.segments.len());
         let llm = Arc::clone(&self.llm);
-        let options = options.clone();
+        let mut options = options.clone();
+        // Each segment needs room for its id and text, so larger requests are not cut off
+        // by the normal single-page output limit.
+        options.max_tokens = options
+            .max_tokens
+            .max(request.segments.len() * TOKENS_PER_SEGMENT + 64);
         let output = tokio_rayon::spawn(move || {
-            let input = image.as_deref().map_or_else(
-                || Input::new(&prompt),
-                |image| Input::new(&prompt).with_image(image),
-            );
+            // The instructions at the start of the prompt are the same on every page: the model
+            // reads them once and keeps what it computed.
+            let mut input = Input::new(&prompt).with_shared_prefix(shared_prefix);
+            for image in &images {
+                input = input.with_image(&**image);
+            }
             llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
         })
         .await?;
@@ -171,6 +188,7 @@ impl LocalTranslator {
             reasoning,
             "local generation finished"
         );
+        tracing::debug!(parent: None, response = %output.text, "local translation response");
         Ok(prompt::parse_translations(
             "local",
             &output.text,
@@ -178,7 +196,7 @@ impl LocalTranslator {
         )?)
     }
 
-    /// Asks the selected model for glossary entries from OCR source lines. Text only,
+    /// Asks the model for the glossary entries of one page, from its source lines. Text only,
     /// without reasoning, with a short output.
     pub(crate) async fn extract_glossary(
         &self,
@@ -218,22 +236,28 @@ impl LocalTranslator {
             finish = ?output.finish_reason,
             "local glossary generation finished"
         );
-        // OCR-only glossary extraction cannot reliably identify speaker/listener pairs.
-        // Address is therefore not generated from character profiles alone.
-        Ok(prompt::parse_glossary(&output.text)
-            .into_iter()
-            .filter(|entry| !entry.kind.trim().eq_ignore_ascii_case("address"))
-            .collect())
+        Ok(prompt::parse_glossary(&output.text))
     }
 
-    fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
+    /// The chat prompt, and how many of its leading bytes are the instructions that do not
+    /// change from page to page (0 when they cannot be told apart).
+    fn render_prompt(
+        &self,
+        request: &TranslationRequest,
+        reasoning: bool,
+    ) -> Result<(String, usize)> {
         let (system, payload) = prompt::prompts(request)?;
-        let payload = if request.image.is_some() {
-            format!("{}\n{payload}", media_marker())
+        let images = request
+            .page_images
+            .len()
+            .max(usize::from(request.image.is_some()));
+        let payload = if images > 0 {
+            let markers = vec![media_marker(); images].join("\n");
+            format!("{markers}\n{payload}")
         } else {
             payload
         };
-        Ok(self
+        let prompt = self
             .llm
             .render_chat_prompt_with_options(
                 &[ChatMessage::system(system), ChatMessage::user(payload)],
@@ -242,7 +266,12 @@ impl LocalTranslator {
                     enable_thinking: reasoning,
                 },
             )
-            .context("failed to render local translation prompt")?)
+            .context("failed to render local translation prompt")?;
+        let stable = prompt::stable_system(request);
+        let shared_prefix = prompt
+            .find(&stable)
+            .map_or(0, |start| start + stable.len());
+        Ok((prompt, shared_prefix))
     }
 }
 
