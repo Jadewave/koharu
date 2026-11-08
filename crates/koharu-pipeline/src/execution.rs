@@ -149,15 +149,16 @@ impl<'a> Execution<'a> {
                     .as_ref()
                     .filter(|mask| stage == Stage::Inpainting && mask.page == page)
                     .cloned(),
-            ),
+            )
+            .with_pages(self.scope.shared_pages()),
             self.stop.clone(),
             self.progress.clone(),
         ))
     }
 
-    /// Runs once every other stage has finished on every page and before the first page is
-    /// translated: the glossary model reads the OCR text of the whole work, then the
-    /// translation model takes over. A failed glossary never fails the run.
+    /// Runs once OCR and the other preparation stages have finished: the selected local
+    /// translation model builds a glossary from the work's OCR before page translation.
+    /// A failed glossary never fails the run.
     async fn open_translation(&mut self) {
         let pages = self.scope.pages().to_vec();
         let lines = match source_lines(&self.scene, &pages, self.scope.entities(), |page| {
