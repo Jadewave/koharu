@@ -15,6 +15,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use koharu_llama::{
+    LlamaStateSeqFlags, SeqState,
     context::{
         LlamaContext,
         params::{LlamaAttentionType, LlamaContextParams},
@@ -47,7 +48,27 @@ pub(super) struct Model {
     eos_token: LlamaToken,
     chat_template: ChatTemplate,
     llguidance_factory: OnceLock<std::result::Result<ParserFactory, String>>,
+    /// What the model computed for the shared prefixes of recent prompts, newest last.
+    prefix_cache: Mutex<Vec<CachedPrefix>>,
 }
+
+/// The model state after reading the shared prefix of a prompt, kept to skip reading it again.
+struct CachedPrefix {
+    text: String,
+    positions: i32,
+    /// The attention mode the state was computed under; a state only fits the same mode.
+    non_causal: bool,
+    state: SeqState,
+}
+
+/// The shared prefix of a prompt: its text and tokens.
+struct PromptPrefix {
+    text: String,
+    tokens: Vec<LlamaToken>,
+}
+
+/// How many prefixes are kept: one for text prompts and one for prompts with images.
+const PREFIX_CACHE_SLOTS: usize = 2;
 
 impl Debug for Model {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -205,6 +226,7 @@ impl Model {
             eos_token,
             chat_template,
             llguidance_factory: OnceLock::new(),
+            prefix_cache: Mutex::new(Vec::new()),
         })
     }
 
@@ -254,7 +276,7 @@ impl Model {
                     .map_err(|_| anyhow::anyhow!("MTMD projector lock is poisoned"))?,
             )
         };
-        let prepared = self.prepare_prompt(input, options.add_special, mtmd.as_deref())?;
+        let prepared = self.prepare_with_prefix(input, options.add_special, mtmd.as_deref())?;
         let context_config = context_config(&prepared, options)?;
         let mut context = self
             .model
@@ -332,6 +354,136 @@ impl Model {
         })
     }
 
+    /// Prepares the prompt, splitting off its shared prefix when the caller named one. The
+    /// prefix is tokenized on its own and the rest is prepared as usual, so only the rest
+    /// (and the images) are read again when the prefix is cached.
+    fn prepare_with_prefix(
+        &self,
+        input: &Input<'_>,
+        add_special: bool,
+        mtmd: Option<&MtmdContext>,
+    ) -> Result<PreparedPrompt> {
+        let prompt = input.prompt();
+        let shared = input.shared_prefix();
+        if shared == 0
+            || shared >= prompt.len()
+            || !prompt.is_char_boundary(shared)
+            || self.model.has_encoder()
+        {
+            return self.prepare_prompt(input, add_special, mtmd);
+        }
+        let (head, tail) = prompt.split_at(shared);
+        let tokens = self
+            .model
+            .str_to_token(
+                head,
+                if add_special {
+                    AddBos::Always
+                } else {
+                    AddBos::Never
+                },
+            )
+            .context("failed to tokenize the shared prompt prefix")?;
+        ensure!(!tokens.is_empty(), "shared prompt prefix produced no tokens");
+
+        let mut rest = Input::new(tail);
+        for media in input.media() {
+            rest = match *media {
+                Media::Image(image) => rest.with_image(image),
+                Media::Audio(samples) => rest.with_audio(samples),
+            };
+        }
+        let mut prepared = self.prepare_prompt(&rest, false, mtmd)?;
+        let count = tokens.len();
+        prepared.prompt_positions = prepared.prompt_positions.saturating_add(count);
+        prepared.prompt_tokens = prepared.prompt_tokens.saturating_add(count);
+        // The prefix is read in one batch, like any other chunk of text.
+        prepared.batch_tokens = prepared.batch_tokens.max(count);
+        let mut history = tokens.clone();
+        history.extend_from_slice(&prepared.history_tokens);
+        prepared.history_tokens = history;
+        prepared.prefix = Some(PromptPrefix {
+            text: head.to_owned(),
+            tokens,
+        });
+        Ok(prepared)
+    }
+
+    /// Puts the shared prefix into the context: restored from the cache when the same prefix
+    /// was read before, otherwise read now and kept. Returns the position after the prefix.
+    fn load_prefix(
+        &self,
+        prefix: &PromptPrefix,
+        non_causal: bool,
+        context: &mut LlamaContext<'_>,
+    ) -> Result<i32> {
+        let positions = i32::try_from(prefix.tokens.len()).context("prompt prefix is too long")?;
+        let mut cache = self
+            .prefix_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let start = Instant::now();
+        if let Some(cached) = cache.iter().find(|cached| {
+            cached.text == prefix.text
+                && cached.positions == positions
+                && cached.non_causal == non_causal
+        }) {
+            match context.state_seq_set(&cached.state, 0) {
+                Ok(()) => {
+                    tracing::info!(
+                        prefix_tokens = prefix.tokens.len(),
+                        secs = start.elapsed().as_secs_f32(),
+                        cached = true,
+                        "prompt prefix ready"
+                    );
+                    return Ok(positions);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cached prompt prefix could not be restored; reading it again");
+                    context.clear_kv_cache();
+                }
+            }
+        }
+
+        let mut batch = LlamaBatch::new(prefix.tokens.len(), 1);
+        for (index, token) in prefix.tokens.iter().enumerate() {
+            batch
+                .add(
+                    *token,
+                    i32::try_from(index).context("prompt prefix position exceeds i32")?,
+                    &[0],
+                    index + 1 == prefix.tokens.len(),
+                )
+                .context("failed to build prompt prefix batch")?;
+        }
+        context
+            .decode(&mut batch)
+            .context("failed to decode prompt prefix")?;
+        match context.state_seq_get(0, LlamaStateSeqFlags::empty()) {
+            Ok(state) => {
+                cache.retain(|cached| cached.non_causal != non_causal);
+                cache.push(CachedPrefix {
+                    text: prefix.text.clone(),
+                    positions,
+                    non_causal,
+                    state,
+                });
+                let excess = cache.len().saturating_sub(PREFIX_CACHE_SLOTS);
+                cache.drain(..excess);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "prompt prefix could not be kept for the next call");
+            }
+        }
+        tracing::info!(
+            prefix_tokens = prefix.tokens.len(),
+            secs = start.elapsed().as_secs_f32(),
+            cached = false,
+            "prompt prefix ready"
+        );
+        Ok(positions)
+    }
+
     fn prepare_prompt(
         &self,
         input: &Input<'_>,
@@ -359,6 +511,7 @@ impl Model {
                 prompt_tokens,
                 batch_tokens: prompt_tokens,
                 non_causal: false,
+                prefix: None,
             });
         };
 
@@ -421,6 +574,7 @@ impl Model {
             prompt_tokens,
             batch_tokens,
             non_causal: mtmd.decode_use_non_causal(),
+            prefix: None,
         })
     }
 
@@ -432,37 +586,72 @@ impl Model {
         sampler: &mut LlamaSampler,
         n_batch: u32,
     ) -> Result<(LlamaToken, i32)> {
+        let past = match &prepared.prefix {
+            Some(prefix) => self.load_prefix(prefix, prepared.non_causal, context)?,
+            None => 0,
+        };
         match &prepared.kind {
             PreparedPromptKind::Text(tokens) => {
                 let mut batch = LlamaBatch::new(tokens.len(), 1);
-                batch
-                    .add_sequence(tokens, 0, false)
-                    .context("failed to build prompt batch")?;
+                if past == 0 {
+                    batch
+                        .add_sequence(tokens, 0, false)
+                        .context("failed to build prompt batch")?;
+                } else {
+                    for (index, token) in tokens.iter().enumerate() {
+                        batch
+                            .add(
+                                *token,
+                                past.checked_add(
+                                    i32::try_from(index).context("prompt position exceeds i32")?,
+                                )
+                                .context("prompt position exceeds i32")?,
+                                &[0],
+                                index + 1 == tokens.len(),
+                            )
+                            .context("failed to build prompt batch")?;
+                    }
+                }
                 if self.model.has_encoder() {
                     context
                         .encode(&mut batch)
                         .context("failed to encode prompt batch")?;
                     self.start_decoder(context, sampler)
                 } else {
+                    let start = Instant::now();
                     context
                         .decode(&mut batch)
                         .context("failed to decode prompt batch")?;
-                    let position = i32::try_from(tokens.len()).context("prompt is too long")?;
+                    tracing::info!(
+                        tokens = tokens.len(),
+                        secs = start.elapsed().as_secs_f32(),
+                        "prompt text read"
+                    );
+                    let position = past
+                        .checked_add(i32::try_from(tokens.len()).context("prompt is too long")?)
+                        .context("prompt is too long")?;
                     Ok((sampler.sample(context, -1), position))
                 }
             }
             PreparedPromptKind::Multimodal { chunks, .. } => {
                 let mtmd = mtmd.context("multimodal prompt requires an MTMD projector")?;
+                let start = Instant::now();
                 let past = chunks
                     .eval_chunks(
                         mtmd,
                         context,
-                        0,
+                        past,
                         0,
                         i32::try_from(n_batch).context("batch size exceeds i32")?,
                         true,
                     )
                     .context("failed to evaluate multimodal prompt")?;
+                // The images (encoding them is the slow part on a CPU) and the text around them.
+                tracing::info!(
+                    tokens = chunks.total_tokens(),
+                    secs = start.elapsed().as_secs_f32(),
+                    "prompt images and text read"
+                );
                 if self.model.has_encoder() {
                     self.start_decoder(context, sampler)
                 } else {
@@ -587,6 +776,7 @@ struct PreparedPrompt {
     prompt_tokens: usize,
     batch_tokens: usize,
     non_causal: bool,
+    prefix: Option<PromptPrefix>,
 }
 
 enum PreparedPromptKind {
