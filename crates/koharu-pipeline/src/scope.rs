@@ -143,6 +143,10 @@ impl NormalizedScope {
         &self.pages
     }
 
+    pub(crate) fn shared_pages(&self) -> Arc<[EntityId]> {
+        Arc::clone(&self.pages)
+    }
+
     pub(crate) fn entities(&self) -> Option<Arc<BTreeSet<EntityId>>> {
         self.entities.clone()
     }
