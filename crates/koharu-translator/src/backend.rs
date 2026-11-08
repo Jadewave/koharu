@@ -91,17 +91,12 @@ impl TranslationRequest {
         subset
     }
 
-    /// Whether the model writes a `speaker` (who speaks to whom, and the pronoun pair) before
-    /// each translation. Only requests built for the local model with page images ask for it,
-    /// and only when the target is Vietnamese, the language that needs a pronoun pair.
-    pub(crate) fn wants_speaker(&self) -> bool {
-        self.target_language == Language::Vietnamese && !self.segment_pages.is_empty()
-    }
 
     /// Drops every image: retries are text only because encoding images on a CPU is slow.
     pub(crate) fn drop_images(&mut self) {
         self.image = None;
         self.page_images.clear();
+        self.segment_pages.clear();
     }
 
     #[cfg(test)]
@@ -178,11 +173,11 @@ pub(crate) fn encode_image(image: &DynamicImage) -> anyhow::Result<EncodedImage>
     })
 }
 
-/// One entry of the glossary built while translating: a name, a recurring term, a
-/// character profile, or how one character addresses another. It is replayed to every model that translates later pages.
+/// One entry of the work glossary: a stable name, a recurring term, or an evidenced style note.
+/// Entries are scoped to one project and target language.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GlossaryEntry {
-    /// `style`, `address`, `character`, `name` or `term`.
+    /// `style`, `name`, or `term`.
     pub kind: String,
     pub source: String,
     pub target: String,
@@ -203,4 +198,4 @@ impl TranslationContext {
             translation: translation.into(),
         }
     }
-            }
+    }
