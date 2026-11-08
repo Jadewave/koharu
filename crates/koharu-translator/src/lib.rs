@@ -34,22 +34,16 @@ pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
 pub use provider::{Provider, ProviderConfig, ProvidersConfig};
 
-/// The model that writes the glossary (names, terms, character profiles) every other model follows.
-const GLOSSARY_MODEL: &str = "gemma4-26b-a4b-uncensored";
-
 /// How many recent translated lines are replayed as context for the next page, so
 /// pronouns, names and tone stay the same from page to page.
 const MEMORY_PAIRS: usize = 10;
 /// Each remembered line is cut to this many characters to keep the prompt short.
 const MEMORY_SEGMENT_CHARS: usize = 80;
-/// Remembered lines are dropped after this long without a translation (a new chapter).
-const MEMORY_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// The glossary is written once per run, after OCR has read every page and before the first
-/// page is translated. The glossary model reads this many source lines at a time...
+/// The work glossary is prepared after OCR and before page translation. The selected model
+/// reads this many source lines at a time...
 const GLOSSARY_CHUNK_LINES: usize = 40;
-/// ...in at most this many reads. This only guards against a runaway work: the whole work is
-/// read unless it has more lines than `GLOSSARY_CHUNK_LINES * GLOSSARY_MAX_CHUNKS`.
+/// ...in at most this many reads. This bounds preprocessing for very long illustrated works.
 const GLOSSARY_MAX_CHUNKS: usize = 200;
 /// Entries kept in the glossary; the oldest are dropped first.
 const GLOSSARY_MAX_ENTRIES: usize = 600;
@@ -59,21 +53,12 @@ const GLOSSARY_LINE_CHARS: usize = 120;
 /// The glossary is complete, but a page is translated with only the entries that matter to
 /// it: at most this many, most useful kinds first.
 const GLOSSARY_BLOCK_MAX_ENTRIES: usize = 50;
-/// Character profiles carry the ages and relationships that decide how people address each
-/// other, so every page gets them, not only the pages that happen to repeat a name. At most
-/// this many.
-const GLOSSARY_CHARACTER_MAX_ENTRIES: usize = 16;
-/// The pronoun pairs chosen so far go to every page, so a pair the model decided on one page
-/// is used on all the others. At most this many.
-const GLOSSARY_ADDRESS_MAX_ENTRIES: usize = 24;
-/// Asked of the model when a translation opened with a subject its source line does not have.
-const NO_SUBJECT_NOTE: &str = "Strict retry: each of these lines was translated before with a subject (a pronoun or a name) that the source line does not contain. Translate them again and start no line with a pronoun or a name unless the source line itself contains that subject or form of address. Keep the speaker and the pronoun pair of every line as decided before.";
-/// Source text of this many previous pages also counts when picking a page's entries, so
-/// characters who are only implied on the page keep their pronouns.
+/// Source text of recent pages also counts when selecting names and recurring terms, so
+/// references that continue across page boundaries can still receive their glossary entries.
 const MEMORY_PAGES: usize = 3;
 const MEMORY_PAGE_CHARS: usize = 4500;
 
-/// Names, terms and address pairs decided by the glossary model for one work.
+/// Stable names, recurring terms, and a limited work-level style note for one illustrated work.
 #[derive(Default)]
 struct Glossary {
     language: Option<Language>,
@@ -82,8 +67,8 @@ struct Glossary {
 }
 
 impl Glossary {
-    /// Starts over for another work or another target language; the same work keeps what it
-    /// has, so a later run extends the glossary instead of rebuilding it.
+    /// Starts or continues a work-specific glossary. A different work or target language gets
+    /// a clean glossary; the same work can extend the entries it has already collected.
     fn begin(&mut self, project: &str, language: Language) {
         if self.language != Some(language) || self.project.as_deref() != Some(project) {
             self.entries.clear();
@@ -92,15 +77,14 @@ impl Glossary {
         self.project = Some(project.to_owned());
     }
 
-    /// Adds entries that are not known yet. Existing entries win, so a rendering never
-    /// flips once it has been chosen.
+    /// Adds only supported glossary types. The first stable rendering wins so a name or term
+    /// does not fluctuate from chunk to chunk.
     fn merge(&mut self, entries: Vec<GlossaryEntry>) {
         for entry in entries.into_iter().filter_map(clean_entry) {
             let source = entry.source.to_lowercase();
-            let known = self
-                .entries
-                .iter()
-                .any(|known| known.kind == entry.kind && known.source.to_lowercase() == source);
+            let known = self.entries.iter().any(|known| {
+                known.kind == entry.kind && known.source.to_lowercase() == source
+            });
             if !known {
                 self.entries.push(entry);
             }
@@ -110,12 +94,10 @@ impl Glossary {
     }
 }
 
-/// `style` entries always apply; the others are ordered by how much they help a page.
-const GLOSSARY_KINDS: [&str; 5] = ["style", "address", "character", "name", "term"];
+/// `style` entries always apply; names and terms are selected by their source text.
+const GLOSSARY_KINDS: [&str; 3] = ["style", "name", "term"];
 
-/// The entries that matter to a page, most useful kinds first: those whose source text
-/// appears in `corpus`, plus every `style`, `character` and `address` entry (a pair the model
-/// chose earlier applies to the next pages even when neither name is spoken on them).
+/// Selects entries relevant to this page, keeping the whole glossary out of each prompt.
 fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntry> {
     let corpus = corpus.to_lowercase();
     let mentioned = |text: &str| {
@@ -125,22 +107,11 @@ fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntr
     let mut selected: Vec<&GlossaryEntry> = entries
         .iter()
         .filter(|entry| match entry.kind.as_str() {
-            "style" | "character" | "address" => true,
-            _ => mentioned(&entry.source),
+            "style" => true,
+            "name" | "term" => mentioned(&entry.source),
+            _ => false,
         })
         .collect();
-    let (mut characters, mut addresses) = (0, 0);
-    selected.retain(|entry| match entry.kind.as_str() {
-        "character" => {
-            characters += 1;
-            characters <= GLOSSARY_CHARACTER_MAX_ENTRIES
-        }
-        "address" => {
-            addresses += 1;
-            addresses <= GLOSSARY_ADDRESS_MAX_ENTRIES
-        }
-        _ => true,
-    });
     selected.sort_by_key(|entry| {
         GLOSSARY_KINDS
             .iter()
@@ -153,11 +124,9 @@ fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntr
 
 fn clean_entry(entry: GlossaryEntry) -> Option<GlossaryEntry> {
     let kind = entry.kind.trim().to_lowercase();
-    let kind = if GLOSSARY_KINDS.contains(&kind.as_str()) {
-        kind
-    } else {
-        "term".to_owned()
-    };
+    if !GLOSSARY_KINDS.contains(&kind.as_str()) {
+        return None;
+    }
     let source: String = entry.source.trim().chars().take(GLOSSARY_FIELD_CHARS).collect();
     let target: String = entry.target.trim().chars().take(GLOSSARY_FIELD_CHARS).collect();
     (!source.is_empty() && !target.is_empty()).then_some(GlossaryEntry {
@@ -196,43 +165,32 @@ fn glossary_chunks(lines: &[String]) -> Vec<&[String]> {
         .collect()
 }
 
-/// The character profiles for the address pass: one per distinct profile, so a character the
-/// lines name in several ways is not counted twice, and no more than a page carries.
-fn distinct_characters(entries: &[GlossaryEntry]) -> Vec<GlossaryEntry> {
-    let mut seen = std::collections::HashSet::new();
-    entries
-        .iter()
-        .filter(|entry| entry.kind == "character" && seen.insert(entry.target.clone()))
-        .take(GLOSSARY_CHARACTER_MAX_ENTRIES)
-        .cloned()
-        .collect()
-}
-
-fn glossary_selection() -> ModelSelection {
-    ModelSelection {
-        provider: Provider::Local,
-        model: Some(GLOSSARY_MODEL.to_owned()),
-        quantization: None,
-        vision: false,
-        reasoning: false,
-    }
-}
-
 struct TranslationMemory {
+    project: Option<String>,
     language: Option<Language>,
     recent: VecDeque<TranslationContext>,
-    /// Source text of the last few pages, to pick the glossary entries of implied characters.
+    /// Source text of the last few pages, to preserve local narrative continuity.
     recent_pages: VecDeque<String>,
-    updated: Instant,
+}
+
+impl TranslationMemory {
+    fn begin(&mut self, project: &str, language: Language) {
+        if self.project.as_deref() != Some(project) || self.language != Some(language) {
+            self.recent.clear();
+            self.recent_pages.clear();
+        }
+        self.project = Some(project.to_owned());
+        self.language = Some(language);
+    }
 }
 
 impl Default for TranslationMemory {
     fn default() -> Self {
         Self {
+            project: None,
             language: None,
             recent: VecDeque::new(),
             recent_pages: VecDeque::new(),
-            updated: Instant::now(),
         }
     }
 }
@@ -241,8 +199,6 @@ impl Default for TranslationMemory {
 pub struct Translator {
     providers: koharu_config::Config<ProvidersConfig>,
     local: Arc<tokio::sync::Mutex<Option<LoadedLocal>>>,
-    /// Holds the glossary model while another model translates, so neither evicts the other.
-    glossary_model: Arc<tokio::sync::Mutex<Option<LoadedLocal>>>,
     memory: Arc<std::sync::Mutex<TranslationMemory>>,
     glossary: Arc<std::sync::Mutex<Glossary>>,
     client: reqwest::Client,
@@ -269,7 +225,6 @@ impl Translator {
         Ok(Self {
             providers,
             local: Arc::new(tokio::sync::Mutex::new(None)),
-            glossary_model: Arc::new(tokio::sync::Mutex::new(None)),
             memory: Arc::new(std::sync::Mutex::new(TranslationMemory::default())),
             glossary: Arc::new(std::sync::Mutex::new(Glossary::default())),
             client: koharu_runtime::http_client()?,
@@ -304,17 +259,10 @@ impl Translator {
     }
 
     pub fn unload(&self) -> bool {
-        let fallback = self
-            .glossary_model
+        self.local
             .try_lock()
             .map(|mut loaded| loaded.take().is_some())
-            .unwrap_or(false);
-        let main = self
-            .local
-            .try_lock()
-            .map(|mut loaded| loaded.take().is_some())
-            .unwrap_or(false);
-        main || fallback
+            .unwrap_or(false)
     }
 
     #[tracing::instrument(skip_all)]
@@ -419,133 +367,13 @@ impl Translator {
             }
             .into());
         }
-        let translated = if request.target_language == Language::Vietnamese {
-            self.without_invented_subjects(selection, generation, &request, translated)
-                .await
-        } else {
-            translated
-        };
         self.remember(request.target_language, &request.segments, &translated);
         tracing::Span::current().record("outcome", "completed");
         Ok((provider_id, translated))
     }
 
-    /// Keeps the pronoun pairs the model wrote for the speakers of a page as address entries,
-    /// so the next pages receive them. A pair chosen first is never replaced, the way every
-    /// glossary entry stays as it was first decided.
-    fn keep_pairs(&self, language: Language, speakers: Vec<String>) {
-        let pairs: Vec<GlossaryEntry> = speakers
-            .iter()
-            .filter_map(|speaker| prompt::address_pair(speaker))
-            .collect();
-        if pairs.is_empty() {
-            return;
-        }
-        let Ok(mut glossary) = self.glossary.lock() else {
-            return;
-        };
-        if glossary.language != Some(language) {
-            return;
-        }
-        let before = glossary.entries.len();
-        glossary.merge(pairs);
-        for entry in glossary.entries.iter().skip(before) {
-            tracing::info!(
-                parent: None,
-                pair = %entry.source,
-                pronouns = %entry.target,
-                "pronoun pair chosen"
-            );
-        }
-    }
 
-    /// The names of the glossary: a line that holds one of them may rightly start with it.
-    fn glossary_names(&self) -> Vec<String> {
-        self.glossary
-            .lock()
-            .map(|glossary| {
-                glossary
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.kind == "name" || entry.kind == "character")
-                    .map(|entry| entry.source.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Translates again the lines that open with a subject their source does not have, with
-    /// the rule spelled out. A line that still has one afterwards keeps the new translation
-    /// and is reported.
-    async fn without_invented_subjects(
-        &self,
-        selection: &ModelSelection,
-        generation: GenerationConfig,
-        request: &TranslationRequest,
-        mut translated: Vec<String>,
-    ) -> Vec<String> {
-        let names = self.glossary_names();
-        let flagged: Vec<usize> = (0..translated.len())
-            .filter(|&index| {
-                loop_guard::needs_translation(&request.segments[index])
-                    && prompt::invented_subject(
-                        &request.segments[index],
-                        &translated[index],
-                        &names,
-                    )
-            })
-            .collect();
-        if flagged.is_empty() {
-            return translated;
-        }
-        tracing::warn!(
-            count = flagged.len(),
-            sources = ?preview(&request.segments, &flagged),
-            "translations open with a subject the source does not have; translating them again"
-        );
-        let mut retry = request.select(&flagged);
-        if selection.provider == Provider::Local {
-            retry.drop_images();
-        }
-        retry.instructions = Some(match retry.instructions.take() {
-            Some(instructions) if !instructions.trim().is_empty() => {
-                format!("{instructions}\n\n{NO_SUBJECT_NOTE}")
-            }
-            _ => NO_SUBJECT_NOTE.to_owned(),
-        });
-        match self.translate_segments(selection, generation, &retry).await {
-            Ok(retried) if retried.len() == flagged.len() => {
-                for (&index, text) in flagged.iter().zip(retried) {
-                    translated[index] = text;
-                }
-                let still: Vec<usize> = flagged
-                    .iter()
-                    .copied()
-                    .filter(|&index| {
-                        prompt::invented_subject(
-                            &request.segments[index],
-                            &translated[index],
-                            &names,
-                        )
-                    })
-                    .collect();
-                if !still.is_empty() {
-                    tracing::warn!(
-                        count = still.len(),
-                        sources = ?preview(&request.segments, &still),
-                        "lines still open with a subject the source does not have"
-                    );
-                }
-            }
-            Ok(_) => tracing::warn!("the second pass returned the wrong number of lines; keeping the first"),
-            Err(error) => tracing::warn!(%error, "the second pass failed; keeping the first translation"),
-        }
-        translated
-    }
-
-    /// The part of the glossary that matters to this page, as a prompt block. The glossary
-    /// holds everything decided for the work; a page only carries the entries about the
-    /// names, terms and characters on it (or on the pages just before it).
+    /// The relevant part of this work's glossary, filtered against this page and recent context.
     fn glossary_block(&self, language: Language, segments: &[String]) -> Option<String> {
         let glossary = self.glossary.lock().ok()?;
         if glossary.language != Some(language) || glossary.entries.is_empty() {
@@ -565,9 +393,8 @@ impl Translator {
         Some(prompt::render_glossary(&selected))
     }
 
-    /// Writes the glossary of a work from the OCR text of all its pages: the glossary model
-    /// reads the lines in chunks and decides the renderings of names and terms and the address pairs, then it is released so the translation model can take its place. Only local
-    /// models write glossaries; any other provider translates without one.
+    /// Builds a work-specific glossary from OCR before page translation. It uses the same
+    /// selected local model as translation; it does not silently load a different hard-coded model.
     ///
     /// A failure leaves the glossary as it was and is reported to the caller, which is
     /// expected to translate anyway.
@@ -583,6 +410,9 @@ impl Translator {
         if let Ok(mut glossary) = self.glossary.lock() {
             glossary.begin(project, language);
         }
+        if let Ok(mut memory) = self.memory.lock() {
+            memory.begin(project, language);
+        }
         if selection.provider != Provider::Local {
             return Ok(());
         }
@@ -591,18 +421,10 @@ impl Translator {
             return Ok(());
         }
         let generation = generation.for_model(selection);
-        let shared = selection.model.as_deref() == Some(GLOSSARY_MODEL);
-        if !shared {
-            // Make room: the translation model is loaded again once the glossary is done.
-            *self.local.lock().await = None;
-        }
         let started = Instant::now();
         let result = self
-            .write_glossary(selection, shared, generation, language, &lines, &stop)
+            .write_glossary(selection, generation, language, &lines, &stop)
             .await;
-        if !shared {
-            *self.glossary_model.lock().await = None;
-        }
         let entries = self
             .glossary
             .lock()
@@ -634,19 +456,12 @@ impl Translator {
     async fn write_glossary(
         &self,
         selection: &ModelSelection,
-        shared: bool,
         generation: GenerationConfig,
         language: Language,
         lines: &[String],
         stop: &(impl Fn() -> bool + Send + Sync),
     ) -> anyhow::Result<()> {
-        let loaded = if shared {
-            self.local(selection).await
-        } else {
-            self.load_into(&self.glossary_model, &glossary_selection())
-                .await
-        };
-        let translator = loaded?;
+        let translator = self.local(selection).await?;
         for chunk in glossary_chunks(lines) {
             if stop() {
                 break;
@@ -668,37 +483,15 @@ impl Translator {
                 Err(error) => tracing::warn!(%error, "glossary chunk failed; continuing"),
             }
         }
-        // A line of OCR text does not say who speaks it, so the pairs are decided from the
-        // character profiles the chunks wrote, once the whole work has been read.
-        if prompt::PROFILES && prompt::decides_address(language) && !stop() {
-            let characters = self
-                .glossary
-                .lock()
-                .map(|glossary| distinct_characters(&glossary.entries))
-                .unwrap_or_default();
-            if characters.len() >= 2 {
-                match translator
-                    .extract_addresses(language, &characters, generation)
-                    .await
-                {
-                    Ok(entries) => {
-                        if let Ok(mut glossary) = self.glossary.lock() {
-                            glossary.merge(entries);
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "address pass failed; continuing"),
-                }
-            }
-        }
         Ok(())
     }
 
-    /// Lines remembered from the previous pages, if they are still fresh.
+    /// Recent source/translation pairs for the currently selected work and target language.
     fn recall(&self, language: Language) -> Vec<TranslationContext> {
         let Ok(mut memory) = self.memory.lock() else {
             return Vec::new();
         };
-        if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
+        if memory.language != Some(language) || memory.project.is_none() {
             memory.recent.clear();
             memory.recent_pages.clear();
             return Vec::new();
@@ -711,7 +504,10 @@ impl Translator {
         let Ok(mut memory) = self.memory.lock() else {
             return;
         };
-        if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
+        if memory.project.is_none() {
+            return;
+        }
+        if memory.language != Some(language) {
             memory.recent.clear();
             memory.recent_pages.clear();
         }
@@ -744,16 +540,19 @@ impl Translator {
         while memory.recent_pages.len() > MEMORY_PAGES {
             memory.recent_pages.pop_front();
         }
-        memory.updated = Instant::now();
     }
 
     /// Forgets the remembered lines and the glossary, e.g. when another work begins.
     pub fn forget(&self) {
         if let Ok(mut memory) = self.memory.lock() {
+            memory.project = None;
+            memory.language = None;
             memory.recent.clear();
             memory.recent_pages.clear();
         }
         if let Ok(mut glossary) = self.glossary.lock() {
+            glossary.project = None;
+            glossary.language = None;
             glossary.entries.clear();
         }
     }
@@ -917,10 +716,10 @@ impl Translator {
         request: &TranslationRequest,
     ) -> anyhow::Result<Vec<String>> {
         if selection.provider == Provider::Local {
-            let local = self.local(selection).await?;
-            let translated = local.translate(request.clone(), generation).await?;
-            self.keep_pairs(request.target_language, local.take_speakers());
-            Ok(translated)
+            self.local(selection)
+                .await?
+                .translate(request.clone(), generation)
+                .await
         } else {
             let providers = self.providers.read()?.clone();
             Ok(remote::translate(&self.client, &providers, selection, &generation, request).await?)
@@ -1009,115 +808,77 @@ fn retryable(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn glossary_keeps_the_first_rendering_and_caps_its_size() {
-        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
+    fn entry(kind: &str, source: &str, target: &str) -> GlossaryEntry {
+        GlossaryEntry {
             kind: kind.to_owned(),
             source: source.to_owned(),
             target: target.to_owned(),
-        };
+        }
+    }
+
+    #[test]
+    fn glossary_keeps_first_name_and_term_renderings_and_caps_size() {
         let mut glossary = Glossary::default();
         glossary.merge(vec![
-            entry("name", "田中", "Tanaka"),
-            entry("bogus", "霊力", "linh lực"),
-            entry("character", "田中", "nam, 17 tuổi, hay nói thân mật"),
+            entry("name", "CHAR_A", "Character A"),
+            entry("term", "TERM_X", "term X"),
+            entry("address", "CHAR_A -> CHAR_B", "tớ - cậu"),
+            entry("unknown", "OTHER", "other"),
         ]);
-        glossary.merge(vec![entry("name", "田中", "Tanaca"), entry("name", "", "x")]);
-        assert_eq!(glossary.entries.len(), 3);
-        assert_eq!(glossary.entries[0].target, "Tanaka");
-        assert_eq!(glossary.entries[1].kind, "term");
+        glossary.merge(vec![
+            entry("name", "CHAR_A", "Character A changed"),
+            entry("name", "", "empty"),
+        ]);
+        assert_eq!(glossary.entries.len(), 2);
+        assert_eq!(glossary.entries[0].target, "Character A");
+        assert_eq!(glossary.entries[1].target, "term X");
 
-        let extra = GLOSSARY_MAX_ENTRIES + 20;
-        let many: Vec<GlossaryEntry> = (0..extra)
-            .map(|index| entry("name", &format!("n{index}"), "x"))
+        let extra: Vec<GlossaryEntry> = (0..GLOSSARY_MAX_ENTRIES + 20)
+            .map(|index| entry("name", &format!("n{index}"), "name"))
             .collect();
-        glossary.merge(many);
+        glossary.merge(extra);
         assert_eq!(glossary.entries.len(), GLOSSARY_MAX_ENTRIES);
-        let last = format!("n{}", extra - 1);
-        assert_eq!(glossary.entries.last().map(|e| e.source.as_str()), Some(last.as_str()));
+        assert_eq!(glossary.entries.last().unwrap().source, "n619");
     }
 
     #[test]
-    fn a_page_only_carries_the_entries_that_matter_to_it() {
-        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
-            kind: kind.to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-        };
+    fn a_page_receives_only_relevant_names_and_terms_plus_style() {
         let entries = vec![
-            entry("term", "霊力", "linh lực"),
-            entry("name", "田中", "Tanaka"),
-            entry("name", "鈴木", "Suzuki"),
-            entry("character", "鈴木", "nữ, 16 tuổi, lịch sự"),
-            entry("style", "work", "học đường, thân mật"),
-            entry("address", "田中 -> 鈴木", "tớ - cậu"),
-            entry("address", "山田 → 佐藤", "anh - em"),
+            entry("term", "TERM_X", "term X"),
+            entry("name", "CHAR_A", "Character A"),
+            entry("name", "CHAR_B", "Character B"),
+            entry("style", "work", "evidence-based style note"),
         ];
-        let selected = relevant_entries(&entries, "田中: おはよう\n霊力が足りない");
+        let selected = relevant_entries(&entries, "CHAR_A uses TERM_X");
         let kinds: Vec<&str> = selected.iter().map(|e| e.kind.as_str()).collect();
-        // Character profiles and address pairs apply to every page, even when the names are
-        // not on it.
-        assert_eq!(
-            kinds,
-            ["style", "address", "address", "character", "name", "term"]
-        );
-        assert!(relevant_entries(&entries, "").iter().all(|entry| {
-            matches!(entry.kind.as_str(), "style" | "character" | "address")
-        }));
+        assert_eq!(kinds, ["style", "name", "term"]);
+        assert!(!selected.iter().any(|e| e.source == "CHAR_B"));
     }
 
     #[test]
-    fn a_character_named_in_several_ways_is_counted_once_for_the_address_pass() {
-        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
-            kind: kind.to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-        };
-        let entries = vec![
-            entry("character", "りお", "Nữ, 27 tuổi"),
-            entry("character", "りおさん", "Nữ, 27 tuổi"),
-            entry("name", "りお", "Rio"),
-            entry("character", "常連さん", "Nam, 56 tuổi"),
-        ];
-        let characters = distinct_characters(&entries);
-        let names: Vec<&str> = characters.iter().map(|entry| entry.source.as_str()).collect();
-        assert_eq!(names, ["りお", "常連さん"]);
-    }
-
-    #[test]
-    fn an_address_pair_keeps_its_first_wording() {
-        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
-            kind: kind.to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-        };
-        let mut glossary = Glossary::default();
-        glossary.merge(vec![
-            entry("address", "田中 -> 鈴木", "tớ - cậu"),
-            entry("address", "田中 -> 鈴木", "anh - em"),
-        ]);
-        assert_eq!(glossary.entries, [entry("address", "田中 -> 鈴木", "tớ - cậu")]);
+    fn glossary_ignores_untrusted_or_unsupported_entry_kinds() {
+        assert!(clean_entry(entry("address", "A -> B", "tớ - cậu")).is_none());
+        assert!(clean_entry(entry("character", "A", "profile")).is_none());
+        assert!(clean_entry(entry("name", "A", "Alpha")).is_some());
     }
 
     #[test]
     fn glossary_lines_are_cleaned_and_deduplicated() {
         let lines = vec![
-            "おはよう".to_owned(),
+            "hello there".to_owned(),
             "…".to_owned(),
-            " おはよう ".to_owned(),
-            "やあ".to_owned(),
+            " hello there ".to_owned(),
+            "another line".to_owned(),
         ];
-        assert_eq!(prepare_glossary_lines(lines), ["おはよう", "やあ"]);
+        assert_eq!(prepare_glossary_lines(lines), ["hello there", "another line"]);
     }
 
     #[test]
     fn long_works_are_sampled_in_a_bounded_number_of_chunks() {
         let short: Vec<String> = (0..100).map(|index| format!("line {index}")).collect();
         assert_eq!(glossary_chunks(&short).len(), 3);
-
         let work: Vec<String> = (0..2000).map(|index| format!("line {index}")).collect();
         assert_eq!(glossary_chunks(&work).len(), 50);
-
         let long: Vec<String> = (0..GLOSSARY_CHUNK_LINES * GLOSSARY_MAX_CHUNKS * 2)
             .map(|index| format!("line {index}"))
             .collect();
@@ -1128,19 +889,35 @@ mod tests {
     }
 
     #[test]
-    fn a_glossary_belongs_to_one_work_and_language() {
-        let entry = GlossaryEntry {
-            kind: "name".to_owned(),
-            source: "田中".to_owned(),
-            target: "Tanaka".to_owned(),
-        };
+    fn glossary_is_isolated_by_work_and_target_language() {
         let mut glossary = Glossary::default();
         glossary.begin("project-a", Language::Vietnamese);
-        glossary.merge(vec![entry]);
+        glossary.merge(vec![entry("name", "CHAR_A", "Character A")]);
         glossary.begin("project-a", Language::Vietnamese);
         assert_eq!(glossary.entries.len(), 1);
         glossary.begin("project-b", Language::Vietnamese);
         assert!(glossary.entries.is_empty());
+        glossary.merge(vec![entry("name", "CHAR_B", "Character B")]);
+        glossary.begin("project-b", Language::English);
+        assert!(glossary.entries.is_empty());
+    }
+
+    #[test]
+    fn translation_memory_is_isolated_by_work_and_language() {
+        let mut memory = TranslationMemory::default();
+        memory.begin("comic-a", Language::Vietnamese);
+        memory.recent.push_back(TranslationContext {
+            source: "hello".to_owned(),
+            translation: "xin chào".to_owned(),
+        });
+        memory.begin("comic-b", Language::Vietnamese);
+        assert!(memory.recent.is_empty());
+        memory.recent.push_back(TranslationContext {
+            source: "bonjour".to_owned(),
+            translation: "xin chào".to_owned(),
+        });
+        memory.begin("comic-b", Language::English);
+        assert!(memory.recent.is_empty());
     }
 
     #[test]
@@ -1151,7 +928,6 @@ mod tests {
         let error = anyhow::Error::from(Error::Other(failure));
         assert!(invalid_output(&error).is_some());
         assert!(retryable(&error));
-
         let quota = anyhow::Error::from(Error::QuotaExceeded { provider: "test" });
         assert!(invalid_output(&quota).is_none());
         assert!(!retryable(&quota));
@@ -1171,24 +947,15 @@ mod tests {
     fn local_vision_requires_capability_and_generation_setting() {
         assert!(Translator::supports_vision(
             &local_selection("gemma4-e2b-it"),
-            &GenerationConfig {
-                vision: Some(true),
-                ..GenerationConfig::default()
-            }
+            &GenerationConfig { vision: Some(true), ..GenerationConfig::default() }
         ));
         assert!(!Translator::supports_vision(
             &local_selection("gemma4-e2b-it"),
-            &GenerationConfig {
-                vision: Some(false),
-                ..GenerationConfig::default()
-            }
+            &GenerationConfig { vision: Some(false), ..GenerationConfig::default() }
         ));
         assert!(!Translator::supports_vision(
             &local_selection("lfm2.5-1.2b-instruct"),
-            &GenerationConfig {
-                vision: Some(true),
-                ..GenerationConfig::default()
-            }
+            &GenerationConfig { vision: Some(true), ..GenerationConfig::default() }
         ));
     }
 }
