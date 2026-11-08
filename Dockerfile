@@ -21,24 +21,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable
 
-ARG BUN_VERSION=1.4.4
-
-RUN set -eux; \
-    for attempt in 1 2 3 4 5; do \
-        if curl -fL --retry 3 --retry-all-errors --retry-delay 2 \
-            https://bun.com/install -o /tmp/bun-install.sh \
-            && bash /tmp/bun-install.sh "bun-v${BUN_VERSION}"; then \
-            break; \
-        fi; \
-        if [ "$attempt" -eq 5 ]; then \
-            echo "ERROR: Cannot install Bun after 5 attempts"; \
-            exit 1; \
-        fi; \
-        sleep $((attempt * 5)); \
-    done; \
-    ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun; \
-    bun --version; \
-    rm -f /tmp/bun-install.sh
+RUN curl -fsSL https://bun.sh/install | bash
 
 WORKDIR /src
 COPY . .
