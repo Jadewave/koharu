@@ -18,8 +18,10 @@ use super::{StageInput, StageProcessor, finish, generation};
 
 const PRODUCER: &str = "dev.koharu.pipeline.translation";
 
-/// Maximum consecutive pages sent together to a local vision model. Kept at one page to
-/// bound image encoding and preserve page-level visual context on CPU deployments.
+/// With a local vision model, up to this many consecutive pages can be translated in one
+/// request. It is 1: a page at a time. Three pages took an hour and a half on a CPU and
+/// translated worse; the pronouns the model chooses are kept page to page by the glossary
+/// instead (see `Translator::keep_pairs`).
 const CLUSTER_PAGES: usize = 1;
 /// A request never carries more segments than this, which keeps its output within the limit.
 const CLUSTER_MAX_SEGMENTS: usize = 40;
