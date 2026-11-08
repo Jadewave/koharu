@@ -22,7 +22,8 @@ const MAX_MISSING_RETRIES: u32 = 2;
 
 /// Upper bound for the tokens of one glossary update.
 const GLOSSARY_MAX_TOKENS: usize = 900;
-/// Output tokens reserved per segment for its numeric ID and translated text.
+/// Output tokens kept per segment: its id, a speaker such as `A>B: em - anh`, and the
+/// translated text of a speech bubble.
 const TOKENS_PER_SEGMENT: usize = 60;
 
 /// A page image costs about this many tokens at most. Encoding the image is the slowest part
@@ -84,7 +85,6 @@ impl LocalTranslator {
             llm: Arc::new(llm),
         })
     }
-
 
     pub(crate) async fn translate(
         &self,
@@ -161,11 +161,11 @@ impl LocalTranslator {
             request.page_images.clone()
         };
         let (prompt, shared_prefix) = self.render_prompt(request, reasoning)?;
-        let schema = prompt::output_schema(request.segments.len());
+        let schema = prompt::request_schema(request);
         let llm = Arc::clone(&self.llm);
         let mut options = options.clone();
-        // Each segment needs room for its id and text, so larger requests are not cut off
-        // by the normal single-page output limit.
+        // Each segment needs room for its id, its speaker and its text, so a request with
+        // many segments (several pages) must not be cut off by the single page limit.
         options.max_tokens = options
             .max_tokens
             .max(request.segments.len() * TOKENS_PER_SEGMENT + 64);
@@ -188,7 +188,21 @@ impl LocalTranslator {
             reasoning,
             "local generation finished"
         );
+        // Shows the speakers the model decided on; `parent: None` prints it right away.
         tracing::debug!(parent: None, response = %output.text, "local translation response");
+        if request.wants_speaker() {
+            // Only for the log: what the model decided about who speaks to whom. It is not
+            // kept or sent to the next pages, so a wrong guess cannot become a rule.
+            let mut decided: Vec<String> = Vec::new();
+            for speaker in prompt::speakers(&output.text) {
+                if !decided.contains(&speaker) {
+                    decided.push(speaker);
+                }
+            }
+            if !decided.is_empty() {
+                tracing::info!(parent: None, speakers = %decided.join(" | "), "speakers decided for this page");
+            }
+        }
         Ok(prompt::parse_translations(
             "local",
             &output.text,
@@ -237,6 +251,54 @@ impl LocalTranslator {
             "local glossary generation finished"
         );
         Ok(prompt::parse_glossary(&output.text))
+    }
+
+    /// Asks the model how the characters address each other, from their profiles. Text only,
+    /// without reasoning, with a short output. Every entry that comes back is an address pair.
+    pub(crate) async fn extract_addresses(
+        &self,
+        target: Language,
+        characters: &[GlossaryEntry],
+        generation: GenerationConfig,
+    ) -> Result<Vec<GlossaryEntry>> {
+        let (system, user) = prompt::address_prompts(target, characters)?;
+        let prompt = self
+            .llm
+            .render_chat_prompt_with_options(
+                &[ChatMessage::system(system), ChatMessage::user(user)],
+                ChatTemplateOptions {
+                    add_generation_prompt: true,
+                    enable_thinking: false,
+                },
+            )
+            .context("failed to render local address prompt")?;
+        let mut options = self.descriptor.generation.options(GenerationConfig {
+            reasoning: Some(false),
+            ..generation
+        });
+        options.max_tokens = GLOSSARY_MAX_TOKENS;
+        let schema = prompt::glossary_schema();
+        let llm = Arc::clone(&self.llm);
+        let output = tokio_rayon::spawn(move || {
+            let input = Input::new(&prompt);
+            llm.inference_with_json_schema_callback(&input, &options, &schema, stop_on_loop)
+        })
+        .await?;
+        tracing::info!(
+            prompt_tokens = output.prompt_tokens,
+            prompt_secs = output.prompt_duration.as_secs_f32(),
+            generated_tokens = output.generated_tokens,
+            generation_secs = output.generation_duration.as_secs_f32(),
+            finish = ?output.finish_reason,
+            "local address generation finished"
+        );
+        Ok(prompt::parse_glossary(&output.text)
+            .into_iter()
+            .map(|mut entry| {
+                entry.kind = "address".to_owned();
+                entry
+            })
+            .collect())
     }
 
     /// The chat prompt, and how many of its leading bytes are the instructions that do not
