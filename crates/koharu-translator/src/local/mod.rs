@@ -51,6 +51,9 @@ fn stop_on_loop(chunk: TokenChunk<'_>) -> anyhow::Result<GenerationControl> {
 pub struct LocalTranslator {
     descriptor: LocalModelDescriptor,
     llm: Arc<Llm>,
+    /// The `speaker` the model wrote for each source line of the last pages, by source text.
+    /// `Translator` takes it after a page and decides what to keep (see `address`).
+    speakers: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl LocalTranslator {
@@ -83,7 +86,16 @@ impl LocalTranslator {
         Ok(Self {
             descriptor,
             llm: Arc::new(llm),
+            speakers: std::sync::Mutex::default(),
         })
+    }
+
+    /// The speakers the model wrote since the last call, by source text; empties the record.
+    pub(crate) fn take_speakers(&self) -> std::collections::HashMap<String, String> {
+        self.speakers
+            .lock()
+            .map(|mut seen| std::mem::take(&mut *seen))
+            .unwrap_or_default()
     }
 
     pub(crate) async fn translate(
@@ -191,8 +203,16 @@ impl LocalTranslator {
         // Shows the speakers the model decided on; `parent: None` prints it right away.
         tracing::debug!(parent: None, response = %output.text, "local translation response");
         if request.wants_speaker() {
-            // Only for the log: what the model decided about who speaks to whom. It is not
-            // kept or sent to the next pages, so a wrong guess cannot become a rule.
+            // What the model decided about who speaks to whom. It is logged, and recorded for
+            // `Translator`, which only keeps a pair after the translations confirm it, so a
+            // wrong guess cannot become a rule on its own.
+            if let Ok(mut seen) = self.speakers.lock() {
+                for (id, speaker) in prompt::speaker_entries(&output.text) {
+                    if let Some(source) = request.segments.get(id) {
+                        seen.insert(source.clone(), speaker);
+                    }
+                }
+            }
             let mut decided: Vec<String> = Vec::new();
             for speaker in prompt::speakers(&output.text) {
                 if !decided.contains(&speaker) {
