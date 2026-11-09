@@ -1,5 +1,6 @@
 //! Translation through local and hosted providers.
 
+mod address;
 mod backend;
 mod error;
 mod language;
@@ -243,6 +244,8 @@ pub struct Translator {
     glossary_model: Arc<tokio::sync::Mutex<Option<LoadedLocal>>>,
     memory: Arc<std::sync::Mutex<TranslationMemory>>,
     glossary: Arc<std::sync::Mutex<Glossary>>,
+    /// The pronoun pair of every direction (who speaks to whom) that the translations confirmed.
+    pairs: Arc<std::sync::Mutex<address::PairBook>>,
     client: reqwest::Client,
     device: Device,
 }
@@ -270,6 +273,7 @@ impl Translator {
             glossary_model: Arc::new(tokio::sync::Mutex::new(None)),
             memory: Arc::new(std::sync::Mutex::new(TranslationMemory::default())),
             glossary: Arc::new(std::sync::Mutex::new(Glossary::default())),
+            pairs: Arc::new(std::sync::Mutex::new(address::PairBook::default())),
             client: koharu_runtime::http_client()?,
             device,
         })
@@ -417,6 +421,14 @@ impl Translator {
             }
             .into());
         }
+        let translated = if request.target_language == Language::Vietnamese
+            && selection.provider == Provider::Local
+        {
+            self.with_consistent_pairs(selection, generation, &request, translated)
+                .await
+        } else {
+            translated
+        };
         let translated = if request.target_language == Language::Vietnamese {
             self.without_invented_subjects(selection, generation, &request, translated)
                 .await
@@ -426,6 +438,91 @@ impl Translator {
         self.remember(request.target_language, &request.segments, &translated);
         tracing::Span::current().record("outcome", "completed");
         Ok((provider_id, translated))
+    }
+
+    /// Keeps the pronoun pairs of the work consistent. For every line the model wrote who
+    /// speaks to whom and the pair of pronouns. A line whose pair (or self pronoun) differs from
+    /// the pair of its direction is translated again with that pair spelled out. The pairs the
+    /// final translations show are remembered, and a pair with enough evidence is locked: it
+    /// goes to every later page as a glossary `address` entry.
+    async fn with_consistent_pairs(
+        &self,
+        selection: &ModelSelection,
+        generation: GenerationConfig,
+        request: &TranslationRequest,
+        mut translated: Vec<String>,
+    ) -> Vec<String> {
+        let Ok(local) = self.local(selection).await else {
+            return translated;
+        };
+        let speakers = local.take_speakers();
+        let declare = |speakers: &std::collections::HashMap<String, String>, index: usize| {
+            speakers
+                .get(&request.segments[index])
+                .and_then(|speaker| address::parse_declared(speaker))
+        };
+        let mut declared: Vec<Option<address::Declared>> = (0..translated.len())
+            .map(|index| declare(&speakers, index))
+            .collect();
+        if declared.iter().all(Option::is_none) {
+            return translated;
+        }
+        let flagged = self
+            .pairs
+            .lock()
+            .map(|book| book.conflicts(&declared, &translated))
+            .unwrap_or_default();
+        if !flagged.is_empty() {
+            let note = self
+                .pairs
+                .lock()
+                .map(|book| book.note(&declared, &flagged))
+                .unwrap_or_default();
+            tracing::warn!(
+                count = flagged.len(),
+                sources = ?preview(&request.segments, &flagged),
+                "lines use another pair of pronouns than the rest of their direction; translating them again"
+            );
+            let mut retry = request.select(&flagged);
+            retry.drop_images();
+            retry.instructions = Some(match retry.instructions.take() {
+                Some(instructions) if !instructions.trim().is_empty() => {
+                    format!("{instructions}\n\n{note}")
+                }
+                _ => note,
+            });
+            match self.translate_segments(selection, generation, &retry).await {
+                Ok(retried) if retried.len() == flagged.len() => {
+                    let fresh = local.take_speakers();
+                    for (&index, text) in flagged.iter().zip(retried) {
+                        translated[index] = text;
+                        declared[index] = declare(&fresh, index);
+                    }
+                }
+                Ok(_) => tracing::warn!(
+                    "the pronoun retry returned the wrong number of lines; keeping the first"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "the pronoun retry failed; keeping the first translation");
+                }
+            }
+            // A line that still disagrees is no evidence for any pair.
+            let still = self
+                .pairs
+                .lock()
+                .map(|book| book.conflicts(&declared, &translated))
+                .unwrap_or_default();
+            for index in still {
+                declared[index] = None;
+            }
+        }
+        if let Ok(mut book) = self.pairs.lock() {
+            let locked = book.learn(&declared, &translated);
+            if locked > 0 {
+                tracing::info!(locked, pairs = ?book.entries(), "pronoun pairs locked for this work");
+            }
+        }
+        translated
     }
 
     /// The names of the glossary: a line that holds one of them may rightly start with it.
@@ -516,18 +613,37 @@ impl Translator {
     /// holds everything decided for the work; a page only carries the entries about the
     /// names, terms and characters on it (or on the pages just before it).
     fn glossary_block(&self, language: Language, segments: &[String]) -> Option<String> {
-        let glossary = self.glossary.lock().ok()?;
-        if glossary.language != Some(language) || glossary.entries.is_empty() {
-            return None;
+        let mut selected = Vec::new();
+        if let Ok(glossary) = self.glossary.lock()
+            && glossary.language == Some(language)
+            && !glossary.entries.is_empty()
+        {
+            let mut corpus = segments.join("\n");
+            if let Ok(memory) = self.memory.lock() {
+                for page in &memory.recent_pages {
+                    corpus.push('\n');
+                    corpus.push_str(page);
+                }
+            }
+            selected = relevant_entries(&glossary.entries, &corpus);
         }
-        let mut corpus = segments.join("\n");
-        if let Ok(memory) = self.memory.lock() {
-            for page in &memory.recent_pages {
-                corpus.push('\n');
-                corpus.push_str(page);
+        // The pairs the translations confirmed go to every page, whatever the glossary says.
+        if language == Language::Vietnamese
+            && let Ok(pairs) = self.pairs.lock()
+        {
+            for (source, target) in pairs.entries().into_iter().take(GLOSSARY_ADDRESS_MAX_ENTRIES) {
+                let known = selected.iter().any(|entry| {
+                    entry.kind == "address" && entry.source.eq_ignore_ascii_case(&source)
+                });
+                if !known {
+                    selected.push(GlossaryEntry {
+                        kind: "address".to_owned(),
+                        source,
+                        target,
+                    });
+                }
             }
         }
-        let selected = relevant_entries(&glossary.entries, &corpus);
         if selected.is_empty() {
             return None;
         }
@@ -558,6 +674,9 @@ impl Translator {
             // Another work (or language): its first page must not see the lines of the last.
             memory.recent.clear();
             memory.recent_pages.clear();
+        }
+        if restarted && let Ok(mut pairs) = self.pairs.lock() {
+            pairs.clear();
         }
         if selection.provider != Provider::Local {
             return Ok(());
@@ -731,6 +850,9 @@ impl Translator {
         }
         if let Ok(mut glossary) = self.glossary.lock() {
             glossary.entries.clear();
+        }
+        if let Ok(mut pairs) = self.pairs.lock() {
+            pairs.clear();
         }
     }
 

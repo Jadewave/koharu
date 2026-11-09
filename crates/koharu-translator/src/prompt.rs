@@ -65,6 +65,44 @@ pub(crate) fn speakers(text: &str) -> Vec<String> {
     speakers
 }
 
+/// The `(id, speaker)` of every segment a response holds that wrote a speaker. Also reads what a
+/// truncated response got as far as writing.
+pub(crate) fn speaker_entries(text: &str) -> Vec<(usize, String)> {
+    if let Ok(output) = serde_json::from_str::<TranslationOutput>(text) {
+        return output
+            .translations
+            .into_iter()
+            .filter_map(|segment| {
+                let id = segment.id;
+                segment.speaker.map(|speaker| (id, speaker))
+            })
+            .collect();
+    }
+    let mut entries = Vec::new();
+    let array = text
+        .find("\"translations\"")
+        .and_then(|key| text[key..].find('[').map(|offset| key + offset + 1));
+    if let Some(start) = array {
+        let mut rest = &text[start..];
+        loop {
+            rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+            if !rest.starts_with('{') {
+                break;
+            }
+            let mut stream =
+                serde_json::Deserializer::from_str(rest).into_iter::<TranslationOutputSegment>();
+            let Some(Ok(segment)) = stream.next() else {
+                break;
+            };
+            let consumed = stream.byte_offset();
+            let id = segment.id;
+            entries.extend(segment.speaker.map(|speaker| (id, speaker)));
+            rest = &rest[consumed..];
+        }
+    }
+    entries
+}
+
 /// Vietnamese words that open a line with a subject: pronouns and the words that stand for one.
 const VIETNAMESE_SUBJECTS: [&str; 34] = [
     "chúng ta", "chúng tôi", "chúng mình", "bọn anh", "bọn em", "bọn tôi", "bọn mình",
@@ -644,7 +682,7 @@ struct TranslationOutputSegment {
     #[serde(deserialize_with = "deserialize_segment_id")]
     id: usize,
     /// "Speaker>Listener: pronoun pair", written before the text so the pronouns are decided
-    /// first; the pairs are kept as the pronouns chosen for the work.
+    /// first. `address::PairBook` keeps the pairs the translations confirm and locks them.
     #[serde(default)]
     speaker: Option<String>,
     text: String,
