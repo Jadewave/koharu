@@ -73,26 +73,50 @@ static CREDENTIAL_STORE: LazyLock<Result<(), String>> = LazyLock::new(|| {
 /// Load a Koharu secret by key.
 ///
 /// In container/headless environments the platform credential store may not
-/// be available. Treat any credential-store read failure as "no credential".
-/// This allows deployments that only use local translation models to run
-/// without a platform keyring.
+/// be available (the Linux kernel keyring needs system calls that container
+/// runtimes usually block, and it forgets everything when the container
+/// restarts). Treat any credential-store read failure as "no credential" and
+/// look at the environment instead: the secret of provider `openai-compatible`
+/// is the variable `KOHARU_OPENAI_COMPATIBLE_API_KEY`, which a hosted space can
+/// set as a secret. This allows deployments without a platform keyring to use
+/// remote providers, and deployments that only use local translation models to
+/// run without either.
 pub fn get(key: &str) -> anyhow::Result<Option<SecretString>> {
-    let entry = match entry(key) {
-        Ok(entry) => entry,
-        Err(_) => return Ok(None),
-    };
+    let stored = entry(key)
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(SecretString::from);
+    Ok(stored.or_else(|| from_environment(key)))
+}
 
-    match entry.get_password() {
-        Ok(value) => Ok(Some(SecretString::from(value))),
-        Err(keyring_core::Error::NoEntry) => Ok(None),
-        Err(_) => Ok(None),
-    }
+/// The name of the environment variable that holds the secret of `key`.
+fn environment_name(key: &str) -> String {
+    let key: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    format!("KOHARU_{key}_API_KEY")
+}
+
+fn from_environment(key: &str) -> Option<SecretString> {
+    let value = std::env::var(environment_name(key)).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| SecretString::from(value))
 }
 
 /// Store a Koharu secret by key.
 pub fn set(key: &str, secret: &SecretString) -> anyhow::Result<()> {
-    entry(key)?.set_password(secret.expose_secret())?;
-    Ok(())
+    use anyhow::Context;
+    entry(key)
+        .and_then(|entry| entry.set_password(secret.expose_secret()).map_err(Into::into))
+        .with_context(|| {
+            format!(
+                "could not store the credential in the platform credential store; set the \
+                 environment variable {} instead",
+                environment_name(key)
+            )
+        })
 }
 
 /// Delete a Koharu secret by key. Missing credentials are treated as success.
@@ -116,4 +140,28 @@ fn entry(key: &str) -> anyhow::Result<Entry> {
     let entry = keyring::Entry::new(SERVICE, key)?.inner;
 
     Ok(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_environment_variable_is_named_after_the_provider() {
+        assert_eq!(
+            environment_name("openai-compatible"),
+            "KOHARU_OPENAI_COMPATIBLE_API_KEY"
+        );
+        assert_eq!(environment_name("openai"), "KOHARU_OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn a_secret_comes_from_the_environment_when_the_store_has_none() {
+        // SAFETY: the only test that touches this variable.
+        unsafe { std::env::set_var("KOHARU_TEST_PROVIDER_API_KEY", "  nvapi-123 \n") };
+        let secret = get("test-provider").unwrap().unwrap();
+        assert_eq!(secret.expose_secret(), "nvapi-123");
+        unsafe { std::env::remove_var("KOHARU_TEST_PROVIDER_API_KEY") };
+        assert!(from_environment("test-provider").is_none());
+    }
 }

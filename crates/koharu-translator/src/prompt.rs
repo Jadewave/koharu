@@ -121,38 +121,136 @@ const SUBJECT_CUES: [&str; 51] = [
     "みんな", "皆", "あいつ", "こいつ", "そいつ", "奴",
 ];
 
+/// The same for Chinese: a pronoun, a title, or a kinship word.
+const CHINESE_SUBJECT_CUES: &[&str] = &[
+    "我", "咱", "俺", "您", "你", "他", "她", "它", "大家", "老师", "老師", "先生", "小姐", "夫人",
+    "太太", "老板", "老闆", "少爷", "少爺", "大人", "殿下", "陛下", "前辈", "前輩", "师父", "師父",
+    "师傅", "師傅", "同学", "同學", "哥", "姐", "弟", "妹", "爸", "妈", "媽", "爹", "娘", "爷",
+    "爺", "奶", "叔", "姨", "舅", "伯",
+];
+
+/// The same for Korean. A cue counts only at the start of a word (see `has_cue`), because
+/// short ones such as 나 and 저 sit inside many other words.
+const KOREAN_SUBJECT_CUES: &[&str] = &[
+    "나", "난", "내가", "날", "저", "전", "제가", "너", "넌", "네가", "니가", "당신", "우리", "걔",
+    "그녀", "그는", "오빠", "형", "누나", "언니", "선배", "선생", "씨", "님", "아빠", "엄마",
+    "아버지", "어머니", "할아버지", "할머니", "여보", "자기", "놈", "자식", "얘", "쟤", "애들",
+    "이 녀석",
+];
+
+/// Words that show that the speaker may be a child or a younger relative of the listener,
+/// the only case where a speaker rightly calls himself 'con' or 'cháu'.
+const KIN_CUES: &[&str] = &[
+    "お父", "お母", "父", "母", "パパ", "ママ", "おじい", "おばあ", "祖父", "祖母", "親",
+    "爸", "妈", "媽", "爹", "娘", "爷", "爺", "奶", "祖", "师父", "師父",
+    "아빠", "엄마", "아버지", "어머니", "할아버지", "할머니",
+];
+
+/// Words by which a line states its own speaker ('I'), in Japanese, Chinese and Korean.
+const FIRST_PERSON_SOURCE: &[&str] = &[
+    "私", "わたし", "あたし", "僕", "ぼく", "俺", "おれ", "我", "咱", "나는", "내가", "제가", "저는",
+    "난",
+];
+
 /// Whether the line is written in Japanese: it has hiragana or katakana.
 fn is_japanese(text: &str) -> bool {
     text.chars()
         .any(|c| matches!(c, '\u{3041}'..='\u{30ff}' | '\u{31f0}'..='\u{31ff}'))
 }
 
-/// Whether a Vietnamese translation opens with a subject that its Japanese source line does
-/// not have: the model invented it. A line whose source has a pronoun, an honorific, a family
-/// title, or one of the names in `names` is never reported, because a subject may be right
-/// there. Lines in other languages are never judged: the word lists are Japanese.
-pub(crate) fn invented_subject(source: &str, translation: &str, names: &[String]) -> bool {
-    if !is_japanese(source) {
-        return false;
-    }
-    let lead = translation
-        .trim_start_matches(|c: char| !c.is_alphabetic())
-        .to_lowercase();
-    let opens_with_subject = VIETNAMESE_SUBJECTS.iter().any(|word| {
+/// Whether the line is written in Korean: it has hangul.
+fn is_korean(text: &str) -> bool {
+    text.chars()
+        .any(|c| matches!(c, '\u{ac00}'..='\u{d7af}' | '\u{1100}'..='\u{11ff}' | '\u{3130}'..='\u{318f}'))
+}
+
+/// Whether the line is written in Chinese: han characters and no kana or hangul.
+fn is_chinese(text: &str) -> bool {
+    !is_japanese(text)
+        && !is_korean(text)
+        && text
+            .chars()
+            .any(|c| matches!(c, '\u{4e00}'..='\u{9fff}' | '\u{3400}'..='\u{4dbf}'))
+}
+
+/// Whether `cue` stands in `text` at the start of a word (not after a hangul syllable).
+fn has_word_start(text: &str, cue: &str) -> bool {
+    text.match_indices(cue).any(|(at, _)| {
+        !text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| matches!(c, '\u{ac00}'..='\u{d7af}'))
+    })
+}
+
+/// Whether the source line has one of the subject cues of its language. `None` when the
+/// language is not one of the three the cue lists are written for: such a line is not judged.
+fn source_has_subject_cue(source: &str, names: &[String]) -> Option<bool> {
+    let by_name = names
+        .iter()
+        .any(|name| !name.is_empty() && source.contains(name.as_str()));
+    let by_cue = if is_japanese(source) {
+        SUBJECT_CUES.iter().any(|cue| source.contains(cue))
+    } else if is_korean(source) {
+        KOREAN_SUBJECT_CUES
+            .iter()
+            .any(|cue| has_word_start(source, cue))
+    } else if is_chinese(source) {
+        CHINESE_SUBJECT_CUES.iter().any(|cue| source.contains(cue))
+    } else {
+        return None;
+    };
+    Some(by_cue || by_name)
+}
+
+/// Whether a Vietnamese line opens with one of `words` as a whole word. 'Cô ơi' and 'Anh, ...'
+/// call someone; they do not make a subject.
+fn opens_with_word(lead: &str, words: &[&str]) -> bool {
+    words.iter().any(|word| {
         lead.strip_prefix(word).is_some_and(|rest| {
             let whole_word = rest.chars().next().is_none_or(|c| !c.is_alphabetic());
-            // 'Cô ơi' and 'Anh, ...' call someone; they do not make a subject.
             let call = rest.starts_with(',') || rest.trim_start().starts_with("ơi");
             whole_word && !call
         })
-    });
-    if !opens_with_subject {
+    })
+}
+
+/// Whether a clause of the Vietnamese text (cut at . … , ! ? ; :) opens with 'con' or 'cháu'
+/// as a subject, so also after an interjection ('Này... con đi vứt rác đây').
+fn clause_opens_with_kin_word(text: &str) -> bool {
+    text.split_inclusive(['.', '…', ',', '!', '?', ';', ':', '—'])
+        .any(|clause| {
+            let clause = clause
+                .trim_start_matches(|c: char| !c.is_alphabetic())
+                .to_lowercase();
+            opens_with_word(&clause, &["con", "cháu"])
+        })
+}
+
+/// Whether a Vietnamese translation is wrong about the subject of its Japanese, Chinese or
+/// Korean source line: it opens with a subject the source does not have (the model invented
+/// it), or it makes the speaker call himself 'con' or 'cháu' while nothing in the line shows a
+/// child or a family title. A line whose source has a pronoun, an honorific, a family title,
+/// or one of the names in `names` is never reported for the first reason, because a subject
+/// may be right there. Lines in other languages are never judged: the word lists are not
+/// written for them.
+pub(crate) fn invented_subject(source: &str, translation: &str, names: &[String]) -> bool {
+    let Some(has_cue) = source_has_subject_cue(source, names) else {
+        return false;
+    };
+    let lead = translation
+        .trim_start_matches(|c: char| !c.is_alphabetic())
+        .to_lowercase();
+    // 'Con đi vứt rác đây' for 我去扔垃圾了: the speaker is not the listener's child.
+    if clause_opens_with_kin_word(translation)
+        && FIRST_PERSON_SOURCE.iter().any(|word| source.contains(word))
+        && !KIN_CUES.iter().any(|cue| source.contains(cue))
+    {
+        return true;
+    }
+    if !opens_with_word(&lead, &VIETNAMESE_SUBJECTS) {
         return false;
     }
-    let has_cue = SUBJECT_CUES.iter().any(|cue| source.contains(cue))
-        || names
-            .iter()
-            .any(|name| !name.is_empty() && source.contains(name.as_str()));
     !has_cue
 }
 
@@ -504,7 +602,7 @@ fn output_schema_with(expected: usize, speaker: bool) -> Value {
             "speaker".to_owned(),
             json!({
                 "type": "string",
-                "description": "Who speaks to whom and the pronoun pair, e.g. 'A>B: em - anh', or 'narration' or 'thought'."
+                "description": "Who speaks to whom and the pronoun pair, e.g. 'A>B: em - anh'; for a thought 'A>thought: mình' (the character and the first-person word); or 'narration'."
             }),
         );
         required.push(json!("speaker"));
@@ -558,6 +656,7 @@ fn translation_rules(request: &TranslationRequest) -> String {
             Speakers and consistency:
             - For every segment work out who speaks to whom, and whether it is dialogue, narration, a monologue, or a thought; give it a fitting voice (spoken for dialogue, plainer and inward for monologue and thoughts). Speakers do not necessarily alternate.
             - The same character keeps the same name, pronouns, and manner of speaking (polite, rough, childish, archaic, ...) while the situation stays the same; change them only when the relationship or mood clearly changes.
+            - A thought or monologue belongs to a character too: it keeps the first-person word that the character uses aloud (or the plain 'mình' for an inner voice), never a different one, and the voice stays inward and plain. Do not give every inner voice the same 'tôi'.
             - Render names, places, skills, and terms the same way every time, following the glossary and context.
             - Never decide that characters are lovers, relatives, or of a given age or rank from a name, a guess, or the text alone; take it only from what the lines or the image clearly show, and otherwise keep the wording neutral.
 
@@ -579,13 +678,13 @@ fn translation_rules(request: &TranslationRequest) -> String {
             - NEVER add a subject, pronoun, or name that the source line does not contain, however much the Vietnamese sounds as if it needs one. Many languages (Japanese, Chinese, Korean) drop the subject, and Vietnamese can too, so translate only what is written: Japanese 行くよ and Korean 갈게 are 'Đi nhé' or 'Đi đây' (not 'Anh đi nhé'), and ごめんね is 'Xin lỗi nhé' (not 'Em xin lỗi nhé'). When a sentence is wrong without a subject, rephrase it without one instead of inventing one. A first-person word the source does state (I, 私, 我, 나) means the speaker, never the listener.
             - For every segment decide who speaks and who listens from the bubble tail in the image, the story, and the speaker's way of talking. The first-person word names the speaker and the second-person word the listener, each matching that person's gender. Never carry over the pronoun of the source language, and never fall back on one pair for everybody ('tôi - cậu' and 'anh - em' included).
             - A glossary address entry 'Speaker -> Listener = pair' was given for those two people in that direction only: use it there, and never reverse it for the other direction. Otherwise reuse the words that the context entries and the earlier lines already show for that person speaking to that listener, and decide a new pair only from the evidence below. Within a sentence refer to the speaker in one way only, and change a pair only when the relationship or mood clearly changes.
-            - Evidence, strongest first. (1) Formality of the speech: polite speech between adults, strangers, colleagues, and customers and workers takes a formal pair ('tôi - cô', 'tôi - anh', 'tôi - chị', or 'em - anh', 'em - chị' for a clearly younger speaker); plain familiar speech between friends, family, and equals takes a close pair ('anh - em', 'chị - em', 'tớ - cậu', 'tao - mày'). A polite speaker keeps polite endings (ạ, vâng, xin, làm ơn) and never turns requests into 'đi', 'nhé', 'đấy'; teasing said politely stays polite. (2) Age and rank, only when the lines or the image clearly show them: a younger person calls an older man 'anh' ('chú', 'bác' when much older) and an older woman 'chị' ('cô', 'dì' when much older), an older person calls a clearly younger one 'em' or 'cháu', and people of the same age use 'cậu', 'bạn', 'tớ', 'mình'. Do not use 'anh - em' between adults who speak politely or are not close. (3) The words of the source: its own pronouns, titles, and honorifics tell the relationship and the register.
-            - Cues in the source language, for lines written in it. Japanese: です/ます polite versus だ/よ plain; 俺 rough male, 僕 gentler male, 私 neutral or polite, あたし casual female; お前 and 貴様 rude ('mày'); さん and 様 formal, ちゃん and くん familiar (くん for a man means an equal or a younger one, so the speaker does not call him 'anh'). Korean: 합쇼체 and 해요체 polite versus 반말 plain; 오빠, 형, 누나, 언니 are what a younger person calls an older one, so they show age and sex. Chinese: 您 formal versus 你 plain; titles such as 老师, 先生, 哥, 姐 show rank and age.
+            - Evidence, strongest first. (1) Formality of the speech: polite speech between adults, strangers, colleagues, and customers and workers takes a formal pair ('tôi - cô', 'tôi - anh', 'tôi - chị', or 'em - anh', 'em - chị' for a clearly younger speaker); plain familiar speech between friends, family, and equals takes a close pair ('anh - em', 'chị - em', 'tớ - cậu', 'tao - mày'). A polite speaker keeps polite endings (ạ, vâng, xin, làm ơn) and never turns requests into 'đi', 'nhé', 'đấy'; teasing said politely stays polite. (2) Age and rank, only when the lines or the image clearly show them: a younger person calls an older man 'anh' ('chú', 'bác' when much older) and an older woman 'chị' ('cô', 'dì' when much older), an older person calls a clearly younger one 'em' or 'cháu', and people of the same age use 'cậu', 'bạn', 'tớ', 'mình'. Do not use 'anh - em' between adults who speak politely or are not close. An older speaker calls himself 'tôi' (or 'bác', 'chú', 'ông', 'lão' by age and manner) when talking to a younger stranger or a worker, and never 'con', 'cháu' or 'em': those are for a clearly younger speaker, or a child to a parent or an elder of the family, and only when the lines or the image show that tie. (3) The words of the source: its own pronouns, titles, and honorifics tell the relationship and the register.
+            - Cues in the source language, for lines written in it. Gender and rank come first from how a person speaks, and only then from the drawing: hair, glasses, build and clothes never decide a gender that the speech shows. Japanese: です/ます polite versus だ/よ plain; 俺 rough male, 僕 gentler male, 私 neutral or polite (a woman or a man), あたし casual female; お前 and 貴様 rude ('mày'); さん and 様 formal, ちゃん and くん familiar (くん for a man means an equal or a younger one, so the speaker does not call him 'anh'). Sentence endings and exclamations: おい, ぞ, ぜ, だぜ, だろ, な (as a command), commands in ～ろ/～しろ/～やがる, and 俺 are rough male speech (a plain, blunt Vietnamese, never 'nào', 'nhé', 'ạ' or a soft 'đi nào'); わ, のよ, かしら, だわ, ～てね and ～なさい are feminine or soft speech; ね and よ alone are neutral. A line with 俺 is a man or a boy, even when the face is androgynous. Korean: 합쇼체 and 해요체 polite versus 반말 plain; 오빠, 형, 누나, 언니 are what a younger person calls an older one, so they show age and sex. Chinese: 您 formal versus 你 plain; 我 is a plain 'tôi' (or the speaker's own word by age and rank), never 'con' or 'em' unless the speaker is clearly a child or a junior; 咱, 俺 and 老子 are rough; 好的/好的呢 said to a senior is a polite acceptance ('vâng ạ', 'dạ'), 喂 is 'Này' or 'Ê'; titles such as 老师, 先生, 哥, 姐 show rank and age.
             - When neither formality nor age is known, use the name, 'bạn', or no pronoun; do not guess.
             - 'chúng ta' includes the listener; 'chúng tôi', 'bọn anh', 'bọn em' leave the listener out (we said to an outsider). Giving verbs keep their direction: the other does it for the speaker's side, the speaker does it for the other, or the speaker receives it.
 
             Vietnamese fidelity and naturalness:
-            - First get the exact meaning right; never guess a different meaning. Check polite forms, homographs, and the sense in context (要る 'need' versus 居る 'be'; だめ! as an exclamation is 'Không được!', never 'hỏng rồi'; a verb that reports what another person feels (Japanese ～がる) is never the speaker's own feeling and never gets an object the source does not name).
+            - First get the exact meaning right; never guess a different meaning. Check polite forms, homographs, and the sense in context (要る 'need' versus 居る 'be'; だめ! as an exclamation is 'Không được!', never 'hỏng rồi'; a verb that reports what another person feels (Japanese ～がる) is never the speaker's own feeling and never gets an object the source does not name; さみしがってる is 'đang buồn, đang cô đơn', never 'đang mong chờ').
             - Then say it as a Vietnamese speaker would: short spoken sentences, fitting sentence-final particles (nhé, nhỉ, mà, đấy, thôi, ạ) for tone and politeness, no calques.
             - Translate compound words by their real meaning, keep every phrase of the source, and use short standard labels (Tên thật, Tuổi, Nghề nghiệp) on profile pages.
             - Sound effects become a short Vietnamese onomatopoeia or stay as they are; never romanize them. Keep each line about as long as the source allows, so it fits the bubble.
@@ -596,7 +695,8 @@ fn translation_rules(request: &TranslationRequest) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
             Speaker field:
-            - Each object has `id`, `speaker` and `text`, in that order. Fill `speaker` first, in a few words: 'Speaker>Listener: I-word - you-word' such as 'A>B: em - anh' where A and B are the two characters (or 'narration', or 'thought'); use the name from the glossary or the context, or a short description such as 'khách hàng' when there is no name.
+            - Each object has `id`, `speaker` and `text`, in that order. Fill `speaker` first, in a few words: 'Speaker>Listener: I-word - you-word' such as 'A>B: em - anh' where A and B are the two characters (or 'narration', or a thought, see below); use the name from the glossary or the context, or a short description such as 'khách hàng' when there is no name.
+            - For a thought or monologue write 'Name>thought: I-word' with the character's name and the first-person word that the character uses aloud (or 'mình'), for example 'Rio>thought: mình'. Use plain 'narration' only for narration that no character thinks or says.
             - Then write `text` with exactly that pair, and keep the pair of the same Speaker>Listener that the context entries and the earlier lines already show, until the relationship clearly changes.
         "}.trim_end());
     }
@@ -1086,8 +1186,48 @@ mod tests {
         assert!(!invented_subject("早く", "Anh, nhanh lên", &none));
         assert!(!invented_subject("来た", "Cảnh sát tới rồi", &none));
         assert!(!invented_subject("来た", "Tại sao lại thế", &none));
-        // Only Japanese lines are judged.
+        // Chinese and Korean lines are judged the same way; other languages are not.
+        assert!(invented_subject("走了", "Anh đi đây", &none));
         assert!(!invented_subject("我走了", "Anh đi đây", &none));
-        assert!(!invented_subject("갈게", "Anh đi đây", &none));
+        assert!(invented_subject("갈게", "Anh đi đây", &none));
+        assert!(!invented_subject("나 갈게", "Tôi đi đây", &none));
+        assert!(!invented_subject("전 갈게요", "Tôi đi đây", &none));
+        assert!(!invented_subject("I am going", "Anh đi đây", &none));
+    }
+
+    #[test]
+    fn a_speaker_who_calls_himself_con_without_a_family_tie_is_caught() {
+        let none: [String; 0] = [];
+        // 我去扔垃圾了 said by an old man to a young one is not a child's line.
+        assert!(invented_subject("喂…我去扔垃圾了", "Này... con đi vứt rác đây", &none));
+        assert!(invented_subject("僕は行くよ", "Con đi đây", &none));
+        assert!(invented_subject("저는 갈게요", "Cháu đi đây", &none));
+        // A family title shows the tie.
+        assert!(!invented_subject("爸，我走了", "Con đi đây, bố", &none));
+        assert!(!invented_subject("お母さん、僕行くね", "Mẹ ơi, con đi nhé", &none));
+        // The neutral word is fine.
+        assert!(!invented_subject("喂…我去扔垃圾了", "Này... tôi đi vứt rác đây", &none));
+    }
+
+    #[test]
+    fn korean_cues_count_only_at_the_start_of_a_word() {
+        assert!(has_word_start("나 갈게", "나"));
+        assert!(has_word_start("그래 나는 갈게", "나"));
+        assert!(!has_word_start("밖으로나가", "나"));
+        assert!(!has_word_start("사나이", "나"));
+    }
+
+    #[test]
+    fn the_vietnamese_prompt_covers_gender_cues_elders_and_thoughts() {
+        let prompt = translation_system_prompt(&TranslationRequest::new(["a"], Language::Vietnamese));
+        assert!(prompt.contains("おい, ぞ, ぜ"));
+        assert!(prompt.contains("hair, glasses, build and clothes never decide a gender"));
+        assert!(prompt.contains("An older speaker calls himself 'tôi'"));
+        assert!(prompt.contains("我 is a plain 'tôi'"));
+        assert!(prompt.contains("さみしがってる"));
+        assert!(prompt.contains("A thought or monologue belongs to a character too"));
+        let mut request = two_pages(Language::Vietnamese);
+        request.instructions = None;
+        assert!(translation_system_prompt(&request).contains("Rio>thought: mình"));
     }
 }

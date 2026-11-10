@@ -139,11 +139,32 @@ pub(crate) async fn models(client: &Client, providers: &ProvidersConfig) -> Vec<
                 models.append(&mut provider_models);
             }
             Err(error) => {
-                tracing::warn!(
-                    provider,
-                    %error,
-                    "failed to list translation models"
-                );
+                // The whole chain, not only "request failed": it says whether the server
+                // refused the connection, timed out, or could not be resolved.
+                let detail = format!("{error:#}");
+                // A server on this machine that nobody started (the defaults of
+                // OpenAI-compatible and LM Studio) is the normal state of a machine
+                // without one, for instance a hosted space: not worth a warning.
+                let probing_local = match provider {
+                    "openai-compatible" => {
+                        is_loopback(providers.openai_compatible.base_url.as_ref())
+                    }
+                    "lm-studio" => is_loopback(providers.lm_studio.base_url.as_ref()),
+                    _ => false,
+                };
+                if probing_local {
+                    tracing::debug!(
+                        provider,
+                        error = %detail,
+                        "no local server to list models from"
+                    );
+                } else {
+                    tracing::warn!(
+                        provider,
+                        error = %detail,
+                        "failed to list translation models"
+                    );
+                }
             }
         }
     }
@@ -160,6 +181,16 @@ pub(crate) async fn models(client: &Client, providers: &ProvidersConfig) -> Vec<
     });
 
     models
+}
+
+/// Whether a server URL is on this machine (an unset URL stands for the local default).
+fn is_loopback(url: Option<&url::Url>) -> bool {
+    url.is_none_or(|url| {
+        matches!(
+            url.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1" | "0.0.0.0")
+        )
+    })
 }
 
 pub(super) async fn send_json<T: DeserializeOwned>(

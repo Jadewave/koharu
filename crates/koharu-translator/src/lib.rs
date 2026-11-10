@@ -65,7 +65,7 @@ const GLOSSARY_CHARACTER_MAX_ENTRIES: usize = 16;
 /// Address pairs that were given (not guessed) go to every page. At most this many.
 const GLOSSARY_ADDRESS_MAX_ENTRIES: usize = 24;
 /// Asked of the model when a translation opened with a subject its source line does not have.
-const NO_SUBJECT_NOTE: &str = "Strict retry: each of these lines was translated before with a subject (a pronoun or a name) that the source line does not contain. Translate them again and start no line with a pronoun or a name unless the source line itself contains that subject or form of address. Keep the speaker and the pronoun pair of every line as decided before.";
+const NO_SUBJECT_NOTE: &str = "Strict retry: each of these lines was translated before with a wrong subject: either one (a pronoun or a name) that the source line does not contain, or 'con' / 'cháu' for a speaker who is not shown to be a child or a younger relative of the listener. Translate them again and start no line with a pronoun or a name unless the source line itself contains that subject or form of address. When the source states the speaker (I, 私, 我, 나), use a neutral 'tôi' (or the pronoun that fits the speaker's age and relationship), never 'con' or 'cháu' unless the line shows a family tie. Keep the speaker and the pronoun pair of every line as decided before.";
 /// Source text of this many previous pages also counts when picking a page's entries, so
 /// characters who are only implied on the page keep their pronouns.
 const MEMORY_PAGES: usize = 3;
@@ -461,22 +461,51 @@ impl Translator {
                 .get(&request.segments[index])
                 .and_then(|speaker| address::parse_declared(speaker))
         };
+        let think = |speakers: &std::collections::HashMap<String, String>, index: usize| {
+            speakers
+                .get(&request.segments[index])
+                .and_then(|speaker| address::parse_thought(speaker))
+        };
         let mut declared: Vec<Option<address::Declared>> = (0..translated.len())
             .map(|index| declare(&speakers, index))
+            .collect();
+        let mut thoughts: Vec<Option<address::Thought>> = (0..translated.len())
+            .map(|index| think(&speakers, index))
             .collect();
         if declared.iter().all(Option::is_none) {
             return translated;
         }
-        let flagged = self
+        let (pair_flagged, thought_flagged) = self
             .pairs
             .lock()
-            .map(|book| book.conflicts(&declared, &translated))
+            .map(|book| {
+                (
+                    book.conflicts(&declared, &translated),
+                    book.thought_conflicts(&thoughts, &declared, &translated),
+                )
+            })
             .unwrap_or_default();
+        let mut flagged: Vec<usize> = pair_flagged
+            .iter()
+            .chain(&thought_flagged)
+            .copied()
+            .collect();
+        flagged.sort_unstable();
+        flagged.dedup();
         if !flagged.is_empty() {
             let note = self
                 .pairs
                 .lock()
-                .map(|book| book.note(&declared, &flagged))
+                .map(|book| {
+                    let mut notes: Vec<String> = Vec::new();
+                    if !pair_flagged.is_empty() {
+                        notes.push(book.note(&declared, &pair_flagged));
+                    }
+                    if !thought_flagged.is_empty() {
+                        notes.push(book.thought_note(&thoughts, &declared, &thought_flagged));
+                    }
+                    notes.join("\n")
+                })
                 .unwrap_or_default();
             tracing::warn!(
                 count = flagged.len(),
@@ -497,6 +526,7 @@ impl Translator {
                     for (&index, text) in flagged.iter().zip(retried) {
                         translated[index] = text;
                         declared[index] = declare(&fresh, index);
+                        thoughts[index] = think(&fresh, index);
                     }
                 }
                 Ok(_) => tracing::warn!(
