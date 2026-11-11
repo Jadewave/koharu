@@ -217,11 +217,23 @@ pub(super) async fn send_json<T: DeserializeOwned>(
         .with_context(|| format!("{provider} request failed"))?;
 
     let status = response.status();
+    let url = response.url().to_string();
 
     let text = response
         .text()
         .await
         .with_context(|| format!("failed to read {provider} response"))?;
+
+    // The whole answer of the server, before anything reads it. Shown with
+    // `RUST_LOG=info,koharu_translator::http=debug` (or `--debug`).
+    tracing::debug!(
+        target: "koharu_translator::http",
+        provider,
+        %url,
+        status = status.as_u16(),
+        body = %text,
+        "response"
+    );
 
     if !status.is_success() {
         let lower = text.to_ascii_lowercase();

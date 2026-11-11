@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::OnceLock};
+use std::{fmt::Write as _, path::PathBuf, sync::OnceLock};
 
 use anyhow::Context as _;
 use hf_hub::{HFClient, HFRepository, RepoType, repository::download::HFByteStream, split_id};
@@ -88,14 +88,30 @@ impl<'a> HuggingFaceFile<'a> {
                 error = %format!("{hub_error:#}"),
                 "hf-hub could not download the file; trying its plain resolve URL"
             );
-            download::fetch(&self.direct_url(), &stage)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to download {} from {} (hf-hub said: {hub_error:#})",
-                        self.filename, self.repository
+            let url = self.direct_url();
+            match download::fetch(&url, &stage).await {
+                Ok(()) => Ok(()),
+                Err(fetch_error) => {
+                    let endpoint = std::env::var("HF_ENDPOINT").ok();
+                    let diagnosis = diagnose(
+                        endpoint.as_deref(),
+                        self.repository,
+                        self.revision,
+                        self.filename,
+                        &url,
                     )
-                })
+                    .await;
+                    Err(fetch_error.context(format!(
+                        "hf-hub said: {hub_error:#}; Hugging Face answers: {diagnosis}"
+                    )))
+                    .with_context(|| {
+                        format!(
+                            "failed to download {} from {}",
+                            self.filename, self.repository
+                        )
+                    })
+                }
+            }
         })
         .await
     }
@@ -137,6 +153,85 @@ impl<'a> HuggingFaceFile<'a> {
             .join(self.revision)
             .join(self.filename)
     }
+}
+
+fn response_header(response: &reqwest::Response, name: &str) -> String {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_owned()
+}
+
+/// What Hugging Face says about a file that could not be downloaded, for the error message: the
+/// answer for the file itself (with the error code and message that Hugging Face sends along
+/// with a 404) and whether the repository is visible at the revision and lists the file. It
+/// tells a missing file from a repository this machine cannot see, and both from an answer that
+/// did not come from Hugging Face (a proxy). Best effort: a failure here only shortens it.
+async fn diagnose(
+    endpoint: Option<&str>,
+    repository: &str,
+    revision: &str,
+    filename: &str,
+    url: &str,
+) -> String {
+    let Ok(client) = network::http() else {
+        return "no HTTP client".to_owned();
+    };
+    let token = ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+    let mut report = format!("token_env_set={token}");
+    match client
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let _ = write!(
+                report,
+                "; file: status={} url={} x-error-code={} x-error-message={:?} server={} via={} x-request-id={}",
+                response.status().as_u16(),
+                response.url(),
+                response_header(&response, "x-error-code"),
+                response_header(&response, "x-error-message"),
+                response_header(&response, "server"),
+                response_header(&response, "via"),
+                response_header(&response, "x-request-id"),
+            );
+        }
+        Err(error) => {
+            let _ = write!(report, "; file request failed: {error:#}");
+        }
+    }
+    let base = endpoint
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .unwrap_or("https://huggingface.co")
+        .trim_end_matches('/');
+    let api = format!("{base}/api/models/{repository}/revision/{}", revision.replace('/', "%2F"));
+    match client.get(&api).send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let error_code = response_header(&response, "x-error-code");
+            let body = response.text().await.unwrap_or_default();
+            let sha = body
+                .split_once("\"sha\":\"")
+                .map(|(_, rest)| rest.chars().take(12).collect::<String>())
+                .unwrap_or_else(|| "-".to_owned());
+            let _ = write!(
+                report,
+                "; repository: status={status} x-error-code={error_code} sha={sha} lists_the_file={}",
+                body.contains(filename)
+            );
+        }
+        Err(error) => {
+            let _ = write!(report, "; repository request failed: {error:#}");
+        }
+    }
+    report
 }
 
 /// `{endpoint}/{repository}/resolve/{revision}/{filename}`, with `datasets/` before the

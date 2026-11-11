@@ -62,6 +62,34 @@ const DB_PARAMS: DbParams = DbParams {
     unclip_ratio: 1.6,
 };
 const DB_ENV: &str = "KOHARU_PPOCR_DB";
+/// Each of the three files can be given as a local path instead of being downloaded.
+const DETECTOR_ENV: &str = "KOHARU_PPOCR_DET";
+const RECOGNIZER_ENV: &str = "KOHARU_PPOCR_REC";
+const DICTIONARY_ENV: &str = "KOHARU_PPOCR_DICT";
+
+/// The path of a model file: the one `variable` names when it is set, else the file downloaded
+/// from Hugging Face.
+async fn resolve_file(
+    variable: &str,
+    file: koharu_runtime::HuggingFaceFile<'static>,
+    what: &str,
+) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os(variable)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        anyhow::ensure!(
+            path.is_file(),
+            "{variable} is set to {}, which is not a file",
+            path.display()
+        );
+        tracing::info!(path = %path.display(), "using a local PP-OCRv6 manga {what}");
+        return Ok(path);
+    }
+    file.resolve().await.with_context(|| {
+        format!("failed to resolve the PP-OCRv6 manga {what} (or set {variable} to a local copy)")
+    })
+}
 const DEBUG_ENV: &str = "KOHARU_PPOCR_DEBUG";
 
 #[derive(Debug)]
@@ -103,24 +131,9 @@ impl PpOcrV6Manga {
     /// lifecycle of every model the same.
     pub async fn load(_device: crate::Device) -> Result<Self> {
         let (detector_path, recognizer_path, dictionary_path) = tokio::try_join!(
-            async {
-                DETECTOR
-                    .resolve()
-                    .await
-                    .context("failed to resolve the PP-OCRv6 manga detector")
-            },
-            async {
-                RECOGNIZER
-                    .resolve()
-                    .await
-                    .context("failed to resolve the PP-OCRv6 manga recognizer")
-            },
-            async {
-                DICTIONARY
-                    .resolve()
-                    .await
-                    .context("failed to resolve the PP-OCRv6 manga dictionary")
-            },
+            resolve_file(DETECTOR_ENV, DETECTOR, "detector"),
+            resolve_file(RECOGNIZER_ENV, RECOGNIZER, "recognizer"),
+            resolve_file(DICTIONARY_ENV, DICTIONARY, "dictionary"),
         )?;
 
         let dictionary = geometry::parse_dictionary(
