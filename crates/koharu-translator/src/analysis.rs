@@ -906,6 +906,8 @@ struct AnalyzedLine {
     self_word: String,
     you: String,
     tone: String,
+    /// How the speaker is related to the listener, when the work has said so.
+    relation: String,
     corrected: Option<String>,
 }
 
@@ -937,6 +939,16 @@ impl PageAnalysis {
                 self_word: clip(&line.self_word, 40),
                 you: clip(&line.you, 40),
                 tone: clip(&line.tone, 60),
+                relation: bible
+                    .character_index(&line.speaker)
+                    .and_then(|index| {
+                        bible.characters[index]
+                            .relationships
+                            .iter()
+                            .find(|relationship| same_name(&relationship.with, &line.listener))
+                    })
+                    .map(|relationship| clip(&relationship.relation, 60))
+                    .unwrap_or_default(),
                 corrected: accept_correction(&sources[line.id], &line.text),
             };
             for name in [&line.speaker, &line.listener] {
@@ -995,8 +1007,8 @@ impl PageAnalysis {
         }
         let mut notes = String::from(
             "Notes on this page from a vision model that saw the picture (you do not see it). \
-Follow them for who speaks to whom and for the words people use for themselves and each other; \
-the numbers are the ids of the segments.",
+Follow them for who speaks to whom and for the words each speaker uses for themselves and for \
+the listener; the numbers are the ids of the segments.",
         );
         if !self.scene.is_empty() {
             let _ = write!(notes, "\nScene: {}", self.scene);
@@ -1012,19 +1024,32 @@ the numbers are the ids of the segments.",
         }
         notes.push_str("\nSegments:");
         for (id, line) in self.lines.iter().enumerate() {
+            // A line the vision model said nothing about gets no note, instead of a made-up one.
+            if line.kind.is_empty()
+                && line.speaker.trim().is_empty()
+                && line.self_word.is_empty()
+                && line.you.is_empty()
+            {
+                continue;
+            }
             let kind = if line.kind.is_empty() { "speech" } else { &line.kind };
             let speaker = if line.speaker.trim().is_empty() { "unknown" } else { line.speaker.trim() };
             let mut entry = format!("\n- {id} {kind}: {speaker}");
             if !is_generic(&line.listener) || line.listener.trim().eq_ignore_ascii_case("self") {
                 let _ = write!(entry, " -> {}", line.listener.trim());
+                if !line.relation.is_empty() {
+                    let _ = write!(entry, " ({})", line.relation);
+                }
             }
-            if !line.self_word.is_empty() || !line.you.is_empty() {
-                let _ = write!(
-                    entry,
-                    "; words: {} / {}",
-                    if line.self_word.is_empty() { "-" } else { &line.self_word },
-                    if line.you.is_empty() { "-" } else { &line.you },
-                );
+            let mut words = Vec::new();
+            if !line.self_word.is_empty() {
+                words.push(format!("calls self \"{}\"", line.self_word));
+            }
+            if !line.you.is_empty() {
+                words.push(format!("calls the listener \"{}\"", line.you));
+            }
+            if !words.is_empty() {
+                let _ = write!(entry, "; {}", words.join(", "));
             }
             if !line.tone.is_empty() {
                 let _ = write!(entry, "; {}", line.tone);
@@ -1289,8 +1314,9 @@ mod tests {
         let notes = analysis.instructions(&lines);
         assert!(notes.contains("Scene: A hospital room."));
         assert!(notes.contains("Sasaki: man, young adult, Rio's colleague; speaks: rough but kind"));
-        assert!(notes.contains("- 0 speech: Sasaki -> Yuu; words: tôi / cậu; teasing"));
+        assert!(notes.contains("- 0 speech: Sasaki -> Yuu; calls self \"tôi\", calls the listener \"cậu\"; teasing"));
         assert!(notes.chars().count() <= INSTRUCTIONS_CHARS + 20);
+        assert!(!notes.contains("- 2 "), "a line nobody described has no note");
         // A page whose lines changed since it was read gets no notes and no corrections.
         let edited = sources(&["おい ゆう!", "x", "…"]);
         assert!(analysis.instructions(&edited).is_empty());

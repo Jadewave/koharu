@@ -340,6 +340,9 @@ impl Processor {
             "translating pages together"
         );
         let mut request = TranslationRequest::new(segments, self.config.target_language);
+        if let Some(notes) = notes.as_deref() {
+            tracing::debug!(%notes, "notes the translation model reads with the page");
+        }
         let instructions = [self.config.instructions.as_deref(), notes.as_deref()]
             .into_iter()
             .flatten()
