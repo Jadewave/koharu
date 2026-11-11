@@ -23,7 +23,7 @@ use koharu_ml::Device;
 use error::{Error, Result};
 use local::LocalTranslator;
 
-pub use analysis::{AnalysisConfig, AnalysisModel, AnalysisPage, PageAnalysis};
+pub use analysis::{AnalysisConfig, AnalysisModel, AnalysisPage, PageAnalysis, PanelLayout};
 pub use backend::{GlossaryEntry, TranslationContext, TranslationRequest};
 
 /// Whether a segment has anything to translate: sound effects made only of punctuation or

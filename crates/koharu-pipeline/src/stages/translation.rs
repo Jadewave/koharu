@@ -8,10 +8,12 @@ use async_trait::async_trait;
 use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::{drawing::draw_filled_rect_mut, rect::Rect};
 use koharu_scene::{
-    Authored, EntityId, Geometry, LanguageTag, Origin, SourceText, Translation,
+    Authored, EntityId, Geometry, LanguageTag, Origin, PanelRegion, RegionSpec, SourceText,
+    Translation,
 };
 use koharu_translator::{
-    AnalysisPage, PageAnalysis, Provider, TranslationRequest, Translator, needs_translation,
+    AnalysisPage, PageAnalysis, PanelLayout, Provider, TranslationRequest, Translator,
+    needs_translation,
 };
 
 use crate::TranslationConfig;
@@ -114,7 +116,11 @@ impl Processor {
                 .iter()
                 .map(|&target| texts.targets[target].1.clone())
                 .collect();
-            match AnalysisPage::new(&marked, segments) {
+            let layout = PanelLayout {
+                panels: page_panels(input),
+                boxes,
+            };
+            match AnalysisPage::new(&marked, segments, Some(&layout)) {
                 Ok(page) => {
                     order.push(input.page);
                     pages.push(page);
@@ -449,6 +455,23 @@ fn silent_text(source: &str) -> Option<String> {
         .iter()
         .all(|character| SILENCE_CHARACTERS.contains(character));
     (all_silence && (marks.len() >= 2 || single_ellipsis)).then(|| "\u{2026}".to_owned())
+}
+
+/// The panels the detection found on a page, as page-pixel boxes, in the order they were
+/// created (the detection reading order). The analysis orders them again by rows.
+fn page_panels(input: &StageInput) -> Vec<[f64; 4]> {
+    let Ok(children) = input.scene.children(input.page) else {
+        return Vec::new();
+    };
+    children
+        .filter_map(|id| {
+            let region = input.scene.analysis_region(id).ok()?;
+            if region.region().ok()?.kind != PanelRegion::kind() {
+                return None;
+            }
+            bounds(&region.geometry().ok()?)
+        })
+        .collect()
 }
 
 /// The left, top, right and bottom of a geometry, in page pixels.

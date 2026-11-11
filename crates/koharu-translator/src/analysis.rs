@@ -53,15 +53,25 @@ pub struct AnalysisConfig {
     pub max_tokens: u32,
     /// The longest side of the page picture that is sent, in pixels.
     pub image_max_dimension: u32,
+    /// The longest side of a panel picture that is sent, in pixels.
+    pub panel_max_dimension: u32,
+    /// The order panels are read in: from the right of a row to its left (Japanese manga), or
+    /// from the left to the right.
+    pub right_to_left: bool,
 }
 
 /// A model of the analysis chain.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisModel {
     pub model: String,
-    /// Whether the model is sent the page picture. A model without vision only reads the text.
+    /// Whether the model is sent the page picture. Set it to false for a model without
+    /// vision, which then only reads the text.
     #[serde(default = "yes")]
     pub vision: bool,
+    /// Sends the panels of the page one by one, in reading order, instead of the whole page
+    /// (when the page has at least two panels that hold text).
+    #[serde(default)]
+    pub panels: bool,
 }
 
 const fn yes() -> bool {
@@ -70,46 +80,220 @@ const fn yes() -> bool {
 
 impl Default for AnalysisConfig {
     fn default() -> Self {
-        let model = |name: &str, vision: bool| AnalysisModel {
+        let model = |name: &str, panels: bool| AnalysisModel {
             model: name.to_owned(),
-            vision,
+            vision: true,
+            panels,
         };
         Self {
             enabled: true,
             models: vec![
-                model("nvidia/nemotron-3.5-super-vl-120b-a12b", true),
-                model("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", true),
-                model("deepseek-ai/deepseek-v4.1-flash", false),
+                model("nvidia/nemotron-3.5-super-vl-120b-a12b", false),
+                model("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", false),
+                model("deepseek-ai/deepseek-v4.1-flash", true),
             ],
             reasoning: false,
             max_tokens: 8192,
             image_max_dimension: 1600,
+            panel_max_dimension: 1024,
+            right_to_left: true,
         }
     }
 }
 
+/// A rectangle: left, top, right and bottom, in page pixels.
+pub type Rect = [f64; 4];
+
+/// The panels of a page and the boxes of its OCR lines, in page pixels.
+#[derive(Clone, Debug, Default)]
+pub struct PanelLayout {
+    /// The panels, in any order.
+    pub panels: Vec<Rect>,
+    /// The box of every OCR line, in the order of the lines.
+    pub boxes: Vec<Option<Rect>>,
+}
+
+/// The picture of one panel and the OCR lines in it.
+#[derive(Clone)]
+struct PanelPicture {
+    picture: String,
+    lines: Vec<usize>,
+}
+
+/// Panels beyond this many on one page are not sent one by one; the page is sent whole.
+const MAX_PANELS: usize = 10;
+/// A panel smaller than this on a side is not sent.
+const MIN_PANEL_SIDE: f64 = 32.0;
+
 /// One page to read: its picture (with the boxes and numbers of the OCR lines drawn on it,
-/// scaled down and encoded once) and the OCR lines, in the order of the numbers.
+/// scaled down and encoded once), its panels when a model of the chain reads them one by one,
+/// and the OCR lines, in the order of the numbers.
 #[derive(Clone)]
 pub struct AnalysisPage {
     picture: String,
+    panels: Vec<PanelPicture>,
     pub segments: Vec<String>,
 }
 
 impl AnalysisPage {
-    /// Prepares a page for the analysis. `image` carries the numbers of `segments`.
-    pub fn new(image: &Arc<DynamicImage>, segments: Vec<String>) -> anyhow::Result<Self> {
-        let longest = analysis_config()
-            .map_or(AnalysisConfig::default().image_max_dimension, |config| {
-                config.image_max_dimension
-            })
-            .max(256);
-        let scaled = shrink_to(image, longest)?;
+    /// Prepares a page for the analysis. `image` carries the numbers of `segments`; `layout`
+    /// holds the panels when the page has any.
+    pub fn new(
+        image: &Arc<DynamicImage>,
+        segments: Vec<String>,
+        layout: Option<&PanelLayout>,
+    ) -> anyhow::Result<Self> {
+        let config = analysis_config().unwrap_or_default();
+        let scaled = shrink_to(image, config.image_max_dimension.max(256))?;
+        let wants_panels = config.models.iter().any(|model| model.vision && model.panels);
+        let panels = match layout {
+            Some(layout) if wants_panels => {
+                panel_pictures(image, layout, segments.len(), &config).unwrap_or_else(|error| {
+                    tracing::warn!(%error, "could not cut the panels of a page; it is sent whole");
+                    Vec::new()
+                })
+            }
+            _ => Vec::new(),
+        };
         Ok(Self {
             picture: encode_image(&scaled)?.data_url(),
+            panels,
             segments,
         })
     }
+}
+
+/// The order panels are read in: rows from the top to the bottom (panels that share more than
+/// half of the lower one's height are one row), and inside a row from the right to the left
+/// when `right_to_left`, else from the left to the right. Returns indexes of `panels`.
+#[must_use]
+pub fn reading_order(panels: &[Rect], right_to_left: bool) -> Vec<usize> {
+    let mut by_top: Vec<usize> = (0..panels.len()).collect();
+    by_top.sort_by(|&left, &right| panels[left][1].total_cmp(&panels[right][1]));
+    // A row: its vertical extent and the panels in it.
+    let mut rows: Vec<([f64; 2], Vec<usize>)> = Vec::new();
+    for index in by_top {
+        let [_, top, _, bottom] = panels[index];
+        let height = (bottom - top).max(1.0);
+        let same_row = rows.last_mut().filter(|(extent, _)| {
+            let overlap = bottom.min(extent[1]) - top.max(extent[0]);
+            overlap > 0.5 * height.min((extent[1] - extent[0]).max(1.0))
+        });
+        match same_row {
+            Some((extent, members)) => {
+                extent[0] = extent[0].min(top);
+                extent[1] = extent[1].max(bottom);
+                members.push(index);
+            }
+            None => rows.push(([top, bottom], vec![index])),
+        }
+    }
+    let mut order = Vec::with_capacity(panels.len());
+    for (_, mut members) in rows {
+        members.sort_by(|&left, &right| {
+            let (left, right) = (panels[left][0] + panels[left][2], panels[right][0] + panels[right][2]);
+            if right_to_left {
+                right.total_cmp(&left)
+            } else {
+                left.total_cmp(&right)
+            }
+        });
+        order.extend(members);
+    }
+    order
+}
+
+fn area(rect: Rect) -> f64 {
+    (rect[2] - rect[0]).max(0.0) * (rect[3] - rect[1]).max(0.0)
+}
+
+/// The panel (an index of `panels`) every OCR line belongs to: the smallest panel that holds
+/// the center of the line's box, else the nearest panel. A line without a box goes with the line
+/// before it (the first one with the first panel). `panels` must not be empty.
+#[must_use]
+pub fn assign_segments(panels: &[Rect], boxes: &[Option<Rect>]) -> Vec<usize> {
+    let mut owners: Vec<usize> = Vec::with_capacity(boxes.len());
+    for rect in boxes {
+        let owner = match rect {
+            Some(rect) => {
+                let (x, y) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
+                let holding = (0..panels.len())
+                    .filter(|&index| {
+                        let panel = panels[index];
+                        x >= panel[0] && x <= panel[2] && y >= panel[1] && y <= panel[3]
+                    })
+                    .min_by(|&left, &right| area(panels[left]).total_cmp(&area(panels[right])));
+                holding.unwrap_or_else(|| {
+                    let distance = |index: usize| {
+                        let panel = panels[index];
+                        let dx = (panel[0] - x).max(0.0).max(x - panel[2]);
+                        let dy = (panel[1] - y).max(0.0).max(y - panel[3]);
+                        dx * dx + dy * dy
+                    };
+                    (0..panels.len())
+                        .min_by(|&left, &right| distance(left).total_cmp(&distance(right)))
+                        .unwrap_or(0)
+                })
+            }
+            None => owners.last().copied().unwrap_or(0),
+        };
+        owners.push(owner);
+    }
+    owners
+}
+
+/// The crop of a panel: the panel with a margin, inside the page; `None` when it is too small.
+fn crop_rect(panel: Rect, width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+    let margin = 8.0 + 0.01 * (panel[2] - panel[0]).max(panel[3] - panel[1]);
+    let left = (panel[0] - margin).max(0.0).floor();
+    let top = (panel[1] - margin).max(0.0).floor();
+    let right = (panel[2] + margin).min(f64::from(width)).ceil();
+    let bottom = (panel[3] + margin).min(f64::from(height)).ceil();
+    if right - left < MIN_PANEL_SIDE || bottom - top < MIN_PANEL_SIDE {
+        return None;
+    }
+    Some((left as u32, top as u32, (right - left) as u32, (bottom - top) as u32))
+}
+
+/// The pictures of the panels that hold OCR lines, in reading order. Empty when the page should
+/// be sent whole: fewer than two such panels, more than `MAX_PANELS`, or an OCR line that no
+/// picture holds.
+fn panel_pictures(
+    image: &Arc<DynamicImage>,
+    layout: &PanelLayout,
+    lines: usize,
+    config: &AnalysisConfig,
+) -> anyhow::Result<Vec<PanelPicture>> {
+    if layout.panels.len() < 2 || layout.boxes.len() != lines {
+        return Ok(Vec::new());
+    }
+    let owners = assign_segments(&layout.panels, &layout.boxes);
+    let mut pictures = Vec::new();
+    for panel in reading_order(&layout.panels, config.right_to_left) {
+        let held: Vec<usize> = owners
+            .iter()
+            .enumerate()
+            .filter_map(|(line, &owner)| (owner == panel).then_some(line))
+            .collect();
+        if held.is_empty() {
+            continue;
+        }
+        let Some((x, y, width, height)) = crop_rect(layout.panels[panel], image.width(), image.height())
+        else {
+            continue;
+        };
+        let crop = Arc::new(image.crop_imm(x, y, width, height));
+        let scaled = shrink_to(&crop, config.panel_max_dimension.max(256))?;
+        pictures.push(PanelPicture {
+            picture: encode_image(&scaled)?.data_url(),
+            lines: held,
+        });
+    }
+    let covered: usize = pictures.iter().map(|picture| picture.lines.len()).sum();
+    if pictures.len() < 2 || pictures.len() > MAX_PANELS || covered != lines {
+        return Ok(Vec::new());
+    }
+    Ok(pictures)
 }
 
 fn analysis_config() -> anyhow::Result<AnalysisConfig> {
@@ -362,21 +546,38 @@ direction the same on every page.
     prompt
 }
 
-fn user_prompt(
-    number: usize,
-    total: usize,
-    segments: &[String],
-    bible: &Bible,
-    has_image: bool,
-) -> String {
+/// What the vision model is shown of a page.
+enum View<'a> {
+    /// No picture: the text only.
+    Text,
+    /// The whole page in one picture.
+    Page,
+    /// One picture for every panel, in reading order.
+    Panels(&'a [PanelPicture]),
+}
+
+fn user_prompt(number: usize, total: usize, segments: &[String], bible: &Bible, view: &View<'_>) -> String {
     let mut prompt = format!("Page {} of {total}. ", number + 1);
-    if has_image {
-        prompt.push_str("The picture of the page is attached.\n");
-    } else {
-        prompt.push_str(
+    match view {
+        View::Page => prompt.push_str("The picture of the page is attached.\n"),
+        View::Text => prompt.push_str(
             "No picture is attached: decide from the text only, and answer 'unknown' where a \
 speaker cannot be told.\n",
-        );
+        ),
+        View::Panels(panels) => {
+            let _ = writeln!(
+                prompt,
+                "The page is attached as {} pictures, one for each panel, in the order the panels \
+are read; picture 1 is the first panel and the story goes on in the next picture. The same \
+character in different panels is the same person. The red boxes carry the numbers of the OCR \
+lines.",
+                panels.len()
+            );
+            for (position, panel) in panels.iter().enumerate() {
+                let lines: Vec<String> = panel.lines.iter().map(ToString::to_string).collect();
+                let _ = writeln!(prompt, "Picture {}: lines {}", position + 1, lines.join(", "));
+            }
+        }
     }
     let known = bible.prompt_json();
     if known.is_empty() {
@@ -897,14 +1098,19 @@ impl Translator {
                 if dead.contains(&position) {
                     continue;
                 }
-                let images = if entry.vision {
-                    vec![page.picture.clone()]
+                let (images, view) = if !entry.vision {
+                    (Vec::new(), View::Text)
+                } else if entry.panels && !page.panels.is_empty() {
+                    (
+                        page.panels.iter().map(|panel| panel.picture.clone()).collect(),
+                        View::Panels(&page.panels),
+                    )
                 } else {
-                    Vec::new()
+                    (vec![page.picture.clone()], View::Page)
                 };
                 let chat = remote::Chat {
                     system: system.clone(),
-                    user: user_prompt(number, pages.len(), &page.segments, &bible, entry.vision),
+                    user: user_prompt(number, pages.len(), &page.segments, &bible, &view),
                     images,
                     schema_name: "manga_page_analysis",
                     schema: schema(count),
@@ -1099,13 +1305,62 @@ mod tests {
         assert!(system.contains("never 'con' or 'cháu'"));
         assert!(!system_prompt(Language::English).contains("Vietnamese pronouns"));
         let mut bible = Bible::default();
-        assert!(user_prompt(0, 2, &sources(&["a"]), &bible, true).contains("Known so far: nothing yet."));
+        assert!(user_prompt(0, 2, &sources(&["a"]), &bible, &View::Page).contains("Known so far: nothing yet."));
         bible.merge_output(&parse_page(ANSWER, 3).unwrap());
-        let user = user_prompt(1, 2, &sources(&["おい", "ゆう"]), &bible, false);
+        let user = user_prompt(1, 2, &sources(&["おい", "ゆう"]), &bible, &View::Text);
         assert!(user.starts_with("Page 2 of 2. No picture is attached"));
         assert!(user.contains("\"Sasaki\""));
         assert!(user.contains("1: \"ゆう\""));
         assert!(user.ends_with("(ids 0 to 1)."));
+    }
+
+    #[test]
+    fn panels_are_read_in_rows_from_top_to_bottom() {
+        // Two panels side by side (the left one starts a little higher), one below them.
+        let panels = [[0.0, 0.0, 95.0, 100.0], [100.0, 4.0, 200.0, 100.0], [0.0, 110.0, 200.0, 200.0]];
+        assert_eq!(reading_order(&panels, true), [1, 0, 2], "right to left");
+        assert_eq!(reading_order(&panels, false), [0, 1, 2], "left to right");
+        // Three tiers of different heights: the tall one on the right is read first.
+        let tiers = [
+            [100.0, 0.0, 200.0, 200.0],
+            [0.0, 0.0, 95.0, 90.0],
+            [0.0, 100.0, 95.0, 200.0],
+        ];
+        assert_eq!(reading_order(&tiers, true), [0, 1, 2]);
+        assert!(reading_order(&[], true).is_empty());
+    }
+
+    #[test]
+    fn a_line_goes_with_the_smallest_panel_that_holds_it_or_the_nearest_one() {
+        let panels = [[0.0, 0.0, 200.0, 200.0], [10.0, 10.0, 60.0, 60.0], [300.0, 0.0, 400.0, 100.0]];
+        let boxes = [
+            Some([20.0, 20.0, 40.0, 40.0]),   // inside the small panel too: the small one
+            Some([100.0, 100.0, 120.0, 120.0]), // only in the large one
+            Some([250.0, 40.0, 270.0, 60.0]), // in none: the nearest, the third
+            None,                             // no box: with the line before it
+        ];
+        assert_eq!(assign_segments(&panels, &boxes), [1, 0, 2, 2]);
+        assert_eq!(assign_segments(&panels, &[None]), [0]);
+    }
+
+    #[test]
+    fn a_panel_is_cut_with_a_margin_inside_the_page() {
+        assert_eq!(crop_rect([50.0, 50.0, 150.0, 150.0], 1000, 1000), Some((41, 41, 118, 118)));
+        assert_eq!(crop_rect([0.0, 0.0, 100.0, 100.0], 105, 1000), Some((0, 0, 105, 109)));
+        assert_eq!(crop_rect([10.0, 10.0, 20.0, 20.0], 1000, 1000), None, "too small");
+    }
+
+    #[test]
+    fn the_panels_are_listed_in_the_prompt() {
+        let panel = |lines: Vec<usize>| PanelPicture {
+            picture: String::new(),
+            lines,
+        };
+        let panels = [panel(vec![0, 1]), panel(vec![2])];
+        let user = user_prompt(0, 3, &sources(&["a", "b", "c"]), &Bible::default(), &View::Panels(&panels));
+        assert!(user.contains("attached as 2 pictures, one for each panel"));
+        assert!(user.contains("Picture 1: lines 0, 1\nPicture 2: lines 2\n"));
+        assert!(user.contains("2: \"c\""));
     }
 
     #[test]
@@ -1118,10 +1373,13 @@ mod tests {
     #[test]
     fn the_default_chain_starts_with_the_vision_model() {
         let config = AnalysisConfig::default();
-        assert!(config.models[0].vision && config.models[1].vision && !config.models[2].vision);
+        assert!(config.models.iter().all(|model| model.vision));
+        assert!(!config.models[0].panels && !config.models[1].panels && config.models[2].panels);
+        assert!(config.right_to_left);
         assert_eq!(config.models[2].model, "deepseek-ai/deepseek-v4.1-flash");
         let parsed: AnalysisConfig =
             serde_json::from_str(r#"{"models": [{"model": "a/b"}]}"#).unwrap();
         assert!(parsed.enabled && parsed.models.len() == 1 && parsed.models[0].vision);
+        assert!(!parsed.models[0].panels, "panels are off unless asked for");
     }
 }
