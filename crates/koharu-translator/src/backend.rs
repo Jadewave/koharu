@@ -129,15 +129,22 @@ impl TranslationRequest {
 
 /// The image scaled down so that its longest side is at most `MAX_IMAGE_DIMENSION`.
 fn shrink(image: &Arc<DynamicImage>) -> anyhow::Result<Arc<DynamicImage>> {
+    shrink_to(image, MAX_IMAGE_DIMENSION)
+}
+
+/// The image scaled down so that its longest side is at most `maximum` pixels.
+pub(crate) fn shrink_to(
+    image: &Arc<DynamicImage>,
+    maximum: u32,
+) -> anyhow::Result<Arc<DynamicImage>> {
     let (width, height) = (image.width(), image.height());
     let longest = width.max(height);
-    if longest <= MAX_IMAGE_DIMENSION {
+    if longest <= maximum {
         return Ok(Arc::clone(image));
     }
-    let resized_width =
-        (u64::from(width) * u64::from(MAX_IMAGE_DIMENSION) / u64::from(longest)).max(1) as u32;
+    let resized_width = (u64::from(width) * u64::from(maximum) / u64::from(longest)).max(1) as u32;
     let resized_height =
-        (u64::from(height) * u64::from(MAX_IMAGE_DIMENSION) / u64::from(longest)).max(1) as u32;
+        (u64::from(height) * u64::from(maximum) / u64::from(longest)).max(1) as u32;
     let source = image.to_rgb8();
     let mut resized = RgbImage::new(resized_width, resized_height);
     Resizer::new()

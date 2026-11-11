@@ -140,14 +140,20 @@ impl StageRunner {
             })
     }
 
-    /// Runs between the last non-translation stage and the first translation: frees the
-    /// vision models, then lets the glossary model read the OCR text of every page.
+    /// Runs between the last non-translation stage and the first translation: the vision
+    /// models of the analysis read every page (picture and OCR text) when they are set up; if
+    /// they could not, frees the vision models and lets the glossary model read the OCR text
+    /// of every page.
     pub(crate) async fn prepare_translation(
         &self,
         project: &str,
         lines: Vec<String>,
+        inputs: Vec<StageInput>,
         stop: impl Fn() -> bool + Send + Sync,
     ) -> Result<()> {
+        if self.stages.analyze_work(project, inputs, &stop).await {
+            return Ok(());
+        }
         let heavy = self.stages.builds_glossary() && !lines.is_empty();
         let _permit = if heavy {
             Some(self.accelerator.acquire().await)

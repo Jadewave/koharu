@@ -10,7 +10,9 @@ use imageproc::{drawing::draw_filled_rect_mut, rect::Rect};
 use koharu_scene::{
     Authored, EntityId, Geometry, LanguageTag, Origin, SourceText, Translation,
 };
-use koharu_translator::{Provider, TranslationRequest, Translator, needs_translation};
+use koharu_translator::{
+    AnalysisPage, PageAnalysis, Provider, TranslationRequest, Translator, needs_translation,
+};
 
 use crate::TranslationConfig;
 
@@ -34,6 +36,9 @@ pub(super) struct Processor {
     /// by text content: the source they were made from, and the translation. Each page takes
     /// its own when its turn comes.
     pending: Mutex<BTreeMap<EntityId, (String, String)>>,
+    /// What the vision models learned about each page before the translation began: the
+    /// notes the translation model reads with the page and the corrections of its OCR text.
+    analysis: Mutex<BTreeMap<EntityId, PageAnalysis>>,
 }
 
 impl Processor {
@@ -42,7 +47,14 @@ impl Processor {
             config,
             translator,
             pending: Mutex::new(BTreeMap::new()),
+            analysis: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn analysis(&self) -> std::sync::MutexGuard<'_, BTreeMap<EntityId, PageAnalysis>> {
+        self.analysis
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn pending(&self) -> std::sync::MutexGuard<'_, BTreeMap<EntityId, (String, String)>> {
@@ -54,6 +66,84 @@ impl Processor {
     /// True when a glossary is written for this model selection (local models only).
     pub(super) fn builds_glossary(&self) -> bool {
         self.config.model.provider == koharu_translator::Provider::Local
+    }
+
+    /// Lets the vision models of the analysis read every page (picture and OCR text) before
+    /// any page is translated: they write the glossary of the whole work and the notes for
+    /// every page. Returns whether any page was read; a failure never fails the run, the pages
+    /// are then translated as they were without it.
+    pub(super) async fn analyze_work(
+        &self,
+        project: &str,
+        inputs: Vec<StageInput>,
+        stop: &(impl Fn() -> bool + Send + Sync),
+    ) -> bool {
+        // A new run: whatever an earlier run left over is stale.
+        self.pending().clear();
+        self.analysis().clear();
+        if !self.translator.analysis_enabled() {
+            return false;
+        }
+        let mut order = Vec::new();
+        let mut pages = Vec::new();
+        for input in &inputs {
+            let texts = match page_texts(input, input.page, |entity| input.contains_entity(entity))
+            {
+                Ok(texts) => texts,
+                Err(error) => {
+                    tracing::warn!(%error, "could not read the text of a page for the analysis");
+                    continue;
+                }
+            };
+            let translatable = texts.translatable();
+            if translatable.is_empty() {
+                continue;
+            }
+            let image = match input.images.get(&input.scene, input.page, "source").await {
+                Ok(Some(image)) => image,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, "could not load a page for the analysis");
+                    continue;
+                }
+            };
+            // The boxes carry the same numbers as the OCR lines listed to the model.
+            let boxes: Vec<_> = translatable.iter().map(|&target| texts.boxes[target]).collect();
+            let marked = Arc::new(mark_segments(&image, &boxes, 0));
+            let segments = translatable
+                .iter()
+                .map(|&target| texts.targets[target].1.clone())
+                .collect();
+            match AnalysisPage::new(&marked, segments) {
+                Ok(page) => {
+                    order.push(input.page);
+                    pages.push(page);
+                }
+                Err(error) => tracing::warn!(%error, "could not prepare a page for the analysis"),
+            }
+        }
+        if pages.is_empty() {
+            return false;
+        }
+        match self
+            .translator
+            .analyze_work(project, self.config.target_language, &pages, stop)
+            .await
+        {
+            Ok(results) => {
+                let mut analysis = self.analysis();
+                for (page, result) in order.into_iter().zip(results) {
+                    if let Some(result) = result {
+                        analysis.insert(page, result);
+                    }
+                }
+                !analysis.is_empty()
+            }
+            Err(error) => {
+                tracing::warn!(%error, "analysis failed; translating without it");
+                false
+            }
+        }
     }
 
     /// Lets the glossary model read the OCR text of the whole work before any page is
@@ -163,7 +253,20 @@ impl Processor {
         let local = self.config.model.provider == Provider::Local;
         let mut pages = vec![current.clone()];
         let mut images: Vec<Arc<DynamicImage>> = Vec::new();
-        if Translator::supports_vision(&self.config.model, &self.config.generation)
+        // A page the vision models read is translated from text alone: their notes say who
+        // speaks to whom and with which words, and their corrections replace the OCR errors.
+        let read: Vec<String> = current
+            .translatable()
+            .iter()
+            .map(|&target| current.targets[target].1.clone())
+            .collect();
+        let analysis = self.analysis().get(&input.page).cloned();
+        let notes = analysis
+            .as_ref()
+            .map(|analysis| analysis.instructions(&read))
+            .filter(|notes| !notes.is_empty());
+        if notes.is_none()
+            && Translator::supports_vision(&self.config.model, &self.config.generation)
             && let Some(image) = input.images.get(&input.scene, input.page, "source").await?
         {
             images.push(image);
@@ -216,15 +319,27 @@ impl Processor {
                 segment_pages.push(index);
             }
         }
+        if let Some(analysis) = analysis.as_ref().filter(|_| notes.is_some()) {
+            let corrected = analysis.texts(&read);
+            if corrected.len() == segments.len() {
+                segments = corrected;
+            }
+        }
         let expected = segments.len();
         tracing::info!(
             pages = pages.len(),
             segments = expected,
             images = marked.len(),
+            analysed = notes.is_some(),
             "translating pages together"
         );
         let mut request = TranslationRequest::new(segments, self.config.target_language);
-        if let Some(instructions) = self.config.instructions.as_deref() {
+        let instructions = [self.config.instructions.as_deref(), notes.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !instructions.is_empty() {
             request = request.with_instructions(instructions);
         }
         if with_images {

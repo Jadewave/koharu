@@ -1,6 +1,7 @@
 //! Translation through local and hosted providers.
 
 mod address;
+mod analysis;
 mod backend;
 mod error;
 mod language;
@@ -22,6 +23,7 @@ use koharu_ml::Device;
 use error::{Error, Result};
 use local::LocalTranslator;
 
+pub use analysis::{AnalysisConfig, AnalysisModel, AnalysisPage, PageAnalysis};
 pub use backend::{GlossaryEntry, TranslationContext, TranslationRequest};
 
 /// Whether a segment has anything to translate: sound effects made only of punctuation or

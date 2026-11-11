@@ -132,6 +132,17 @@ impl Stages {
         self.translation.builds_glossary()
     }
 
+    /// Lets the vision models read the work before it is translated; see
+    /// `translation::Processor::analyze_work`.
+    pub(crate) async fn analyze_work(
+        &self,
+        project: &str,
+        inputs: Vec<StageInput>,
+        stop: &(impl Fn() -> bool + Send + Sync),
+    ) -> bool {
+        self.translation.analyze_work(project, inputs, stop).await
+    }
+
     pub(crate) async fn build_glossary(
         &self,
         project: &str,

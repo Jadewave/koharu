@@ -66,6 +66,16 @@ impl Default for OpenAiCompatibleConfig {
     }
 }
 
+/// One request for a JSON answer: what to ask, the images that go with it (as data URLs), and
+/// the JSON schema the answer follows.
+pub(crate) struct Chat {
+    pub(crate) system: String,
+    pub(crate) user: String,
+    pub(crate) images: Vec<String>,
+    pub(crate) schema_name: &'static str,
+    pub(crate) schema: serde_json::Value,
+}
+
 pub(super) async fn translate(
     client: &Client,
     config: &OpenAiCompatibleConfig,
@@ -73,25 +83,57 @@ pub(super) async fn translate(
     generation: &GenerationConfig,
     request: &TranslationRequest,
 ) -> Result<Vec<String>> {
-    let api_key = koharu_secrets::get("openai-compatible")?;
     let (system, user) = prompt::prompts(request)?;
-    let user_content = match request.image.as_deref() {
-        Some(image) => MessageContent::Parts(vec![
-            ContentPart::Text { text: user },
-            ContentPart::ImageUrl {
-                image_url: ImageUrl {
-                    url: encode_image(image)?.data_url(),
-                },
-            },
-        ]),
-        None => MessageContent::Text(user),
+    let images = match request.image.as_deref() {
+        Some(image) => vec![encode_image(image)?.data_url()],
+        None => Vec::new(),
+    };
+    let text = chat_json(
+        client,
+        config,
+        model,
+        generation,
+        Chat {
+            system,
+            user,
+            images,
+            schema_name: "manga_translation",
+            schema: prompt::output_schema(request.segments.len()),
+        },
+    )
+    .await?;
+    Ok(prompt::translations(
+        "openai-compatible",
+        &text,
+        &request.segments,
+    )?)
+}
+
+/// Sends `chat` to the server and returns the text of the answer, cleaned of the thinking and
+/// the markdown fence that reasoning models wrap around a JSON answer.
+pub(super) async fn chat_json(
+    client: &Client,
+    config: &OpenAiCompatibleConfig,
+    model: &str,
+    generation: &GenerationConfig,
+    chat: Chat,
+) -> Result<String> {
+    let api_key = koharu_secrets::get("openai-compatible")?;
+    let user_content = if chat.images.is_empty() {
+        MessageContent::Text(chat.user)
+    } else {
+        let mut parts = vec![ContentPart::Text { text: chat.user }];
+        parts.extend(chat.images.into_iter().map(|url| ContentPart::ImageUrl {
+            image_url: ImageUrl { url },
+        }));
+        MessageContent::Parts(parts)
     };
     let body = ChatRequest {
         model,
         messages: [
             Message {
                 role: "system",
-                content: MessageContent::Text(system),
+                content: MessageContent::Text(chat.system),
             },
             Message {
                 role: "user",
@@ -113,9 +155,9 @@ pub(super) async fn translate(
         response_format: ResponseFormat {
             kind: "json_schema",
             json_schema: JsonSchema {
-                name: "manga_translation",
+                name: chat.schema_name,
                 strict: true,
-                schema: prompt::output_schema(request.segments.len()),
+                schema: chat.schema,
             },
         },
     };
@@ -155,12 +197,7 @@ pub(super) async fn translate(
         .into_iter()
         .next()
         .context("OpenAI-compatible backend returned no choices")?;
-    let text = answer_text(choice)?;
-    Ok(prompt::translations(
-        "openai-compatible",
-        &text,
-        &request.segments,
-    )?)
+    Ok(answer_text(choice)?)
 }
 
 /// What the server refused before for this endpoint and model, so that a later request does

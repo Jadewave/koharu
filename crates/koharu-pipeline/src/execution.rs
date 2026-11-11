@@ -182,9 +182,29 @@ impl<'a> Execution<'a> {
         }
         let project = format!("{:?}", self.scene.project_id());
         let stop = self.stop.clone();
+        // What the vision models of the analysis read: every page of the run.
+        let mut inputs = Vec::with_capacity(pages.len());
+        for &page in &pages {
+            let images = self
+                .images
+                .entry(page)
+                .or_insert_with(|| Arc::new(ImageCache::default()))
+                .clone();
+            inputs.push(
+                StageInput::new(
+                    self.scene.clone(),
+                    page,
+                    self.scope.entities(),
+                    self.scope.region(page),
+                    images,
+                    None,
+                )
+                .with_pages(self.scope.shared_pages()),
+            );
+        }
         if let Err(error) = self
             .runner
-            .prepare_translation(&project, lines, move || stop.stopped())
+            .prepare_translation(&project, lines, inputs, move || stop.stopped())
             .await
         {
             tracing::warn!(%error, "glossary phase failed; translating without a glossary");

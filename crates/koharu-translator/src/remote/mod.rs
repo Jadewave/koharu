@@ -27,6 +27,7 @@ pub use lm_studio::LmStudioConfig;
 pub use minimax::MiniMaxConfig;
 pub use openai::OpenAiConfig;
 pub use openai_compatible::OpenAiCompatibleConfig;
+pub(crate) use openai_compatible::Chat;
 pub use openrouter::OpenRouterConfig;
 
 use crate::{
@@ -94,6 +95,19 @@ pub(crate) async fn translate(
     }
 }
 
+/// Asks an OpenAI-compatible server (the one of `providers.openai_compatible`) for a JSON
+/// answer and returns its text.
+pub(crate) async fn chat_json(
+    client: &Client,
+    providers: &ProvidersConfig,
+    model: &str,
+    generation: &GenerationConfig,
+    chat: Chat,
+) -> Result<String> {
+    openai_compatible::chat_json(client, &providers.openai_compatible, model, generation, chat)
+        .await
+}
+
 pub(crate) async fn models(client: &Client, providers: &ProvidersConfig) -> Vec<Model> {
     let pending: Vec<(&'static str, BoxFuture<'_, Result<Vec<Model>>>)> = vec![
         ("openai", openai::models(client).boxed()),
@@ -153,7 +167,7 @@ pub(crate) async fn models(client: &Client, providers: &ProvidersConfig) -> Vec<
                     _ => false,
                 };
                 if probing_local {
-                    tracing::debug!(
+                    tracing::trace!(
                         provider,
                         error = %detail,
                         "no local server to list models from"
@@ -184,7 +198,7 @@ pub(crate) async fn models(client: &Client, providers: &ProvidersConfig) -> Vec<
 }
 
 /// Whether a server URL is on this machine (an unset URL stands for the local default).
-fn is_loopback(url: Option<&url::Url>) -> bool {
+pub(crate) fn is_loopback(url: Option<&url::Url>) -> bool {
     url.is_none_or(|url| {
         matches!(
             url.host_str(),
