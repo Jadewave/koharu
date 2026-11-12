@@ -72,6 +72,9 @@ pub struct AnalysisModel {
     /// (when the page has at least two panels that hold text).
     #[serde(default)]
     pub panels: bool,
+    /// Lets this model think before it answers. Unset: follows `[analysis] reasoning`.
+    #[serde(default)]
+    pub reasoning: Option<bool>,
 }
 
 const fn yes() -> bool {
@@ -80,20 +83,22 @@ const fn yes() -> bool {
 
 impl Default for AnalysisConfig {
     fn default() -> Self {
-        let model = |name: &str, panels: bool| AnalysisModel {
+        let model = |name: &str, panels: bool, reasoning: Option<bool>| AnalysisModel {
             model: name.to_owned(),
             vision: true,
             panels,
+            reasoning,
         };
         Self {
             enabled: true,
             models: vec![
-                model("nvidia/nemotron-3.5-super-vl-120b-a12b", false),
-                model("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", false),
-                model("deepseek-ai/deepseek-v4.1-flash", true),
+                model("nvidia/nemotron-3.5-super-vl-120b-a12b", false, Some(true)),
+                model("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", false, Some(true)),
+                model("deepseek-ai/deepseek-v4.1-flash", true, None),
             ],
             reasoning: false,
-            max_tokens: 8192,
+            // Thinking tokens count against this limit, so it is large for the reasoning models.
+            max_tokens: 16384,
             image_max_dimension: 1600,
             panel_max_dimension: 1024,
             right_to_left: true,
@@ -1139,6 +1144,10 @@ impl Translator {
                     images,
                     schema_name: "manga_page_analysis",
                     schema: schema(count),
+                };
+                let generation = GenerationConfig {
+                    reasoning: Some(entry.reasoning.unwrap_or(config.reasoning)),
+                    ..generation
                 };
                 let attempt = remote::chat_json(&self.client, &providers, &entry.model, &generation, chat)
                     .await

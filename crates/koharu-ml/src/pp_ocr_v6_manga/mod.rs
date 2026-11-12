@@ -1,7 +1,7 @@
 //! PP-OCRv6 manga: a manga fine-tune of the PP-OCRv6 tiny detector and small
 //! recognizer, run on ONNX Runtime.
 //!
-//! Upstream: <https://huggingface.co/Kellenok/PP-OCRv6_manga>. The checkpoint is
+//! Upstream: <https://huggingface.co/Kellenok/PP-OCRv6_manga> (revision `v0.3`). The checkpoint is
 //! pinned below. The pipeline is a port of the author's reference demo
 //! (<https://huggingface.co/spaces/Kellenok/PP-OCR_manga>, `app.py`): the detector
 //! finds the text lines inside the crop, each line is cut out upright, the
@@ -45,9 +45,13 @@ use self::{
     session::OnnxSession,
 };
 
-crate::model_repository!("Kellenok/PP-OCRv6_manga" @ "main" {
-    DETECTOR = "det/manga_det_v0.2.onnx",
-    RECOGNIZER = "rec/manga_rec_v0.2.onnx",
+// v0.3 keeps its files under version-agnostic names and is published under the `v0.3` revision
+// (`main` only holds the older v0.1 and v0.2 files). The FP32 files are used: the FP16 ones take
+// and return half-precision tensors. The dictionary (19,053 symbols) plus the blank and the
+// space class gives the recognizer's 19,055 classes.
+crate::model_repository!("Kellenok/PP-OCRv6_manga" @ "v0.3" {
+    DETECTOR = "det/manga_det.onnx",
+    RECOGNIZER = "rec/manga_rec.onnx",
     DICTIONARY = "ppocrv6_dict.txt",
 });
 
