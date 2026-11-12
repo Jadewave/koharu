@@ -20,8 +20,10 @@ use image::DynamicImage;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
+mod review;
+
 use crate::{
-    Error, GenerationConfig, Language, Translator,
+    Error, GenerationConfig, Language, ProvidersConfig, Translator,
     backend::{GlossaryEntry, encode_image, shrink_to},
     remote,
 };
@@ -48,9 +50,19 @@ pub struct AnalysisConfig {
     pub enabled: bool,
     /// The models, in the order they are tried for every page.
     pub models: Vec<AnalysisModel>,
-    /// Lets the models think before they answer. Slower and it needs `max_tokens` to be large.
+    /// Lets the models think while they read a page. Slower and it needs `max_tokens` to be
+    /// large. Off by default: the second reading (`review`) is where thinking pays.
     pub reasoning: bool,
     pub max_tokens: u32,
+    /// After every page is read, the models read the whole work again as text, settle the words
+    /// for "I" and "you" of every pair of characters and correct the notes of the pages that
+    /// disagree with it.
+    pub review: bool,
+    /// Lets the models think during the second reading.
+    pub review_reasoning: bool,
+    /// How many characters of the pages one request of the second reading carries; a longer
+    /// work is read in several parts.
+    pub review_chars: usize,
     /// The longest side of the page picture that is sent, in pixels.
     pub image_max_dimension: u32,
     /// The longest side of a panel picture that is sent, in pixels.
@@ -72,7 +84,7 @@ pub struct AnalysisModel {
     /// (when the page has at least two panels that hold text).
     #[serde(default)]
     pub panels: bool,
-    /// Lets this model think before it answers. Unset: follows `[analysis] reasoning`.
+    /// Lets this model think while it reads a page. Unset: follows `[analysis] reasoning`.
     #[serde(default)]
     pub reasoning: Option<bool>,
 }
@@ -92,13 +104,16 @@ impl Default for AnalysisConfig {
         Self {
             enabled: true,
             models: vec![
-                model("nvidia/nemotron-3.5-super-vl-120b-a12b", false, Some(true)),
-                model("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", false, Some(true)),
+                model("nvidia/nemotron-3.5-super-vl-120b-a12b", false, None),
+                model("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", false, None),
                 model("deepseek-ai/deepseek-v4.1-flash", true, None),
             ],
             reasoning: false,
-            // Thinking tokens count against this limit, so it is large for the reasoning models.
+            // Thinking tokens count against this limit, so it is large for the second reading.
             max_tokens: 16384,
+            review: true,
+            review_reasoning: true,
+            review_chars: 60_000,
             image_max_dimension: 1600,
             panel_max_dimension: 1024,
             right_to_left: true,
@@ -533,9 +548,14 @@ shows otherwise. Report only what is new or changed.
 - Write the lines in the order of their numbers and answer for every number you were given.
 - Answer with the JSON object only."
     );
+    prompt.push_str(pronoun_rules(target));
+    prompt
+}
+
+/// What the target language adds to the rules for the words of "I" and "you".
+fn pronoun_rules(target: Language) -> &'static str {
     if target == Language::Vietnamese {
-        prompt.push_str(
-            "
+        "
 
 Vietnamese pronouns for self and you:
 - Pick the pair from the relationship, the ages and the rank, for example 'tôi - cô', \
@@ -545,10 +565,10 @@ a formal pair, close people a familiar one. Do not give everyone the same pair.
 direction the same on every page.
 - An older speaker calls himself 'tôi' (or 'bác', 'chú', 'ông', 'lão' by age and manner), never \
 'con' or 'cháu', unless the speaker is a child or a younger relative of the listener.
-- The first-person word of a thought is the one the character uses aloud, or 'mình'.",
-        );
+- The first-person word of a thought is the one the character uses aloud, or 'mình'."
+    } else {
+        ""
     }
-    prompt
 }
 
 /// What the vision model is shown of a page.
@@ -765,8 +785,13 @@ impl Bible {
         {
             return;
         }
+        // A listener known under an alias is written under the name of the character.
+        let listener = match self.character_index(listener) {
+            Some(index) => self.characters[index].name.clone(),
+            None => listener.to_owned(),
+        };
         let relationship = Relationship {
-            with: listener.to_owned(),
+            with: listener,
             relation: String::new(),
             self_word: self_word.to_owned(),
             you: you.to_owned(),
@@ -1188,6 +1213,11 @@ impl Translator {
                     results.push(None);
                 }
             }
+        }
+
+        if config.review {
+            self.review_work(&config, &providers, language, &mut bible, &mut results, &mut dead, &stop)
+                .await;
         }
 
         if let Ok(mut glossary) = self.glossary.lock() {
