@@ -21,6 +21,7 @@
 use std::{collections::HashMap, fmt::Write as _, ops::Range};
 
 use super::*;
+use crate::address::PairBook;
 
 const SCHEMA_NAME: &str = "manga_address_review";
 
@@ -222,6 +223,46 @@ fn overwrite(field: &mut String, value: &str) -> bool {
     }
     *field = value;
     true
+}
+
+/// Locks, in the pair book the translation is held to, the pair of every direction whose
+/// lines all use the same words. A direction with exceptions is left out: the lines that differ
+/// would be translated again with the pair of the others. Returns how many were locked.
+pub(super) fn seed_pairs(book: &mut PairBook, bible: &Bible, results: &[Option<PageAnalysis>]) -> usize {
+    let name = |name: &str| {
+        bible
+            .character_index(name)
+            .map_or_else(|| name.trim().to_owned(), |index| bible.characters[index].name.clone())
+    };
+    let mut directions: Vec<((String, String), Vec<(String, String)>)> = Vec::new();
+    for page in results.iter().flatten() {
+        for line in &page.lines {
+            if is_generic(&line.speaker)
+                || is_generic(&line.listener)
+                || line.self_word.trim().is_empty()
+                || line.you.trim().is_empty()
+            {
+                continue;
+            }
+            let key = (name(&line.speaker), name(&line.listener));
+            let pair = (line.self_word.trim().to_lowercase(), line.you.trim().to_lowercase());
+            match directions.iter_mut().find(|(known, _)| *known == key) {
+                Some((_, pairs)) => {
+                    if !pairs.contains(&pair) {
+                        pairs.push(pair);
+                    }
+                }
+                None => directions.push((key, vec![pair])),
+            }
+        }
+    }
+    let mut seeded = 0;
+    for ((from, to), pairs) in directions {
+        if pairs.len() == 1 && book.seed(&from, &to, &pairs[0].0, &pairs[0].1) {
+            seeded += 1;
+        }
+    }
+    seeded
 }
 
 impl Bible {
@@ -586,6 +627,24 @@ mod tests {
         assert_eq!(answer.changes[0], Change { page: 1, id: 1, self_word: String::new(), you: "em".to_owned() });
         assert!(parse("no json here").is_err());
         assert_eq!(parse("{}").unwrap(), ReviewOutput::default());
+    }
+
+    #[test]
+    fn the_translation_is_held_to_the_pairs_all_lines_agree_on() {
+        let mut bible = Bible::default();
+        let mut analysis = page(FIRST, 4, &mut bible);
+        let answer = editor_answer();
+        bible.review_character(&answer.characters[0]);
+        let mut exceptions = HashMap::new();
+        exceptions.insert(1, (String::new(), "em".to_owned()));
+        analysis.apply_review(&bible, Some(&exceptions));
+        // Sasaki -> Rio has two pairs now (line 0 and the exception of line 1): not locked.
+        let mut book = PairBook::default();
+        assert_eq!(seed_pairs(&mut book, &bible, &[Some(analysis.clone())]), 0);
+        // Without the exception the direction has one pair, which is locked.
+        analysis.apply_review(&bible, None);
+        assert_eq!(seed_pairs(&mut book, &bible, &[Some(analysis), None]), 1);
+        assert_eq!(book.entries(), [("Sasaki -> Rio".to_owned(), "tôi - chị".to_owned())]);
     }
 
     #[test]

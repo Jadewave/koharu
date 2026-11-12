@@ -1220,9 +1220,26 @@ impl Translator {
                 .await;
         }
 
-        if let Ok(mut glossary) = self.glossary.lock() {
-            glossary.begin(project, language);
-            glossary.merge(bible.glossary_entries());
+        // What the whole work decided replaces what an earlier run of it wrote.
+        let restarted = match self.glossary.lock() {
+            Ok(mut glossary) => {
+                let restarted = glossary.begin(project, language);
+                glossary.replace(bible.glossary_entries());
+                restarted
+            }
+            Err(_) => false,
+        };
+        if restarted && let Ok(mut memory) = self.memory.lock() {
+            // Another work (or language): its first page must not see the lines of the last.
+            memory.recent.clear();
+            memory.recent_pages.clear();
+        }
+        // The pairs the translations locked in an earlier run are stale; the pairs of this
+        // reading are what the translation is held to.
+        if let Ok(mut book) = self.pairs.lock() {
+            book.clear();
+            let seeded = review::seed_pairs(&mut book, &bible, &results);
+            tracing::info!(seeded, "pronoun pairs of the analysis given to the translation");
         }
         tracing::info!(
             characters = bible.characters.len(),

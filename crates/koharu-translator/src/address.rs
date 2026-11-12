@@ -428,6 +428,32 @@ impl PairBook {
         newly
     }
 
+    /// Locks a pair that was decided outside the translations (by the analysis of the whole
+    /// work) and so replaces what the translations had locked for the direction. Returns
+    /// false for names or words that make no pair.
+    pub(crate) fn seed(&mut self, from_name: &str, to_name: &str, mine: &str, yours: &str) -> bool {
+        let (from, to) = (norm_name(from_name), norm_name(to_name));
+        let (Some(mine), Some(yours)) = (clean_word(mine), clean_word(yours)) else {
+            return false;
+        };
+        if from == to || GENERIC.contains(&from.as_str()) || GENERIC.contains(&to.as_str()) {
+            return false;
+        }
+        self.locked
+            .retain(|locked| (locked.declared.from.as_str(), locked.declared.to.as_str()) != (from.as_str(), to.as_str()));
+        self.locked.push(Locked {
+            declared: Declared {
+                from,
+                to,
+                from_name: from_name.trim().to_owned(),
+                to_name: to_name.trim().to_owned(),
+                mine,
+                yours,
+            },
+        });
+        true
+    }
+
     /// The locked pairs as glossary `address` entries: (`Speaker -> Listener`, `I - you`).
     pub(crate) fn entries(&self) -> Vec<(String, String)> {
         self.locked
@@ -561,6 +587,20 @@ mod tests {
         assert_eq!(book.conflicts(&declared, &translations), [2]);
         let note = book.note(&declared, &[2]);
         assert!(note.contains("Sasaki>Rio: anh - em"), "{note}");
+    }
+
+    #[test]
+    fn a_seeded_pair_replaces_a_locked_one_and_is_enforced() {
+        let mut book = PairBook::default();
+        line(&mut book, "Sasaki>Rio: anh - em", "Anh đây.");
+        line(&mut book, "Sasaki>Rio: anh - em", "Em ơi.");
+        assert!(book.seed("Sasaki-kun", "Rio", "Tôi", "chị"));
+        assert!(!book.seed("narrator", "Rio", "tôi", "chị"));
+        assert!(!book.seed("Sasaki", "Rio", "", "chị"));
+        assert_eq!(book.entries(), [("Sasaki-kun -> Rio".to_owned(), "tôi - chị".to_owned())]);
+        let declared = [declared("Sasaki>Rio: anh - em"), declared("Sasaki>Rio: tôi - chị")];
+        let translations = texts(&["Anh cảm ơn em.", "Tôi muốn giúp chị."]);
+        assert_eq!(book.conflicts(&declared, &translations), [0]);
     }
 
     #[test]

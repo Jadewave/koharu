@@ -95,6 +95,25 @@ impl Glossary {
         restart
     }
 
+    /// Writes entries that were decided on purpose, by the analysis that read the whole work:
+    /// an entry of the same kind and source takes the new target, the others are added. A
+    /// later run of the same work thus replaces what an earlier one wrote.
+    fn replace(&mut self, entries: Vec<GlossaryEntry>) {
+        for entry in entries.into_iter().filter_map(clean_entry) {
+            let source = entry.source.to_lowercase();
+            match self
+                .entries
+                .iter_mut()
+                .find(|known| known.kind == entry.kind && known.source.to_lowercase() == source)
+            {
+                Some(known) => known.target = entry.target,
+                None => self.entries.push(entry),
+            }
+        }
+        let excess = self.entries.len().saturating_sub(GLOSSARY_MAX_ENTRIES);
+        self.entries.drain(..excess);
+    }
+
     /// Adds entries that are not known yet. Existing entries win, so a rendering never
     /// flips once it has been chosen.
     fn merge(&mut self, entries: Vec<GlossaryEntry>) {
@@ -1228,6 +1247,26 @@ mod tests {
             entry("address", "田中 -> 鈴木", "anh - em"),
         ]);
         assert_eq!(glossary.entries, [entry("address", "田中 -> 鈴木", "tớ - cậu")]);
+    }
+
+    #[test]
+    fn a_decided_address_pair_replaces_the_one_of_an_earlier_run() {
+        let entry = |source: &str, target: &str| GlossaryEntry {
+            kind: "address".to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let mut glossary = Glossary::default();
+        glossary.merge(vec![entry("Sasaki -> Rio", "anh - em"), entry("Rio -> Sasaki", "em - anh")]);
+        glossary.replace(vec![entry("sasaki -> rio", "tôi - chị"), entry("Yuu -> Rio", "tớ - cậu")]);
+        assert_eq!(
+            glossary.entries,
+            [
+                entry("Sasaki -> Rio", "tôi - chị"),
+                entry("Rio -> Sasaki", "em - anh"),
+                entry("Yuu -> Rio", "tớ - cậu"),
+            ]
+        );
     }
 
     #[test]
