@@ -43,6 +43,32 @@ RUN mkdir -p /opt/ort \
     && cp -L "/tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION}" /opt/ort/libonnxruntime.so \
     && rm -rf "/tmp/onnxruntime-linux-x64-${ORT_VERSION}"
 
+# The CEF runtime (libcef.so and its resources) is not always next to the binary in
+# target/release, so look for it where the build left it and gather what the app needs in
+# /opt/cef. When it is nowhere, say so and show what the build produced.
+RUN set -eux; \
+    mkdir -p /opt/cef; \
+    lib="$(find /src/target /root -name libcef.so -type f 2>/dev/null | head -n 1 || true)"; \
+    if [ -z "$lib" ]; then \
+        echo "libcef.so was not produced by the build. target/release holds:"; \
+        ls -la /src/target/release | head -n 80; \
+        find / -xdev \( -iname 'libcef*' -o -iname 'icudtl.dat' \) 2>/dev/null | head -n 40; \
+        exit 1; \
+    fi; \
+    dir="$(dirname "$lib")"; \
+    echo "CEF runtime found in $dir"; \
+    ls -la "$dir" | head -n 80; \
+    for f in libcef.so icudtl.dat resources.pak locales chrome-sandbox \
+             chrome_100_percent.pak chrome_200_percent.pak \
+             v8_context_snapshot.bin snapshot_blob.bin \
+             libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 vk_swiftshader_icd.json; do \
+        if [ -e "$dir/$f" ]; then cp -a "$dir/$f" /opt/cef/; fi; \
+    done; \
+    test -f /opt/cef/libcef.so; \
+    test -f /opt/cef/icudtl.dat; \
+    test -f /opt/cef/resources.pak; \
+    ls -la /opt/cef
+
 
 FROM ubuntu:24.04 AS runtime
 
@@ -114,16 +140,13 @@ RUN chown -R 1000:1000 /home/user \
 WORKDIR /app
 
 COPY --from=builder /src/target/release/koharu /app/koharu
-COPY --from=builder /src/target/release/libcef.so /app/libcef.so
-COPY --from=builder /src/target/release/icudtl.dat /app/icudtl.dat
-COPY --from=builder /src/target/release/resources.pak /app/resources.pak
-COPY --from=builder /src/target/release/locales /app/locales
-COPY --from=builder /src/target/release/chrome-sandbox /app/chrome-sandbox
+COPY --from=builder /opt/cef/ /app/
 COPY --from=builder /opt/ort/libonnxruntime.so /app/libonnxruntime.so
 
 RUN chown -R 1000:1000 /app \
-    && chown root:root /app/chrome-sandbox \
-    && chmod 4755 /app/chrome-sandbox
+    && if [ -f /app/chrome-sandbox ]; then \
+        chown root:root /app/chrome-sandbox && chmod 4755 /app/chrome-sandbox; \
+    fi
 
 ENV LD_LIBRARY_PATH=/app
 ENV WGPU_BACKEND=vulkan
