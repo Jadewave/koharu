@@ -35,9 +35,24 @@ struct Change {
     /// The number of the line on the page.
     #[serde(deserialize_with = "lenient_id")]
     id: usize,
+    /// Who really says the line, when the readers got it wrong.
+    #[serde(deserialize_with = "lenient_string")]
+    speaker: String,
+    /// Who the line is really said to.
+    #[serde(deserialize_with = "lenient_string")]
+    listener: String,
     #[serde(rename = "self", deserialize_with = "lenient_string")]
     self_word: String,
     #[serde(deserialize_with = "lenient_string")]
+    you: String,
+}
+
+/// What the editor corrected in one line.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LineFix {
+    speaker: String,
+    listener: String,
+    self_word: String,
     you: String,
 }
 
@@ -85,6 +100,8 @@ fn schema() -> Value {
                     "properties": {
                         "page": { "type": "integer", "minimum": 1, "description": "The number of the page." },
                         "id": { "type": "integer", "minimum": 0, "description": "The number of the line on that page." },
+                        "speaker": text("The character who really says the line: only to correct the readers."),
+                        "listener": text("The character the line is really said to: only to correct the readers."),
                         "self": text("The word the speaker uses for themselves in this line."),
                         "you": text("The word the speaker uses for the listener in this line.")
                     },
@@ -105,13 +122,22 @@ their choices can clash. You now see the whole work as text and you settle the w
 so that they fit the story and are the same wherever the same people talk to each other.
 
 What you do:
+- Find out who the characters really are. The readers sometimes named a speaker by a role \
+(nurse, patient, visitor, customer) or took two people for one, because the names were not known \
+on the first pages. The text tells: a name said in a line belongs to someone other than the \
+speaker, people who answer each other are different people, and nobody speaks to themself \
+except in a thought. When the text shows who really says or hears a line, list that line in \
+changes with speaker and/or listener set to the right name. Use the names of the list; add a \
+character to characters only when a real person is missing from it.
 - Check the gender and age of every character against all their lines: how they speak (俺, 僕, \
 あたし, sentence endings, honorifics) and how the others talk to them. Report a character's \
 gender or age only to correct it.
-- For every direction (a speaker to a listener) that appears in the lines, decide the one pair of \
-words that fits their relationship, their ages, their rank and their closeness, and give it in \
+- For every direction (a speaker to a listener) decide the one pair of words that fits their \
+relationship, their ages, their rank and their closeness, and give it in \
 characters[].relationships (with, relation, self, you). A pair belongs to one direction: what A \
-calls B is not what B calls A.
+calls B is not what B calls A. Lines of a direction take its pair by themselves, so do not go \
+through the lines one by one: think about the people and their pairs, then about the few lines \
+that need something else.
 - The same person is called the same way by everyone who stands in the same relation to them. \
 Do not let one speaker call a man 'anh' and another speaker, in the same relation, call him 'cô'.
 - Honorifics (さん, くん, ちゃん, 様) show closeness and rank and never the gender of the \
@@ -121,9 +147,9 @@ in characters the pair that holds for most of the work, and list in changes each
 must use other words: page (counted from 1), id (the number of the line), self and/or you. \
 Give the line a word only when it differs from the pair of its direction, or when the line has \
 no pair (a thought uses the word the character uses aloud, or 'mình').
-- Do not list a line that is already right. Never rename or invent a character: use the names \
-of the list. Do not touch the lines of narration, signs or sound effects.
-- Take your time to think about the whole work before you answer.
+- Do not list a line that is already right. Do not touch the lines of narration, signs or \
+sound effects.
+- Keep your thinking short: the answer is a table of pairs and a short list of lines.
 - Answer with the JSON object only."
     );
     prompt.push_str(pronoun_rules(target));
@@ -277,12 +303,25 @@ impl Bible {
         })
     }
 
+    /// The name a character goes by in the notes: the name of the character the given name
+    /// or alias belongs to; other names (narrator, self, ...) stay as they are.
+    fn canonical(&self, name: &str) -> String {
+        if is_generic(name) {
+            return name.trim().to_owned();
+        }
+        self.character_index(name)
+            .map_or_else(|| name.trim().to_owned(), |index| self.characters[index].name.clone())
+    }
+
     /// Writes what the editor decided over what the first reading learned (unlike `fill`,
-    /// which keeps the first answer). A character the work does not know is ignored. Returns
+    /// which keeps the first answer). A character the work does not know is added. Returns
     /// whether anything changed.
     fn review_character(&mut self, new: &Character) -> bool {
         let Some(index) = self.character_index(&new.name) else {
-            return false;
+            // A real person the readers missed (they may have called them by a role).
+            let known = self.characters.len();
+            self.merge_character(new.clone());
+            return self.characters.len() > known;
         };
         // The character every known and every new relationship points at, aliases resolved.
         let existing: Vec<Option<usize>> = self.characters[index]
@@ -333,17 +372,33 @@ impl Bible {
 }
 
 impl PageAnalysis {
-    /// Puts the settled words into the notes of the page: a line gets the pair of its
-    /// direction, unless `exceptions` (the words by line number) say otherwise, and the cast of
-    /// the page is written again from the characters as they are now. Returns how many lines
-    /// ended up with other words than before.
-    fn apply_review(&mut self, bible: &Bible, exceptions: Option<&HashMap<usize, (String, String)>>) -> usize {
+    /// Puts the settled words into the notes of the page: a line gets the speaker and listener
+    /// the editor corrected, then the pair of its direction, unless `fixes` (by line number)
+    /// carry words of their own for it, and the cast of the page is written again from the
+    /// characters as they are now. Returns how many lines ended up different than before.
+    fn apply_review(&mut self, bible: &Bible, fixes: Option<&HashMap<usize, LineFix>>) -> usize {
         let mut changed = 0;
         for (id, line) in self.lines.iter_mut().enumerate() {
             if line.kind.is_empty() && line.speaker.trim().is_empty() {
                 continue;
             }
-            let before = (line.self_word.clone(), line.you.clone());
+            let before = (
+                line.speaker.clone(),
+                line.listener.clone(),
+                line.self_word.clone(),
+                line.you.clone(),
+            );
+            let fix = fixes.and_then(|lines| lines.get(&id));
+            if let Some(fix) = fix {
+                if !fix.speaker.is_empty() {
+                    line.speaker = fix.speaker.clone();
+                }
+                if !fix.listener.is_empty() {
+                    line.listener = fix.listener.clone();
+                }
+            }
+            line.speaker = bible.canonical(&line.speaker);
+            line.listener = bible.canonical(&line.listener);
             let pair = if is_generic(&line.speaker) || is_generic(&line.listener) {
                 None
             } else {
@@ -354,16 +409,16 @@ impl PageAnalysis {
                     line.relation = clip(&pair.relation, 60);
                 }
             }
-            match exceptions.and_then(|lines| lines.get(&id)) {
-                Some((mine, yours)) => {
-                    if !mine.is_empty() {
-                        line.self_word = mine.clone();
+            match fix {
+                Some(fix) if !fix.self_word.is_empty() || !fix.you.is_empty() => {
+                    if !fix.self_word.is_empty() {
+                        line.self_word = fix.self_word.clone();
                     }
-                    if !yours.is_empty() {
-                        line.you = yours.clone();
+                    if !fix.you.is_empty() {
+                        line.you = fix.you.clone();
                     }
                 }
-                None => {
+                _ => {
                     if let Some(pair) = pair {
                         if !pair.self_word.trim().is_empty() {
                             line.self_word = clip(&pair.self_word, 40);
@@ -374,7 +429,13 @@ impl PageAnalysis {
                     }
                 }
             }
-            if (line.self_word.clone(), line.you.clone()) != before {
+            if (
+                line.speaker.clone(),
+                line.listener.clone(),
+                line.self_word.clone(),
+                line.you.clone(),
+            ) != before
+            {
                 changed += 1;
             }
         }
@@ -428,15 +489,16 @@ impl Translator {
         let total = results.len();
         let system = system_prompt(language);
         let generation = GenerationConfig {
-            temperature: Some(0.2),
+            // The setting reasoning models are made for: a low temperature makes them loop.
+            temperature: Some(0.6),
             top_p: Some(0.95),
-            max_tokens: Some(config.max_tokens),
+            max_tokens: Some(config.review_max_tokens),
             reasoning: Some(config.review_reasoning),
             ..GenerationConfig::default()
         };
         let sizes: Vec<usize> = digests.iter().map(|(_, digest)| digest.chars().count()).collect();
         let parts = parts(&sizes, config.review_chars.max(2000));
-        let mut exceptions: HashMap<usize, HashMap<usize, (String, String)>> = HashMap::new();
+        let mut exceptions: HashMap<usize, HashMap<usize, LineFix>> = HashMap::new();
         let mut reviewed = 0;
 
         for (part, range) in parts.iter().enumerate() {
@@ -450,33 +512,56 @@ impl Translator {
                 if dead.contains(&position) {
                     continue;
                 }
-                let chat = remote::Chat {
-                    system: system.clone(),
-                    user: user.clone(),
-                    images: Vec::new(),
-                    schema_name: SCHEMA_NAME,
-                    schema: schema(),
-                };
-                let attempt = remote::chat_json(&self.client, providers, &entry.model, &generation, chat)
-                    .await
-                    .map_err(|error| {
-                        if matches!(&error, Error::Api { status, .. } if matches!(*status, 401 | 403 | 404)) {
-                            dead.insert(position);
+                let mut reasoning = config.review_reasoning;
+                loop {
+                    let generation = GenerationConfig {
+                        reasoning: Some(reasoning),
+                        ..generation
+                    };
+                    let chat = remote::Chat {
+                        system: system.clone(),
+                        user: user.clone(),
+                        images: Vec::new(),
+                        schema_name: SCHEMA_NAME,
+                        schema: schema(),
+                    };
+                    let attempt =
+                        remote::chat_json(&self.client, providers, &entry.model, &generation, chat)
+                            .await
+                            .map_err(|error| {
+                                if matches!(&error, Error::Api { status, .. } if matches!(*status, 401 | 403 | 404)) {
+                                    dead.insert(position);
+                                }
+                                anyhow::Error::from(error)
+                            })
+                            .and_then(|text| parse(&text));
+                    match attempt {
+                        Ok(answer) => {
+                            output = Some((entry.model.clone(), answer));
+                            break;
                         }
-                        anyhow::Error::from(error)
-                    })
-                    .and_then(|text| parse(&text));
-                match attempt {
-                    Ok(answer) => {
-                        output = Some((entry.model.clone(), answer));
-                        break;
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            // It thought until its tokens ran out: ask the same model again,
+                            // this time to answer straight away.
+                            let thought_too_long = reasoning && message.contains("token limit");
+                            tracing::warn!(
+                                part = part + 1,
+                                model = %entry.model,
+                                reasoning,
+                                error = %message,
+                                "review model could not read the work"
+                            );
+                            if thought_too_long {
+                                reasoning = false;
+                                continue;
+                            }
+                            break;
+                        }
                     }
-                    Err(error) => tracing::warn!(
-                        part = part + 1,
-                        model = %entry.model,
-                        error = %format!("{error:#}"),
-                        "review model could not read the work; trying the next one"
-                    ),
+                }
+                if output.is_some() {
+                    break;
                 }
             }
             let Some((model, answer)) = output else {
@@ -498,10 +583,16 @@ impl Translator {
                 if number < first || number > last {
                     continue;
                 }
-                exceptions.entry(number).or_default().insert(
-                    change.id,
-                    (clip(&change.self_word, 40), clip(&change.you, 40)),
-                );
+                let fix = LineFix {
+                    speaker: clip(&change.speaker, FIELD_CHARS),
+                    listener: clip(&change.listener, FIELD_CHARS),
+                    self_word: clip(&change.self_word, 40),
+                    you: clip(&change.you, 40),
+                };
+                if fix == LineFix::default() {
+                    continue;
+                }
+                exceptions.entry(number).or_default().insert(change.id, fix);
                 kept += 1;
             }
             reviewed += 1;
@@ -561,14 +652,14 @@ mod tests {
                 {"name": "Sasaki", "gender": "", "relationships": [
                     {"with": "Rio-san", "relation": "colleague", "self": "tôi", "you": "chị"},
                     {"with": "narrator", "self": "x", "you": "y"}]},
-                {"name": "Nobody", "relationships": [{"with": "Rio", "self": "a", "you": "b"}]}
+                {"name": "narrator", "relationships": [{"with": "Rio", "self": "a", "you": "b"}]}
             ], "changes": [{"page": "1", "id": 1, "you": "em"}, {"page": 0, "id": 0, "you": "z"}]}"#,
         )
         .unwrap()
     }
 
     #[test]
-    fn the_editor_overwrites_a_pair_through_an_alias_and_ignores_strangers() {
+    fn the_editor_overwrites_a_pair_through_an_alias_and_ignores_the_narrator() {
         let mut bible = Bible::default();
         page(FIRST, 4, &mut bible);
         let answer = editor_answer();
@@ -589,12 +680,13 @@ mod tests {
         let answer = editor_answer();
         bible.review_character(&answer.characters[0]);
         let mut exceptions = HashMap::new();
-        exceptions.insert(1, (String::new(), "em".to_owned()));
+        exceptions.insert(1, LineFix { you: "em".to_owned(), ..LineFix::default() });
         let changed = analysis.apply_review(&bible, Some(&exceptions));
         // Line 0 takes the pair ("tôi", "chị"); line 1 keeps its own self word and takes the
-        // exception's "you" (so it does not change); the thought and the narration are not
-        // touched.
-        assert_eq!(changed, 1);
+        // exception's "you" (its words do not change, but its listener "Rio-san" is written as
+        // "Rio"); the thought and the narration are not touched.
+        assert_eq!(changed, 2);
+        assert_eq!(analysis.lines[1].listener, "Rio");
         assert_eq!((analysis.lines[0].self_word.as_str(), analysis.lines[0].you.as_str()), ("tôi", "chị"));
         assert_eq!((analysis.lines[1].self_word.as_str(), analysis.lines[1].you.as_str()), ("anh", "em"));
         assert_eq!(analysis.lines[2].self_word, "mình");
@@ -624,7 +716,10 @@ mod tests {
     fn the_answer_is_read_with_text_around_it_and_string_numbers() {
         let answer = editor_answer();
         assert_eq!(answer.characters.len(), 2);
-        assert_eq!(answer.changes[0], Change { page: 1, id: 1, self_word: String::new(), you: "em".to_owned() });
+        assert_eq!(
+            answer.changes[0],
+            Change { page: 1, id: 1, you: "em".to_owned(), ..Change::default() }
+        );
         assert!(parse("no json here").is_err());
         assert_eq!(parse("{}").unwrap(), ReviewOutput::default());
     }
@@ -636,7 +731,7 @@ mod tests {
         let answer = editor_answer();
         bible.review_character(&answer.characters[0]);
         let mut exceptions = HashMap::new();
-        exceptions.insert(1, (String::new(), "em".to_owned()));
+        exceptions.insert(1, LineFix { you: "em".to_owned(), ..LineFix::default() });
         analysis.apply_review(&bible, Some(&exceptions));
         // Sasaki -> Rio has two pairs now (line 0 and the exception of line 1): not locked.
         let mut book = PairBook::default();
@@ -645,6 +740,45 @@ mod tests {
         analysis.apply_review(&bible, None);
         assert_eq!(seed_pairs(&mut book, &bible, &[Some(analysis), None]), 1);
         assert_eq!(book.entries(), [("Sasaki -> Rio".to_owned(), "tôi - chị".to_owned())]);
+    }
+
+    #[test]
+    fn a_line_the_readers_gave_to_a_role_gets_the_right_speaker_and_the_pair_of_its_direction() {
+        let mut bible = Bible::default();
+        let mut analysis = page(FIRST, 4, &mut bible);
+        analysis.lines[1].speaker = "visitor".to_owned();
+        analysis.lines[1].listener = "nurse".to_owned();
+        analysis.lines[1].self_word = "xxx".to_owned();
+        analysis.lines[1].you = "yyy".to_owned();
+        let mut fixes = HashMap::new();
+        fixes.insert(
+            1,
+            LineFix {
+                speaker: "Sasaki".to_owned(),
+                listener: "Rio-san".to_owned(),
+                ..LineFix::default()
+            },
+        );
+        analysis.apply_review(&bible, Some(&fixes));
+        let line = &analysis.lines[1];
+        assert_eq!((line.speaker.as_str(), line.listener.as_str()), ("Sasaki", "Rio"));
+        assert_eq!((line.self_word.as_str(), line.you.as_str()), ("tôi", "cô"));
+        assert_eq!(line.relation, "colleague");
+    }
+
+    #[test]
+    fn a_person_the_readers_missed_is_added_with_their_pairs() {
+        let mut bible = Bible::default();
+        page(FIRST, 4, &mut bible);
+        let answer = parse(
+            r#"{"characters": [{"name": "Yuu", "gender": "man", "relationships":
+                [{"with": "Rio", "self": "anh", "you": "em"}]}], "changes": []}"#,
+        )
+        .unwrap();
+        assert!(bible.review_character(&answer.characters[0]));
+        let pair = bible.pair("Yuu", "Rio-san").unwrap();
+        assert_eq!((pair.self_word.as_str(), pair.you.as_str()), ("anh", "em"));
+        assert!(!bible.review_character(&answer.characters[0]), "known now, nothing to change");
     }
 
     #[test]
@@ -677,6 +811,7 @@ mod tests {
     fn the_defaults_read_twice_and_think_only_in_the_second_reading() {
         let config = AnalysisConfig::default();
         assert!(config.review && config.review_reasoning && !config.reasoning);
+        assert!(config.review_max_tokens > config.max_tokens);
         assert!(config.models.iter().all(|model| model.reasoning.is_none()));
     }
 }

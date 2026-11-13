@@ -60,6 +60,9 @@ pub struct AnalysisConfig {
     pub review: bool,
     /// Lets the models think during the second reading.
     pub review_reasoning: bool,
+    /// The most tokens one request of the second reading may use, thinking included. A model
+    /// that spends all of them thinking is asked again without thinking.
+    pub review_max_tokens: u32,
     /// How many characters of the pages one request of the second reading carries; a longer
     /// work is read in several parts.
     pub review_chars: usize,
@@ -109,10 +112,12 @@ impl Default for AnalysisConfig {
                 model("deepseek-ai/deepseek-v4.1-flash", true, None),
             ],
             reasoning: false,
-            // Thinking tokens count against this limit, so it is large for the second reading.
-            max_tokens: 16384,
+            // A page is answered in about two thousand tokens: a model that loops (the log of one
+            // page wrote the same phrase until the limit) is cut off early.
+            max_tokens: 6144,
             review: true,
             review_reasoning: true,
+            review_max_tokens: 32768,
             review_chars: 60_000,
             image_max_dimension: 1600,
             panel_max_dimension: 1024,
@@ -528,6 +533,14 @@ on the page.
 - speaker: the name of the character who says or thinks it ('narrator' for narration, \
 'unknown' when nobody can be told). Follow the tail of the bubble, the positions and the story.
 - listener: the character spoken to ('self' for a thought, 'everyone', 'unknown').
+- Speaker and listener are names, never roles: not nurse, patient, visitor, customer, boss or \
+friend. The text says who is who: a person who is called 'Sasaki-kun' is Sasaki, 'Rio-san' is \
+Rio, and a name that is said in a line belongs to someone other than the speaker. Use the names \
+of 'Known so far' and the names that are said or written in the OCR lines. When a character has \
+no name yet, give a short label by look ('woman with long hair', 'man with glasses') and use \
+exactly that label on every page until the name is learned, then put the label in aliases. Two \
+people who answer each other are two different characters, and nobody speaks to themself \
+except in a thought.
 - self and you: the words the speaker uses for themselves and for the listener in {target}, \
 chosen from age, sex, rank, closeness and manner of speaking.
 - tone: two or three words (polite, rough, teasing, tender, scared, ...).
