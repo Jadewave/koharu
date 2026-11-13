@@ -10,6 +10,18 @@ use crate::Language;
 const MAX_IMAGE_DIMENSION: u32 = 2048;
 const JPEG_QUALITY: u8 = 88;
 
+/// The words a line must use for "I" and "you", as the notes of the analysis decided them for
+/// its speaker and listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedPair {
+    pub speaker: String,
+    pub listener: String,
+    /// What the speaker calls themselves.
+    pub mine: String,
+    /// What the speaker calls the listener.
+    pub yours: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranslationRequest {
     pub segments: Vec<String>,
@@ -23,6 +35,12 @@ pub struct TranslationRequest {
     pub page_images: Vec<Arc<DynamicImage>>,
     /// For each segment, the index of its page among `page_images`. Empty for one page.
     pub segment_pages: Vec<usize>,
+    /// For each segment, the words its notes decided for it (`None` where the notes give none).
+    /// Empty when the page has no notes. The translation is held to them.
+    pub pairs: Vec<Option<ExpectedPair>>,
+    /// Asks the model to write `speaker` before every `text` although no page image is attached,
+    /// so that what it wrote can be checked against `pairs`.
+    pub speakers: bool,
 }
 
 impl TranslationRequest {
@@ -40,6 +58,8 @@ impl TranslationRequest {
             image: None,
             page_images: Vec::new(),
             segment_pages: Vec::new(),
+            pairs: Vec::new(),
+            speakers: false,
         }
     }
 
@@ -75,6 +95,28 @@ impl TranslationRequest {
         self
     }
 
+    /// The words the notes of the page decided for every segment (see `pairs`). `pairs` must
+    /// have one entry for each segment, else it is ignored.
+    #[must_use]
+    pub fn with_pairs(mut self, pairs: Vec<Option<ExpectedPair>>) -> Self {
+        if pairs.len() == self.segments.len() {
+            self.pairs = pairs;
+        }
+        self
+    }
+
+    /// Makes the model write who speaks to whom before each translation (see `speakers`).
+    #[must_use]
+    pub fn with_speakers(mut self) -> Self {
+        self.speakers = true;
+        self
+    }
+
+    /// Whether the page was read by the analysis: its notes are in the instructions.
+    pub(crate) fn has_notes(&self) -> bool {
+        !self.pairs.is_empty()
+    }
+
     /// The same request restricted to the segments at `indices`, keeping their pages.
     pub(crate) fn select(&self, indices: &[usize]) -> Self {
         let mut subset = self.clone();
@@ -88,14 +130,19 @@ impl TranslationRequest {
                 .map(|&index| self.segment_pages[index])
                 .collect();
         }
+        if self.pairs.len() == self.segments.len() {
+            subset.pairs = indices.iter().map(|&index| self.pairs[index].clone()).collect();
+        }
         subset
     }
 
     /// Whether the model writes a `speaker` (who speaks to whom, and the pronoun pair) before
-    /// each translation. Only requests built for the local model with page images ask for it,
-    /// and only when the target is Vietnamese, the language that needs a pronoun pair.
+    /// each translation. Only requests built for the local model ask for it: those with page
+    /// images, and those that were told to (`speakers`, for a page with notes, which has no
+    /// image). Only when the target is Vietnamese, the language that needs a pronoun pair.
     pub(crate) fn wants_speaker(&self) -> bool {
-        self.target_language == Language::Vietnamese && !self.segment_pages.is_empty()
+        self.target_language == Language::Vietnamese
+            && (!self.segment_pages.is_empty() || self.speakers)
     }
 
     /// Drops every image: retries are text only because encoding images on a CPU is slow.

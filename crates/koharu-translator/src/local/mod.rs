@@ -206,12 +206,25 @@ impl LocalTranslator {
             // What the model decided about who speaks to whom. It is logged, and recorded for
             // `Translator`, which only keeps a pair after the translations confirm it, so a
             // wrong guess cannot become a rule on its own.
-            if let Ok(mut seen) = self.speakers.lock() {
-                for (id, speaker) in prompt::speaker_entries(&output.text) {
-                    if let Some(source) = request.segments.get(id) {
-                        seen.insert(source.clone(), speaker);
+            // The record is by source text, and one text can stand on a page twice (はい, …)
+            // said by two people: what the model wrote for it counts only when both agree,
+            // else it says nothing about either line. A later call (a retry) replaces it.
+            let mut answered: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (id, speaker) in prompt::speaker_entries(&output.text) {
+                if let Some(source) = request.segments.get(id) {
+                    match answered.get(source) {
+                        Some(known) if *known != speaker => {
+                            answered.insert(source.clone(), String::new());
+                        }
+                        _ => {
+                            answered.insert(source.clone(), speaker);
+                        }
                     }
                 }
+            }
+            if let Ok(mut seen) = self.speakers.lock() {
+                seen.extend(answered);
             }
             let mut decided: Vec<String> = Vec::new();
             for speaker in prompt::speakers(&output.text) {

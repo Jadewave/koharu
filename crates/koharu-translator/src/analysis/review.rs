@@ -15,6 +15,10 @@
 //! The pairs and the exceptions are applied to the notes of every page and to the glossary. A
 //! part that no model can read leaves the notes of the first reading as they were.
 //!
+//! The models are those of `analysis.review_models`, tried in that order (DeepSeek first). When
+//! the settled pairs still give a word of one sex to a person of the other, or the two directions
+//! of a pair do not fit each other, the editor is asked once more about exactly those.
+//!
 //! This is where thinking pays, so the models think here (`review_reasoning`) and not while
 //! they read a page.
 
@@ -49,7 +53,7 @@ struct Change {
 
 /// What the editor corrected in one line.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct LineFix {
+pub(super) struct LineFix {
     speaker: String,
     listener: String,
     self_word: String,
@@ -376,7 +380,7 @@ impl PageAnalysis {
     /// the editor corrected, then the pair of its direction, unless `fixes` (by line number)
     /// carry words of their own for it, and the cast of the page is written again from the
     /// characters as they are now. Returns how many lines ended up different than before.
-    fn apply_review(&mut self, bible: &Bible, fixes: Option<&HashMap<usize, LineFix>>) -> usize {
+    pub(super) fn apply_review(&mut self, bible: &Bible, fixes: Option<&HashMap<usize, LineFix>>) -> usize {
         let mut changed = 0;
         for (id, line) in self.lines.iter_mut().enumerate() {
             if line.kind.is_empty() && line.speaker.trim().is_empty() {
@@ -459,10 +463,339 @@ impl PageAnalysis {
     }
 }
 
+/// Words that name a man or a boy, as "I" or as "you".
+const MALE_ONLY: [&str; 8] = ["anh", "chú", "ông", "lão", "bác trai", "bố", "cha", "ba"];
+/// Words that name a woman or a girl, as "I" or as "you".
+const FEMALE_ONLY: [&str; 9] = ["chị", "cô", "dì", "bà", "thím", "mợ", "bác gái", "mẹ", "má"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sex {
+    Male,
+    Female,
+}
+
+/// The sex a gender note says ("man", "young woman", "boy", ...); `None` when it says none
+/// or both.
+fn sex_of(gender: &str) -> Option<Sex> {
+    let lower = gender.to_lowercase();
+    let mut male = false;
+    let mut female = false;
+    for word in lower.split(|c: char| !c.is_alphabetic()) {
+        male |= matches!(word, "man" | "male" | "boy");
+        female |= matches!(word, "woman" | "female" | "girl" | "lady");
+    }
+    match (male, female) {
+        (true, false) => Some(Sex::Male),
+        (false, true) => Some(Sex::Female),
+        _ => None,
+    }
+}
+
+/// Whether `word` (lowercase) can only be said about the other sex than `sex`.
+fn names_other_sex(word: &str, sex: Sex) -> bool {
+    let word = word.trim().to_lowercase();
+    match sex {
+        Sex::Male => FEMALE_ONLY.contains(&word.as_str()),
+        Sex::Female => MALE_ONLY.contains(&word.as_str()),
+    }
+}
+
+impl Bible {
+    /// Gives every direction the pair most of its lines used (the first one on a tie), over
+    /// what the first line of the direction said. Returns how many directions changed.
+    pub(super) fn settle_pairs(&mut self) -> usize {
+        // Names learned later turn labels into names: count under the name they have now.
+        let mut merged = Tally::new();
+        for ((from, to), pairs) in std::mem::take(&mut self.tally) {
+            let key = (self.direction_name(&from), self.direction_name(&to));
+            for (pair, votes) in pairs {
+                add_votes(&mut merged, key.clone(), pair, votes);
+            }
+        }
+        let mut settled = 0;
+        for ((from, to), pairs) in &merged {
+            if pairs.len() < 2 {
+                continue;
+            }
+            let mut best = &pairs[0];
+            for candidate in &pairs[1..] {
+                if candidate.1 > best.1 {
+                    best = candidate;
+                }
+            }
+            let Some(index) = self.character_index(from) else {
+                continue;
+            };
+            let target = self.character_index(to);
+            let position = self.characters[index].relationships.iter().position(|relationship| {
+                same_name(&relationship.with, to)
+                    || (target.is_some() && self.character_index(&relationship.with) == target)
+            });
+            let Some(at) = position else {
+                continue;
+            };
+            let slot = &mut self.characters[index].relationships[at];
+            let (mine, yours) = (clip(&best.0.0, 40), clip(&best.0.1, 40));
+            if slot.self_word.trim().to_lowercase() != mine || slot.you.trim().to_lowercase() != yours {
+                slot.self_word = mine;
+                slot.you = yours;
+                settled += 1;
+            }
+        }
+        self.tally = merged;
+        settled
+    }
+
+    /// The settled pairs that cannot be right, each described in a sentence: a word of one sex
+    /// for a person of the other, and the two directions of a pair of people that do not fit
+    /// each other ("anh - em" one way, "tôi - cô" the other).
+    pub(super) fn address_conflicts(&self) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for character in &self.characters {
+            let sex = sex_of(&character.gender);
+            for relationship in &character.relationships {
+                let (mine, yours) = (
+                    relationship.self_word.trim().to_lowercase(),
+                    relationship.you.trim().to_lowercase(),
+                );
+                if mine.is_empty() || yours.is_empty() {
+                    continue;
+                }
+                let listener = self.character_index(&relationship.with).map(|at| &self.characters[at]);
+                let pair = format!("{} -> {}: {mine} - {yours}", character.name, relationship.with);
+                if let Some(sex) = sex
+                    && names_other_sex(&mine, sex)
+                {
+                    found.push(format!(
+                        "{pair}: {} ({}) calls themselves \"{mine}\", a word of the other sex",
+                        character.name,
+                        character.gender.trim()
+                    ));
+                }
+                let Some(listener) = listener else {
+                    continue;
+                };
+                if let Some(sex) = sex_of(&listener.gender)
+                    && names_other_sex(&yours, sex)
+                {
+                    found.push(format!(
+                        "{pair}: {} ({}) is called \"{yours}\", a word of the other sex",
+                        listener.name,
+                        listener.gender.trim()
+                    ));
+                }
+                // Siblings and the like: the elder says "anh/chị - em", the younger "em - anh/chị".
+                let elder = matches!(mine.as_str(), "anh" | "chị") && yours == "em";
+                let younger = mine == "em" && matches!(yours.as_str(), "anh" | "chị");
+                if !(elder || younger) {
+                    continue;
+                }
+                let mut names = [character.name.to_lowercase(), listener.name.to_lowercase()];
+                names.sort();
+                let key = (names[0].clone(), names[1].clone());
+                if seen.contains(&key) {
+                    continue;
+                }
+                let Some(back) = self.pair(&listener.name, &character.name) else {
+                    continue;
+                };
+                let (back_mine, back_yours) =
+                    (back.self_word.trim().to_lowercase(), back.you.trim().to_lowercase());
+                if back_mine.is_empty() || back_yours.is_empty() {
+                    continue;
+                }
+                let (want_mine, want_yours) = if elder {
+                    ("em".to_owned(), mine.clone())
+                } else {
+                    (yours.clone(), "em".to_owned())
+                };
+                seen.push(key);
+                if (back_mine.as_str(), back_yours.as_str()) != (want_mine.as_str(), want_yours.as_str()) {
+                    found.push(format!(
+                        "{pair} but {} -> {}: {back_mine} - {back_yours}; the two directions do not fit \
+each other (expected {want_mine} - {want_yours})",
+                        listener.name, character.name
+                    ));
+                }
+            }
+        }
+        found
+    }
+}
+
+/// What the editor is asked when the settled pairs contradict genders or each other: the
+/// problems, and the pages where the characters of the problems talk.
+fn repair_prompt(bible: &Bible, problems: &[String], pages: &[(usize, String)], total: usize) -> String {
+    let characters = json!({ "characters": bible.characters }).to_string();
+    let mut prompt = format!(
+        "The work has {total} pages. You settled the words of its characters, and some of them \
+cannot be right. The characters now (JSON): {characters}\n\nThe problems:\n"
+    );
+    for problem in problems {
+        let _ = writeln!(prompt, "- {problem}");
+    }
+    prompt.push_str(
+        "\nThe pages where these characters talk, one line per OCR line: id, kind, speaker -> \
+listener (relation), the words used, the tone and the text.\n\n",
+    );
+    for (_, digest) in pages {
+        prompt.push_str(digest);
+        prompt.push('\n');
+    }
+    prompt.push_str(
+        "For every problem decide from the lines what is true. Answer in characters[].relationships \
+with the pair that is right for the direction (the same pair again when it is right after all), \
+and give a gender only when the gender of the character is what was wrong. Leave changes empty. \
+Answer with the JSON object.",
+    );
+    prompt
+}
+
 impl Translator {
+    /// Asks the review models, in the order of `review_models`, until one answers. A model that
+    /// thought until its tokens ran out is asked again without thinking; a model the server
+    /// does not know or does not let the user call is skipped for the rest of the run.
+    async fn ask_review(
+        &self,
+        config: &AnalysisConfig,
+        providers: &ProvidersConfig,
+        system: &str,
+        user: &str,
+        what: &str,
+        dead: &mut HashSet<String>,
+    ) -> Option<(String, ReviewOutput)> {
+        let generation = GenerationConfig {
+            // The setting reasoning models are made for: a low temperature makes them loop.
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            max_tokens: Some(config.review_max_tokens),
+            reasoning: Some(config.review_reasoning),
+            ..GenerationConfig::default()
+        };
+        for entry in &config.review_models {
+            let model = &entry.model;
+            if dead.contains(model) {
+                continue;
+            }
+            let mut reasoning = entry.reasoning.unwrap_or(config.review_reasoning);
+            loop {
+                let generation = GenerationConfig {
+                    reasoning: Some(reasoning),
+                    ..generation
+                };
+                let chat = remote::Chat {
+                    system: system.to_owned(),
+                    user: user.to_owned(),
+                    images: Vec::new(),
+                    schema_name: SCHEMA_NAME,
+                    schema: schema(),
+                };
+                let attempt = remote::chat_json(&self.client, providers, model, &generation, chat)
+                    .await
+                    .map_err(|error| {
+                        if matches!(&error, Error::Api { status, .. } if matches!(*status, 401 | 403 | 404)) {
+                            dead.insert(model.clone());
+                        }
+                        anyhow::Error::from(error)
+                    })
+                    .and_then(|text| parse(&text));
+                match attempt {
+                    Ok(answer) => return Some((model.clone(), answer)),
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        // It thought until its tokens ran out: ask the same model again,
+                        // this time to answer straight away.
+                        let thought_too_long = reasoning && message.contains("token limit");
+                        tracing::warn!(
+                            what,
+                            %model,
+                            reasoning,
+                            error = %message,
+                            "review model could not read the work"
+                        );
+                        if thought_too_long {
+                            reasoning = false;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// One more question to the editor when the settled pairs contradict the genders of the
+    /// characters or each other. Only what it says about the characters is taken.
+    async fn repair_addresses(
+        &self,
+        config: &AnalysisConfig,
+        providers: &ProvidersConfig,
+        system: &str,
+        bible: &mut Bible,
+        digests: &[(usize, String)],
+        total: usize,
+        dead: &mut HashSet<String>,
+    ) {
+        let problems = bible.address_conflicts();
+        if problems.is_empty() {
+            return;
+        }
+        tracing::warn!(count = problems.len(), ?problems, "settled pairs contradict genders or each other");
+        // The pages that name a character of a problem, up to the size of one review request.
+        let names: Vec<String> = bible
+            .characters
+            .iter()
+            .map(|character| character.name.to_lowercase())
+            .filter(|name| {
+                problems
+                    .iter()
+                    .any(|problem| problem.to_lowercase().contains(name.as_str()))
+            })
+            .collect();
+        let budget = config.review_chars.max(2000);
+        let mut used = 0;
+        let mut pages: Vec<(usize, String)> = Vec::new();
+        for (number, digest) in digests {
+            let lower = digest.to_lowercase();
+            if !names.iter().any(|name| lower.contains(name.as_str())) {
+                continue;
+            }
+            let size = digest.chars().count();
+            if used + size > budget && !pages.is_empty() {
+                break;
+            }
+            used += size;
+            pages.push((*number, digest.clone()));
+        }
+        if pages.is_empty() {
+            return;
+        }
+        let user = repair_prompt(bible, &problems, &pages, total);
+        let Some((model, answer)) = self
+            .ask_review(config, providers, system, &user, "repair", dead)
+            .await
+        else {
+            tracing::warn!("no model could answer for the pairs that cannot be right");
+            return;
+        };
+        let characters = answer
+            .characters
+            .iter()
+            .filter(|character| bible.review_character(character))
+            .count();
+        tracing::info!(
+            %model,
+            characters,
+            remaining = bible.address_conflicts().len(),
+            "pairs that cannot be right asked again"
+        );
+    }
+
     /// Reads the whole work again as text and settles the words for "I" and "you" (see the
     /// module). Changes `bible` and the notes in `results`; whatever fails leaves them as the
-    /// first reading made them.
+    /// first reading made them. Returns whether the notes were settled by the review.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn review_work(
         &self,
@@ -471,9 +804,9 @@ impl Translator {
         language: Language,
         bible: &mut Bible,
         results: &mut [Option<PageAnalysis>],
-        dead: &mut HashSet<usize>,
+        dead: &mut HashSet<String>,
         stop: &(impl Fn() -> bool + Send + Sync),
-    ) {
+    ) -> bool {
         let digests: Vec<(usize, String)> = results
             .iter()
             .enumerate()
@@ -483,19 +816,11 @@ impl Translator {
                     .map(|digest| (number, digest))
             })
             .collect();
-        if digests.is_empty() || bible.characters.is_empty() {
-            return;
+        if digests.is_empty() || bible.characters.is_empty() || config.review_models.is_empty() {
+            return false;
         }
         let total = results.len();
         let system = system_prompt(language);
-        let generation = GenerationConfig {
-            // The setting reasoning models are made for: a low temperature makes them loop.
-            temperature: Some(0.6),
-            top_p: Some(0.95),
-            max_tokens: Some(config.review_max_tokens),
-            reasoning: Some(config.review_reasoning),
-            ..GenerationConfig::default()
-        };
         let sizes: Vec<usize> = digests.iter().map(|(_, digest)| digest.chars().count()).collect();
         let parts = parts(&sizes, config.review_chars.max(2000));
         let mut exceptions: HashMap<usize, HashMap<usize, LineFix>> = HashMap::new();
@@ -507,64 +832,11 @@ impl Translator {
             }
             let pages = &digests[range.clone()];
             let user = user_prompt(bible, pages, total);
-            let mut output = None;
-            for (position, entry) in config.models.iter().enumerate() {
-                if dead.contains(&position) {
-                    continue;
-                }
-                let mut reasoning = config.review_reasoning;
-                loop {
-                    let generation = GenerationConfig {
-                        reasoning: Some(reasoning),
-                        ..generation
-                    };
-                    let chat = remote::Chat {
-                        system: system.clone(),
-                        user: user.clone(),
-                        images: Vec::new(),
-                        schema_name: SCHEMA_NAME,
-                        schema: schema(),
-                    };
-                    let attempt =
-                        remote::chat_json(&self.client, providers, &entry.model, &generation, chat)
-                            .await
-                            .map_err(|error| {
-                                if matches!(&error, Error::Api { status, .. } if matches!(*status, 401 | 403 | 404)) {
-                                    dead.insert(position);
-                                }
-                                anyhow::Error::from(error)
-                            })
-                            .and_then(|text| parse(&text));
-                    match attempt {
-                        Ok(answer) => {
-                            output = Some((entry.model.clone(), answer));
-                            break;
-                        }
-                        Err(error) => {
-                            let message = format!("{error:#}");
-                            // It thought until its tokens ran out: ask the same model again,
-                            // this time to answer straight away.
-                            let thought_too_long = reasoning && message.contains("token limit");
-                            tracing::warn!(
-                                part = part + 1,
-                                model = %entry.model,
-                                reasoning,
-                                error = %message,
-                                "review model could not read the work"
-                            );
-                            if thought_too_long {
-                                reasoning = false;
-                                continue;
-                            }
-                            break;
-                        }
-                    }
-                }
-                if output.is_some() {
-                    break;
-                }
-            }
-            let Some((model, answer)) = output else {
+            let what = format!("part {} of {}", part + 1, parts.len());
+            let Some((model, answer)) = self
+                .ask_review(config, providers, &system, &user, &what, dead)
+                .await
+            else {
                 tracing::warn!(part = part + 1, "no model could review this part of the work");
                 continue;
             };
@@ -607,9 +879,16 @@ impl Translator {
         }
 
         if reviewed == 0 {
-            return;
+            return false;
         }
-        // Once, at the end: a later part can change a pair an earlier one decided.
+        // A later part can change a pair an earlier one decided, and a word of the wrong sex
+        // or a pair that does not fit its other direction is a mistake whoever made it: ask
+        // once more about those before the notes are written.
+        if language == Language::Vietnamese && !stop() {
+            self.repair_addresses(config, providers, &system, bible, &digests, total, dead)
+                .await;
+        }
+        // Once, at the end.
         let mut lines = 0;
         for (number, page) in results.iter_mut().enumerate() {
             if let Some(page) = page {
@@ -617,6 +896,7 @@ impl Translator {
             }
         }
         tracing::info!(lines, "notes of the pages settled by the review");
+        true
     }
 }
 
@@ -813,5 +1093,95 @@ mod tests {
         assert!(config.review && config.review_reasoning && !config.reasoning);
         assert!(config.review_max_tokens > config.max_tokens);
         assert!(config.models.iter().all(|model| model.reasoning.is_none()));
+    }
+
+    fn cast(json: &str) -> Bible {
+        let mut bible = Bible::default();
+        bible.merge_output(&serde_json::from_str::<PageOutput>(json).unwrap());
+        bible
+    }
+
+    #[test]
+    fn a_gender_is_read_from_its_words_not_from_their_letters() {
+        assert_eq!(sex_of("man"), Some(Sex::Male));
+        assert_eq!(sex_of("young man"), Some(Sex::Male));
+        assert_eq!(sex_of("Boy"), Some(Sex::Male));
+        // "woman" holds the letters "man"; it is a woman.
+        assert_eq!(sex_of("woman"), Some(Sex::Female));
+        assert_eq!(sex_of("girl, teenager"), Some(Sex::Female));
+        assert_eq!(sex_of("unknown"), None);
+        assert_eq!(sex_of(""), None);
+        assert!(names_other_sex("chị", Sex::Male) && names_other_sex("Anh", Sex::Female));
+        assert!(!names_other_sex("em", Sex::Male) && !names_other_sex("tôi", Sex::Female));
+    }
+
+    #[test]
+    fn a_word_of_the_other_sex_is_a_problem_for_the_speaker_and_for_the_listener() {
+        let bible = cast(
+            r#"{"characters": [
+                {"name": "Sasaki", "gender": "man", "relationships": [
+                    {"with": "Rio", "self": "tôi", "you": "cô"}]},
+                {"name": "Rio", "gender": "woman", "relationships": [
+                    {"with": "Sasaki", "self": "anh", "you": "chị"}]}]}"#,
+        );
+        let problems = bible.address_conflicts();
+        // Sasaki -> Rio is fine; Rio calls herself "anh" and Sasaki "chị".
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("Rio -> Sasaki") && p.contains("calls themselves \"anh\"")));
+        assert!(problems.iter().any(|p| p.contains("Sasaki (man) is called \"chị\"")));
+    }
+
+    #[test]
+    fn the_two_directions_of_older_and_younger_have_to_fit() {
+        let bible = cast(
+            r#"{"characters": [
+                {"name": "Yuu", "gender": "man", "relationships": [
+                    {"with": "Rio", "self": "anh", "you": "em"}]},
+                {"name": "Rio", "gender": "woman", "relationships": [
+                    {"with": "Yuu", "self": "tôi", "you": "cô"}]}]}"#,
+        );
+        let problems = bible.address_conflicts();
+        // "cô" for Yuu is also a word of the other sex; the pair as a whole does not fit either.
+        assert!(problems.iter().any(|p| p.contains("do not fit each other") && p.contains("expected em - anh")), "{problems:?}");
+        // The same pair seen from the other side is reported once.
+        assert_eq!(problems.iter().filter(|p| p.contains("do not fit")).count(), 1);
+    }
+
+    #[test]
+    fn fitting_pairs_and_neutral_words_raise_no_problem() {
+        let bible = cast(
+            r#"{"characters": [
+                {"name": "Yuu", "gender": "man", "relationships": [
+                    {"with": "Rio", "self": "anh", "you": "em"}]},
+                {"name": "Rio", "gender": "woman", "relationships": [
+                    {"with": "Yuu", "self": "em", "you": "anh"}]},
+                {"name": "Mika", "gender": "girl", "relationships": [
+                    {"with": "Rio", "self": "em", "you": "chị"},
+                    {"with": "Yuu", "self": "tớ", "you": "cậu"}]},
+                {"name": "Ken", "gender": "unknown", "relationships": [
+                    {"with": "Rio", "self": "anh", "you": "cô"}]}]}"#,
+        );
+        assert_eq!(bible.address_conflicts(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_repair_question_carries_the_problems_and_the_pages() {
+        let mut bible = Bible::default();
+        let analysis = page(FIRST, 4, &mut bible);
+        let digest = page_digest(0, &analysis).unwrap();
+        let prompt = repair_prompt(&bible, &["Rio -> Sasaki: anh - chị".to_owned()], &[(0, digest)], 9);
+        assert!(prompt.starts_with("The work has 9 pages."));
+        assert!(prompt.contains("- Rio -> Sasaki: anh - chị\n"));
+        assert!(prompt.contains("0 speech Sasaki -> Rio"));
+        assert!(prompt.ends_with("Answer with the JSON object."));
+    }
+
+    #[test]
+    fn the_default_review_asks_deepseek_before_anyone_else() {
+        let config = AnalysisConfig::default();
+        assert_eq!(config.review_models.first().map(|m| m.model.as_str()), Some("deepseek-ai/deepseek-v4.1-flash"));
+        assert_eq!(config.review_models[0].reasoning, Some(false));
+        assert!(config.review_reasoning, "the fallback model still thinks");
+        assert_eq!(config.review_models.len(), 2);
     }
 }

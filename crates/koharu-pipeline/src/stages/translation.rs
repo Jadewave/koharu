@@ -343,6 +343,14 @@ impl Processor {
         if let Some(notes) = notes.as_deref() {
             tracing::debug!(%notes, "notes the translation model reads with the page");
         }
+        // The notes say which words every line uses for "I" and "you": the translation is held
+        // to them, and a local model writes who speaks to whom so that it can be.
+        if let Some(analysis) = analysis.as_ref().filter(|_| notes.is_some()) {
+            request = request.with_pairs(analysis.expected_pairs(&read));
+            if local {
+                request = request.with_speakers();
+            }
+        }
         let instructions = [self.config.instructions.as_deref(), notes.as_deref()]
             .into_iter()
             .flatten()

@@ -9,6 +9,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::ExpectedPair;
+
 /// First person words that cannot be anything else: a line that uses one of them speaks about
 /// its speaker, so a different pair for that speaker is a mistake.
 const FIRST_PERSON: [&str; 4] = ["tôi", "tao", "tớ", "tui"];
@@ -45,6 +47,23 @@ pub(crate) struct Declared {
 }
 
 impl Declared {
+    /// What the notes of a page decided for a line, written the way a translation declares it.
+    /// `None` for names or words that make no pair.
+    pub(crate) fn expected(expected: &ExpectedPair) -> Option<Self> {
+        let (from, to) = (norm_name(&expected.speaker), norm_name(&expected.listener));
+        if GENERIC.contains(&from.as_str()) || GENERIC.contains(&to.as_str()) || from == to {
+            return None;
+        }
+        Some(Self {
+            from,
+            to,
+            from_name: expected.speaker.trim().to_owned(),
+            to_name: expected.listener.trim().to_owned(),
+            mine: clean_word(&expected.mine)?,
+            yours: clean_word(&expected.yours)?,
+        })
+    }
+
     fn direction(&self) -> (String, String) {
         (self.from.clone(), self.to.clone())
     }
@@ -229,6 +248,68 @@ fn page_pairs(
         reference.insert(direction, best.0.clone());
     }
     reference
+}
+
+/// The lines (by index) whose declared words or text contradict what the notes of the page
+/// decided for them. The notes name the words of every line, so a line is held to its own and not
+/// to what the rest of its direction uses: a line the notes give other words than the rest is
+/// right to have them. The names the model wrote are not compared, only the words.
+pub(crate) fn conflicts_with_notes(
+    expected: &[Option<Declared>],
+    declared: &[Option<Declared>],
+    translations: &[String],
+) -> Vec<usize> {
+    let mut flagged = Vec::new();
+    for (index, translation) in translations.iter().enumerate() {
+        let Some(expect) = expected.get(index).and_then(Option::as_ref) else {
+            continue;
+        };
+        let text = translation.to_lowercase();
+        let wrong_declared = declared
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|declared| declared.pair() != expect.pair());
+        let wrong_self = FIRST_PERSON
+            .iter()
+            .any(|word| *word != expect.mine && has_word(&text, word));
+        let wrong_you = SECOND_PERSON
+            .iter()
+            .any(|word| *word != expect.yours && has_word(&text, word));
+        if wrong_declared || wrong_self || wrong_you {
+            flagged.push(index);
+        }
+    }
+    flagged
+}
+
+/// The instruction for translating the lines that contradict the notes again. `retried` are the
+/// lines the retry carries, in order (its ids are their positions); `wrong` are those among them
+/// that contradict the notes.
+pub(crate) fn notes_note(
+    expected: &[Option<Declared>],
+    retried: &[usize],
+    wrong: &[usize],
+) -> String {
+    let mut listed: Vec<String> = Vec::new();
+    for (position, index) in retried.iter().enumerate() {
+        if !wrong.contains(index) {
+            continue;
+        }
+        let Some(expect) = expected.get(*index).and_then(Option::as_ref) else {
+            continue;
+        };
+        listed.push(format!(
+            "{position}: {}>{}: {} - {}",
+            expect.from_name, expect.to_name, expect.mine, expect.yours
+        ));
+    }
+    format!(
+        "Strict retry: each of these lines was written with other words for 'I' and 'you' than \
+         the notes of the page decided for it. Write each line again with exactly the words of its \
+         note, and keep the `speaker` of the line in the form `Speaker>Listener: I-word - you-word` \
+         with the same pair. The words by `id`: {}.",
+        listed.join(" | ")
+    )
 }
 
 impl PairBook {
@@ -682,5 +763,66 @@ mod tests {
         let thoughts: Vec<_> = lines.iter().map(|l| parse_thought(l)).collect();
         let translations = texts(&["a", "b", "Tớ phải cố"]);
         assert!(book.thought_conflicts(&thoughts, &declared, &translations).is_empty());
+    }
+
+    fn expect(speaker: &str, listener: &str, mine: &str, yours: &str) -> Option<Declared> {
+        Declared::expected(&ExpectedPair {
+            speaker: speaker.to_owned(),
+            listener: listener.to_owned(),
+            mine: mine.to_owned(),
+            yours: yours.to_owned(),
+        })
+    }
+
+    #[test]
+    fn the_notes_make_a_pair_only_from_two_names_and_two_words() {
+        let pair = expect("Sasaki-kun", "Rio", "Tôi", "chị").unwrap();
+        assert_eq!((pair.from.as_str(), pair.to.as_str()), ("sasaki", "rio"));
+        assert_eq!(pair.pair(), ("tôi".to_owned(), "chị".to_owned()));
+        assert!(expect("unknown", "Rio", "tôi", "chị").is_none());
+        assert!(expect("Sasaki", "Rio", "", "chị").is_none());
+    }
+
+    #[test]
+    fn a_line_is_held_to_its_own_note_not_to_the_rest_of_its_direction() {
+        // Two lines of one direction: the notes give the second one other words (an exception).
+        let expected = vec![expect("A", "B", "anh", "em"), expect("A", "B", "tao", "mày")];
+        let declared = vec![parse_declared("A>B: anh - em"), parse_declared("A>B: tao - mày")];
+        let translations = texts(&["Anh đây.", "Tao đây, mày đừng lo."]);
+        assert!(conflicts_with_notes(&expected, &declared, &translations).is_empty());
+    }
+
+    #[test]
+    fn a_declared_pair_or_a_word_in_the_text_that_the_note_did_not_give_is_flagged() {
+        let expected = vec![
+            expect("A", "B", "anh", "em"),
+            expect("A", "B", "anh", "em"),
+            expect("A", "B", "anh", "em"),
+            None,
+        ];
+        let declared = vec![
+            parse_declared("A>B: tôi - cô"),
+            parse_declared("A>B: anh - em"),
+            None,
+            parse_declared("A>B: tôi - cô"),
+        ];
+        let translations = texts(&["Cô đi đi.", "Tôi nói rồi mà.", "Tao biết rồi.", "Tôi đây."]);
+        // 0: the declared pair differs; 1: declared right but "tôi" is in the text; 2: nothing
+        // declared but "tao" is in the text; 3: no note, no judgement.
+        assert_eq!(conflicts_with_notes(&expected, &declared, &translations), [0, 1, 2]);
+    }
+
+    #[test]
+    fn the_retry_note_numbers_the_lines_the_way_the_retry_does() {
+        let expected = vec![
+            expect("A", "B", "anh", "em"),
+            None,
+            expect("Sasaki", "Rio", "tôi", "chị"),
+            expect("A", "B", "anh", "em"),
+        ];
+        // The retry carries lines 0, 2 and 3 (positions 0, 1, 2); 0 and 2 are the wrong ones.
+        let note = notes_note(&expected, &[0, 2, 3], &[0, 2]);
+        assert!(note.contains("0: A>B: anh - em | 1: Sasaki>Rio: tôi - chị."), "{note}");
+        assert!(!note.contains("2:"), "{note}");
     }
 }

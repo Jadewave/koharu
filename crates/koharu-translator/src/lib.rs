@@ -23,8 +23,8 @@ use koharu_ml::Device;
 use error::{Error, Result};
 use local::LocalTranslator;
 
-pub use analysis::{AnalysisConfig, AnalysisModel, AnalysisPage, PageAnalysis, PanelLayout};
-pub use backend::{GlossaryEntry, TranslationContext, TranslationRequest};
+pub use analysis::{AnalysisConfig, AnalysisModel, ReviewModel, AnalysisPage, PageAnalysis, PanelLayout};
+pub use backend::{ExpectedPair, GlossaryEntry, TranslationContext, TranslationRequest};
 
 /// Whether a segment has anything to translate: sound effects made only of punctuation or
 /// placeholder glyphs do not, and are not sent to the model.
@@ -463,9 +463,11 @@ impl Translator {
 
     /// Keeps the pronoun pairs of the work consistent. For every line the model wrote who
     /// speaks to whom and the pair of pronouns. A line whose pair (or self pronoun) differs from
-    /// the pair of its direction is translated again with that pair spelled out. The pairs the
-    /// final translations show are remembered, and a pair with enough evidence is locked: it
-    /// goes to every later page as a glossary `address` entry.
+    /// the pair of its direction is translated again with that pair spelled out. A page the
+    /// analysis read has a pair for every line in its notes: its lines are held to those instead
+    /// of to the rest of their direction. The pairs the final translations show are remembered,
+    /// and a pair with enough evidence is locked: it goes to every later page as a glossary
+    /// `address` entry.
     async fn with_consistent_pairs(
         &self,
         selection: &ModelSelection,
@@ -493,15 +495,27 @@ impl Translator {
         let mut thoughts: Vec<Option<address::Thought>> = (0..translated.len())
             .map(|index| think(&speakers, index))
             .collect();
-        if declared.iter().all(Option::is_none) {
+        // What the notes of the page decided for each line, when the analysis read the page.
+        let expected: Vec<Option<address::Declared>> = request
+            .pairs
+            .iter()
+            .map(|pair| pair.as_ref().and_then(address::Declared::expected))
+            .collect();
+        let noted = expected.iter().any(Option::is_some);
+        if declared.iter().all(Option::is_none) && !noted {
             return translated;
         }
         let (pair_flagged, thought_flagged) = self
             .pairs
             .lock()
             .map(|book| {
+                let pairs = if noted {
+                    address::conflicts_with_notes(&expected, &declared, &translated)
+                } else {
+                    book.conflicts(&declared, &translated)
+                };
                 (
-                    book.conflicts(&declared, &translated),
+                    pairs,
                     book.thought_conflicts(&thoughts, &declared, &translated),
                 )
             })
@@ -520,7 +534,11 @@ impl Translator {
                 .map(|book| {
                     let mut notes: Vec<String> = Vec::new();
                     if !pair_flagged.is_empty() {
-                        notes.push(book.note(&declared, &pair_flagged));
+                        notes.push(if noted {
+                            address::notes_note(&expected, &flagged, &pair_flagged)
+                        } else {
+                            book.note(&declared, &pair_flagged)
+                        });
                     }
                     if !thought_flagged.is_empty() {
                         notes.push(book.thought_note(&thoughts, &declared, &thought_flagged));
@@ -561,7 +579,13 @@ impl Translator {
             let still = self
                 .pairs
                 .lock()
-                .map(|book| book.conflicts(&declared, &translated))
+                .map(|book| {
+                    if noted {
+                        address::conflicts_with_notes(&expected, &declared, &translated)
+                    } else {
+                        book.conflicts(&declared, &translated)
+                    }
+                })
                 .unwrap_or_default();
             for index in still {
                 declared[index] = None;

@@ -691,6 +691,16 @@ fn translation_rules(request: &TranslationRequest) -> String {
         "}.trim_end());
     }
 
+    if request.target_language == Language::Vietnamese && request.has_notes() {
+        prompt.push_str("\n\n");
+        prompt.push_str(indoc! {"
+            Notes of the analysis:
+            - The additional instructions hold notes from a vision model that saw the pages (they start with 'Notes on this page'). They are authoritative for who speaks to whom and for the words of 'I' and 'you'. For every segment that has a note, use exactly its speaker, its listener and the words it gives ('calls self', 'calls the listener'): they win over your own reading of the story, over the evidence list above, and over a glossary address pair (a line whose note differs from the pair of its direction is an exception the note already holds).
+            - Decide a pair yourself, from the evidence above, only for a segment that has no note. A thought keeps the word its note gives, or 'mình'.
+            - The notes stand in for the picture, which you do not see: never invent a speaker or a listener they do not name.
+        "}.trim_end());
+    }
+
     if request.wants_speaker() {
         prompt.push_str("\n\n");
         prompt.push_str(indoc! {"
@@ -699,6 +709,9 @@ fn translation_rules(request: &TranslationRequest) -> String {
             - For a thought or monologue write 'Name>thought: I-word' with the character's name and the first-person word that the character uses aloud (or 'mình'), for example 'Rio>thought: mình'. Use plain 'narration' only for narration that no character thinks or says.
             - Then write `text` with exactly that pair, and keep the pair of the same Speaker>Listener that the context entries and the earlier lines already show, until the relationship clearly changes.
         "}.trim_end());
+        if request.has_notes() {
+            prompt.push_str("\n- A segment that has a note takes the speaker, the listener and the pair of its note into `speaker`, word for word.");
+        }
     }
 
     if request.page_images.len() > 1 {
@@ -1229,5 +1242,54 @@ mod tests {
         let mut request = two_pages(Language::Vietnamese);
         request.instructions = None;
         assert!(translation_system_prompt(&request).contains("Rio>thought: mình"));
+    }
+
+    fn pair(speaker: &str, mine: &str) -> Option<crate::ExpectedPair> {
+        Some(crate::ExpectedPair {
+            speaker: speaker.to_owned(),
+            listener: "Rio".to_owned(),
+            mine: mine.to_owned(),
+            yours: "em".to_owned(),
+        })
+    }
+
+    #[test]
+    fn a_page_with_notes_makes_the_model_follow_them_and_write_its_speakers() {
+        let plain = TranslationRequest::new(["a", "b"], Language::Vietnamese);
+        assert!(!plain.has_notes() && !plain.wants_speaker());
+        assert!(!translation_rules(&plain).contains("Notes of the analysis"));
+
+        let noted = plain
+            .clone()
+            .with_pairs(vec![pair("Sasaki", "anh"), None])
+            .with_speakers();
+        assert!(noted.has_notes() && noted.wants_speaker());
+        let rules = translation_rules(&noted);
+        assert!(rules.contains("Notes of the analysis"));
+        assert!(rules.contains("they win over your own reading"));
+        assert!(rules.contains("takes the speaker, the listener and the pair of its note"));
+        let schema = request_schema(&noted);
+        assert!(schema["properties"]["translations"]["items"]["properties"]["speaker"].is_object());
+        // Another target language has no pronoun pairs to follow.
+        let english = TranslationRequest::new(["a", "b"], Language::English)
+            .with_pairs(vec![pair("Sasaki", "I"), None])
+            .with_speakers();
+        assert!(!translation_rules(&english).contains("Notes of the analysis"));
+        assert!(!english.wants_speaker());
+    }
+
+    #[test]
+    fn pairs_of_the_wrong_length_are_ignored_and_a_subset_keeps_its_own() {
+        let request = TranslationRequest::new(["a", "b", "c"], Language::Vietnamese);
+        assert!(!request.clone().with_pairs(vec![None]).has_notes());
+        let noted = request.with_pairs(vec![pair("A", "anh"), None, pair("C", "tôi")]);
+        let subset = noted.select(&[2, 0]);
+        assert_eq!(subset.pairs.len(), 2);
+        assert_eq!(subset.pairs[0].as_ref().unwrap().speaker, "C");
+        assert_eq!(subset.pairs[1].as_ref().unwrap().speaker, "A");
+        // Without images the page keeps asking for speakers.
+        let mut noted = noted.with_speakers();
+        noted.remove_image();
+        assert!(noted.wants_speaker());
     }
 }

@@ -12,6 +12,9 @@
 //! the next one reads it. A model that the server does not know or does not let the user call
 //! is skipped for the rest of the run. A page that no model could read is translated the way
 //! it was before, without notes.
+//!
+//! Once every page is read, the whole work is read again as text (see `review`) by the models of
+//! `analysis.review_models`, DeepSeek first, before the local model translates anything.
 
 use std::{collections::HashSet, fmt::Write as _, sync::Arc};
 
@@ -24,7 +27,7 @@ mod review;
 
 use crate::{
     Error, GenerationConfig, Language, ProvidersConfig, Translator,
-    backend::{GlossaryEntry, encode_image, shrink_to},
+    backend::{ExpectedPair, GlossaryEntry, encode_image, shrink_to},
     remote,
 };
 
@@ -38,8 +41,10 @@ const FIELD_CHARS: usize = 160;
 const PROFILE_CHARS: usize = 240;
 /// What the vision model is told it knows already is cut to this many characters.
 const BIBLE_PROMPT_CHARS: usize = 6000;
-/// The notes of one page are cut to this many characters.
-const INSTRUCTIONS_CHARS: usize = 3500;
+/// The notes of one page are cut to this many characters. A line the notes do not reach is
+/// translated by the model's own guess, which is where the pronouns drift, so the limit is
+/// generous: a crowded page still has a note for every line.
+const INSTRUCTIONS_CHARS: usize = 6000;
 
 /// `[analysis]` of the configuration file.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,15 +53,19 @@ pub struct AnalysisConfig {
     /// Reads the work with the vision models below when the OpenAI-compatible provider has
     /// a server of its own (not the local default). Set to false to turn it off.
     pub enabled: bool,
-    /// The models, in the order they are tried for every page.
+    /// The models that read the pages, in the order they are tried for every page.
     pub models: Vec<AnalysisModel>,
+    /// The models of the second reading, in the order they are tried for every part of the
+    /// work. It is text only, so these are names, not `AnalysisModel`s. DeepSeek comes first:
+    /// it settles the pronouns of the whole work before the local model translates a page.
+    pub review_models: Vec<ReviewModel>,
     /// Lets the models think while they read a page. Slower and it needs `max_tokens` to be
     /// large. Off by default: the second reading (`review`) is where thinking pays.
     pub reasoning: bool,
     pub max_tokens: u32,
-    /// After every page is read, the models read the whole work again as text, settle the words
-    /// for "I" and "you" of every pair of characters and correct the notes of the pages that
-    /// disagree with it.
+    /// After every page is read, the `review_models` read the whole work again as text, settle
+    /// the words for "I" and "you" of every pair of characters and correct the notes of the
+    /// pages that disagree with it.
     pub review: bool,
     /// Lets the models think during the second reading.
     pub review_reasoning: bool,
@@ -73,6 +82,20 @@ pub struct AnalysisConfig {
     /// The order panels are read in: from the right of a row to its left (Japanese manga), or
     /// from the left to the right.
     pub right_to_left: bool,
+}
+
+/// The DeepSeek model of the analysis.
+const DEEPSEEK: &str = "deepseek-ai/deepseek-v4.1-flash";
+/// The vision model of the analysis.
+const NEMOTRON_VL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
+
+/// A model of the second reading.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReviewModel {
+    pub model: String,
+    /// Lets this model think during the review. Unset: follows `[analysis] review_reasoning`.
+    #[serde(default)]
+    pub reasoning: Option<bool>,
 }
 
 /// A model of the analysis chain.
@@ -106,10 +129,12 @@ impl Default for AnalysisConfig {
         };
         Self {
             enabled: true,
-            models: vec![
-                model("nvidia/nemotron-3.5-super-vl-120b-a12b", false, None),
-                model("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", false, None),
-                model("deepseek-ai/deepseek-v4.1-flash", true, None),
+            models: vec![model(NEMOTRON_VL, false, None), model(DEEPSEEK, true, None)],
+            // DeepSeek answers the review without thinking; the vision model, its fallback, follows
+            // `review_reasoning`.
+            review_models: vec![
+                ReviewModel { model: DEEPSEEK.to_owned(), reasoning: Some(false) },
+                ReviewModel { model: NEMOTRON_VL.to_owned(), reasoning: None },
             ],
             reasoning: false,
             // A page is answered in about two thousand tokens: a model that loops (the log of one
@@ -578,6 +603,14 @@ a formal pair, close people a familiar one. Do not give everyone the same pair.
 direction the same on every page.
 - An older speaker calls himself 'tôi' (or 'bác', 'chú', 'ông', 'lão' by age and manner), never \
 'con' or 'cháu', unless the speaker is a child or a younger relative of the listener.
+- A word that names a sex belongs to that sex, as 'I' and as 'you' alike: 'anh', 'chú', 'ông' \
+are for men and boys only; 'chị', 'cô', 'dì', 'bà' for women and girls only. A woman never calls \
+herself 'anh' and nobody calls a man 'chị' or 'cô'. 'tôi', 'tớ', 'mình', 'em', 'cháu', 'con' fit \
+either sex. Check the gender of the person the word is about before you write it.
+- The two directions of a pair fit each other. When A calls himself 'anh' and calls B 'em', \
+B calls A 'anh' and calls themselves 'em' (not 'tôi - cô'); when A calls B 'chị' and calls \
+themselves 'em', B calls A 'em' and themselves 'chị'. A direction may differ only for a real \
+reason: a quarrel, a stranger who speaks formally, a talk to a child.
 - The first-person word of a thought is the one the character uses aloud, or 'mình'."
     } else {
         ""
@@ -687,6 +720,25 @@ fn is_generic(name: &str) -> bool {
 struct Bible {
     characters: Vec<Character>,
     terms: Vec<Term>,
+    /// How many lines used each pair of words, by direction (speaker, listener; lowercase).
+    /// What the first line of a direction used is not what the direction is: a line can be
+    /// noise. `settle_pairs` gives every direction the pair most of its lines used.
+    tally: Tally,
+}
+
+/// What a speaker calls themselves and what they call the listener.
+type WordPair = (String, String);
+/// Pairs of words with the number of lines that used them, for every direction.
+type Tally = Vec<((String, String), Vec<(WordPair, u32)>)>;
+
+fn add_votes(tally: &mut Tally, key: (String, String), pair: WordPair, votes: u32) {
+    match tally.iter_mut().find(|(known, _)| *known == key) {
+        Some((_, pairs)) => match pairs.iter_mut().find(|(known, _)| *known == pair) {
+            Some((_, count)) => *count += votes,
+            None => pairs.push((pair, votes)),
+        },
+        None => tally.push((key, vec![(pair, votes)])),
+    }
 }
 
 fn fill(known: &mut String, new: &str) {
@@ -732,7 +784,16 @@ impl Bible {
         if is_generic(&new.name) {
             return;
         }
-        let Some(index) = self.character_index(&new.name) else {
+        // A character that was met under a label ('man with glasses') and is now named comes
+        // with that label in `aliases`: it is the same person, not a second one, or the words
+        // the two entries hold would never meet.
+        let by_name = self.character_index(&new.name);
+        let index = by_name.or_else(|| {
+            new.aliases
+                .iter()
+                .find_map(|alias| self.character_index(alias))
+        });
+        let Some(index) = index else {
             if self.characters.len() < MAX_CHARACTERS {
                 let mut character = Character {
                     name: clip(&new.name, FIELD_CHARS),
@@ -752,6 +813,12 @@ impl Bible {
             return;
         };
         let known = &mut self.characters[index];
+        // Found only through the label: the name that came with it is the one to use from now
+        // on (an honorific makes no new name: 'Sasaki-kun' is still Sasaki).
+        if by_name.is_none() && crate::address::norm_name(&known.name) != crate::address::norm_name(&new.name) {
+            let label = std::mem::replace(&mut known.name, clip(&new.name, FIELD_CHARS));
+            known.aliases.push(label);
+        }
         fill(&mut known.gender, &new.gender);
         fill(&mut known.age, &new.age);
         fill(&mut known.role, &new.role);
@@ -804,7 +871,7 @@ impl Bible {
             None => listener.to_owned(),
         };
         let relationship = Relationship {
-            with: listener,
+            with: listener.clone(),
             relation: String::new(),
             self_word: self_word.to_owned(),
             you: you.to_owned(),
@@ -817,6 +884,20 @@ impl Bible {
                 ..Character::default()
             }),
         }
+        let (mine, yours) = (self_word.trim().to_lowercase(), you.trim().to_lowercase());
+        if !mine.is_empty() && !yours.is_empty() {
+            let key = (self.direction_name(speaker), self.direction_name(&listener));
+            add_votes(&mut self.tally, key, (mine, yours), 1);
+        }
+    }
+
+    /// The name a direction is counted under: the character's name when the name or alias is
+    /// known, else the name as written; always lowercase.
+    fn direction_name(&self, name: &str) -> String {
+        self.character_index(name).map_or_else(
+            || name.trim().to_lowercase(),
+            |index| self.characters[index].name.trim().to_lowercase(),
+        )
     }
 
     fn merge_output(&mut self, output: &PageOutput) {
@@ -889,9 +970,14 @@ impl Bible {
                 if mine.is_empty() || yours.is_empty() {
                     continue;
                 }
+                // The listener under the name the character has now, not the label it was met by.
+                let listener = self.character_index(&relationship.with).map_or_else(
+                    || relationship.with.trim().to_owned(),
+                    |index| self.characters[index].name.clone(),
+                );
                 entries.push(GlossaryEntry {
                     kind: "address".to_owned(),
-                    source: format!("{} -> {}", character.name, relationship.with.trim()),
+                    source: format!("{} -> {listener}", character.name),
                     target: format!("{mine} - {yours}"),
                 });
             }
@@ -1034,6 +1120,34 @@ impl PageAnalysis {
             .collect()
     }
 
+    /// For every line of the page the words the notes decided for it, or `None` for a line the
+    /// notes give no pair for (narration, a thought, an unknown speaker). Empty when the page
+    /// changed since it was read. The translation is checked against these.
+    #[must_use]
+    pub fn expected_pairs(&self, current: &[String]) -> Vec<Option<ExpectedPair>> {
+        if !self.same_page(current) {
+            return Vec::new();
+        }
+        self.lines
+            .iter()
+            .map(|line| {
+                let speech = line.kind.is_empty() || line.kind == "speech";
+                let (mine, yours) = (line.self_word.trim(), line.you.trim());
+                (speech
+                    && !is_generic(&line.speaker)
+                    && !is_generic(&line.listener)
+                    && !mine.is_empty()
+                    && !yours.is_empty())
+                .then(|| ExpectedPair {
+                    speaker: line.speaker.trim().to_owned(),
+                    listener: line.listener.trim().to_owned(),
+                    mine: mine.to_owned(),
+                    yours: yours.to_owned(),
+                })
+            })
+            .collect()
+    }
+
     /// How many lines the vision model corrected.
     #[must_use]
     pub fn corrections(&self) -> usize {
@@ -1152,7 +1266,7 @@ impl Translator {
         };
         let system = system_prompt(language);
         let mut bible = Bible::default();
-        let mut dead: HashSet<usize> = HashSet::new();
+        let mut dead: HashSet<String> = HashSet::new();
         let mut results: Vec<Option<PageAnalysis>> = Vec::with_capacity(pages.len());
 
         for (number, page) in pages.iter().enumerate() {
@@ -1162,8 +1276,8 @@ impl Translator {
             }
             let count = page.segments.len();
             let mut result = None;
-            for (position, entry) in config.models.iter().enumerate() {
-                if dead.contains(&position) {
+            for entry in &config.models {
+                if dead.contains(&entry.model) {
                     continue;
                 }
                 let (images, view) = if !entry.vision {
@@ -1191,7 +1305,7 @@ impl Translator {
                     .await
                     .map_err(|error| {
                         if matches!(&error, Error::Api { status, .. } if matches!(*status, 401 | 403 | 404)) {
-                            dead.insert(position);
+                            dead.insert(entry.model.clone());
                         }
                         anyhow::Error::from(error)
                     })
@@ -1228,9 +1342,18 @@ impl Translator {
             }
         }
 
-        if config.review {
-            self.review_work(&config, &providers, language, &mut bible, &mut results, &mut dead, &stop)
+        let settled = bible.settle_pairs();
+        tracing::info!(settled, "directions settled by the number of lines that used a pair");
+        let reviewed = config.review
+            && self
+                .review_work(&config, &providers, language, &mut bible, &mut results, &mut dead, &stop)
                 .await;
+        if !reviewed {
+            // Nobody read the work again: what most lines of a direction used is its pair, so
+            // that a line that strayed does not make the notes of the pages disagree.
+            for page in results.iter_mut().flatten() {
+                page.apply_review(&bible, None);
+            }
         }
 
         // What the whole work decided replaces what an earlier run of it wrote.
@@ -1398,6 +1521,8 @@ mod tests {
         assert!(system.contains("translated into Vietnamese"));
         assert!(system.contains("never from hair, glasses or build alone"));
         assert!(system.contains("never 'con' or 'cháu'"));
+        assert!(system.contains("for men and boys only"), "a word of one sex is not for the other");
+        assert!(system.contains("The two directions of a pair fit each other"));
         assert!(!system_prompt(Language::English).contains("Vietnamese pronouns"));
         let mut bible = Bible::default();
         assert!(user_prompt(0, 2, &sources(&["a"]), &bible, &View::Page).contains("Known so far: nothing yet."));
@@ -1466,15 +1591,91 @@ mod tests {
     }
 
     #[test]
-    fn the_default_chain_starts_with_the_vision_model() {
+    fn the_default_chain_is_the_vision_model_then_deepseek() {
         let config = AnalysisConfig::default();
         assert!(config.models.iter().all(|model| model.vision));
-        assert!(!config.models[0].panels && !config.models[1].panels && config.models[2].panels);
+        assert_eq!(config.models.len(), 2, "the nano omni model is gone");
+        assert_eq!(config.models[0].model, NEMOTRON_VL);
+        assert_eq!(config.models[1].model, DEEPSEEK);
+        assert!(!config.models[0].panels && config.models[1].panels);
         assert!(config.right_to_left);
-        assert_eq!(config.models[2].model, "deepseek-ai/deepseek-v4.1-flash");
+        assert!(config.models.iter().all(|model| !model.model.contains("nano")));
+        // The second reading starts with DeepSeek and falls back on the vision model.
+        assert_eq!(config.review_models[0].model, DEEPSEEK);
+        assert_eq!(config.review_models[0].reasoning, Some(false), "DeepSeek does not think in the review");
+        assert_eq!(config.review_models[1].model, NEMOTRON_VL);
         let parsed: AnalysisConfig =
             serde_json::from_str(r#"{"models": [{"model": "a/b"}]}"#).unwrap();
         assert!(parsed.enabled && parsed.models.len() == 1 && parsed.models[0].vision);
         assert!(!parsed.models[0].panels, "panels are off unless asked for");
+        assert_eq!(parsed.review_models, AnalysisConfig::default().review_models, "an unset chain is the default");
+    }
+
+    #[test]
+    fn a_page_tells_the_translation_the_words_of_every_speech_line() {
+        let lines = sources(&["おい ゆう", "りおさん さみしがつてるぞ", "…"]);
+        let output = parse_page(ANSWER, 3).unwrap();
+        let mut bible = Bible::default();
+        bible.merge_output(&output);
+        let analysis = PageAnalysis::new(&output, &lines, &bible);
+        let pairs = analysis.expected_pairs(&lines);
+        assert_eq!(pairs.len(), 3);
+        let first = pairs[0].as_ref().unwrap();
+        assert_eq!((first.speaker.as_str(), first.listener.as_str()), ("Sasaki", "Yuu"));
+        assert_eq!((first.mine.as_str(), first.yours.as_str()), ("tôi", "cậu"));
+        assert!(pairs[2].is_none(), "a line nobody described has no pair");
+        // A page that changed since it was read has none.
+        assert!(analysis.expected_pairs(&sources(&["x", "y", "z"])).is_empty());
+    }
+
+    #[test]
+    fn the_pair_most_lines_used_wins_over_the_first_line() {
+        let page = |lines: &str| parse_page(lines, 4).unwrap();
+        let mut bible = Bible::default();
+        // The first line of the direction is the stray one.
+        bible.merge_output(&page(
+            r#"{"lines": [
+                {"id": 0, "speaker": "Sasaki", "listener": "Rio", "self": "tôi", "you": "cô"},
+                {"id": 1, "speaker": "Sasaki", "listener": "Rio", "self": "anh", "you": "em"},
+                {"id": 2, "speaker": "Sasaki", "listener": "Rio", "self": "anh", "you": "em"}]}"#,
+        ));
+        assert_eq!(bible.characters[0].relationships[0].you, "cô", "the first line came first");
+        assert_eq!(bible.settle_pairs(), 1);
+        let rio = &bible.characters[0].relationships[0];
+        assert_eq!((rio.self_word.as_str(), rio.you.as_str()), ("anh", "em"));
+        // Nothing left to settle.
+        assert_eq!(bible.settle_pairs(), 0);
+    }
+
+    #[test]
+    fn a_tie_keeps_the_pair_that_came_first_and_a_label_counts_under_its_name() {
+        let mut bible = Bible::default();
+        bible.merge_output(&parse_page(
+            r#"{"lines": [
+                {"id": 0, "speaker": "man with glasses", "listener": "Rio", "self": "tôi", "you": "cô"},
+                {"id": 1, "speaker": "man with glasses", "listener": "Rio", "self": "anh", "you": "em"}]}"#,
+            3,
+        ).unwrap());
+        // The name is learned later: the label becomes an alias.
+        bible.merge_output(&PageOutput {
+            characters: vec![Character {
+                name: "Sasaki".into(),
+                aliases: vec!["man with glasses".into()],
+                ..Character::default()
+            }],
+            lines: vec![Line {
+                id: 0,
+                speaker: "Sasaki".into(),
+                listener: "Rio".into(),
+                self_word: "anh".into(),
+                you: "em".into(),
+                ..Line::default()
+            }],
+            ..PageOutput::default()
+        });
+        bible.settle_pairs();
+        let known = bible.character_index("Sasaki").unwrap();
+        let rio = &bible.characters[known].relationships[0];
+        assert_eq!((rio.self_word.as_str(), rio.you.as_str()), ("anh", "em"), "two votes for anh - em");
     }
 }
