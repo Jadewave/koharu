@@ -698,6 +698,10 @@ fn translation_rules(request: &TranslationRequest) -> String {
             - The additional instructions hold notes from a vision model that saw the pages (they start with 'Notes on this page'). They are authoritative for who speaks to whom and for the words of 'I' and 'you'. For every segment that has a note, use exactly its speaker, its listener and the words it gives ('calls self', 'calls the listener'): they win over your own reading of the story, over the evidence list above, and over a glossary address pair (a line whose note differs from the pair of its direction is an exception the note already holds).
             - Decide a pair yourself, from the evidence above, only for a segment that has no note. A thought keeps the word its note gives, or 'mình'.
             - The notes stand in for the picture, which you do not see: never invent a speaker or a listener they do not name.
+            - The notes describe people by sex, age and look, not by name. Match each description to the person who speaks or listens, and decide the words from who that person is: their sex, their age, their rank and how close they are to the other. A name said inside a line is linked to a person through the character entries of the glossary (they hold the look). The same description is the same person in every segment of the page.
+            - A note marked (speaker inferred) or (listener inferred) was worked out from the context, not seen: still use its words. A note marked (speaker unknown) or (listener unknown) has no known person: take the words the note gives, add no word that names a sex, and let the sentence go without a pronoun when Vietnamese allows it.
+            - A line 'to a group' is said to several people: use the plural the note gives ('các em', 'các bạn', 'mọi người', 'các vị', 'bọn mày', ...) and the speaker's word for themselves toward them, in the register of the tone. A 'themself (a thought)' line is an inner voice: plain and short, in the speaker's own manner.
+            - The tone and the source cues of a note set the register of the whole sentence, not only the pronouns: polite or formal tones take full polite forms (ạ, vâng, xin, làm ơn); rough, angry or contemptuous tones take blunt short words and no softening particles; tender, teasing or shy tones take soft particles (nhé, nhỉ, mà, đấy). A note that says it differs from their usual words is an exception for that line only: use its words there and go back to the usual ones in the next segment.
         "}.trim_end());
     }
 
@@ -710,7 +714,7 @@ fn translation_rules(request: &TranslationRequest) -> String {
             - Then write `text` with exactly that pair, and keep the pair of the same Speaker>Listener that the context entries and the earlier lines already show, until the relationship clearly changes.
         "}.trim_end());
         if request.has_notes() {
-            prompt.push_str("\n- A segment that has a note takes the speaker, the listener and the pair of its note into `speaker`, word for word.");
+            prompt.push_str("\n- A segment that has a note takes its speaker and its listener into `speaker` in two or three words each (their sex and age, as in 'young man>girl'), then its pair, word for word: 'young man>girl: anh - em'.");
         }
     }
 
@@ -1267,7 +1271,11 @@ mod tests {
         let rules = translation_rules(&noted);
         assert!(rules.contains("Notes of the analysis"));
         assert!(rules.contains("they win over your own reading"));
-        assert!(rules.contains("takes the speaker, the listener and the pair of its note"));
+        assert!(rules.contains("takes its speaker and its listener into `speaker` in two or three words each"));
+        assert!(rules.contains("describe people by sex, age and look, not by name"));
+        assert!(rules.contains("A line 'to a group'"));
+        assert!(rules.contains("(speaker unknown)"));
+        assert!(rules.contains("set the register of the whole sentence"));
         let schema = request_schema(&noted);
         assert!(schema["properties"]["translations"]["items"]["properties"]["speaker"].is_object());
         // Another target language has no pronoun pairs to follow.

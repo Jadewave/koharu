@@ -605,6 +605,12 @@ impl Translator {
                 declared[index] = None;
             }
         }
+        // A page with notes names its people by what they look like, not by name, and the notes
+        // decide its words: what the model wrote for them is no evidence of a pair between two
+        // characters, so nothing is learned from it.
+        if noted {
+            return translated;
+        }
         if let Ok(mut book) = self.pairs.lock() {
             let locked = book.learn(&declared, &translated);
             if locked > 0 {

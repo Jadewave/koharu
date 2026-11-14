@@ -52,7 +52,7 @@ const BIBLE_PROMPT_CHARS: usize = 6000;
 /// The notes of one page are cut to this many characters. A line the notes do not reach is
 /// translated by the model's own guess, which is where the pronouns drift, so the limit is
 /// generous: a crowded page still has a note for every line.
-const INSTRUCTIONS_CHARS: usize = 6000;
+const INSTRUCTIONS_CHARS: usize = 9000;
 
 /// `[analysis]` of the configuration file.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -417,6 +417,9 @@ struct Character {
     age: String,
     #[serde(deserialize_with = "lenient_string")]
     role: String,
+    /// What identifies the character in the picture: hair, clothes, build, marks.
+    #[serde(deserialize_with = "lenient_string")]
+    look: String,
     #[serde(deserialize_with = "lenient_string")]
     speech_style: String,
     relationships: Vec<Relationship>,
@@ -453,6 +456,82 @@ struct Line {
     you: String,
     #[serde(deserialize_with = "lenient_string")]
     tone: String,
+    /// What identifies the speaker on this line: a look, or the voice of one who is not seen.
+    #[serde(deserialize_with = "lenient_string")]
+    speaker_desc: String,
+    /// `seen`, `inferred` or `unknown`: how the speaker was found out.
+    #[serde(deserialize_with = "lenient_string")]
+    speaker_basis: String,
+    /// What identifies the listener, or who the group is.
+    #[serde(deserialize_with = "lenient_string")]
+    listener_desc: String,
+    #[serde(deserialize_with = "lenient_string")]
+    listener_basis: String,
+    /// `one`, `group`, `self` or `unknown`: who is spoken to.
+    #[serde(deserialize_with = "lenient_string")]
+    audience: String,
+    /// What in the text shows the register: 一人称 and 二人称 words, sentence endings, honorifics.
+    #[serde(deserialize_with = "lenient_string")]
+    cues: String,
+    /// Why the line uses other words than the usual pair of its direction (a quarrel, a taunt,
+    /// tenderness, a pretence); empty for a line that follows its direction.
+    #[serde(deserialize_with = "lenient_string")]
+    exception: String,
+}
+
+impl Line {
+    /// Makes the keys agree with what the line says about its audience and its certainty, so
+    /// that a line to a group, to nobody, or from a voice that is not seen is never counted as a
+    /// direction between two characters.
+    fn normalize(&mut self) {
+        let audience = self.audience.trim().to_lowercase();
+        self.audience = match audience.as_str() {
+            "group" | "crowd" | "several" | "many" | "all" | "everyone" | "plural" | "audience" => "group",
+            "self" | "thought" | "soliloquy" | "monologue" => "self",
+            "unknown" | "unclear" | "none" => "unknown",
+            _ => "one",
+        }
+        .to_owned();
+        let basis = |text: &str| match text.trim().to_lowercase().as_str() {
+            "seen" | "visible" | "shown" => "seen",
+            "inferred" | "guessed" | "context" => "inferred",
+            "unknown" | "unclear" | "unseen" | "none" => "unknown",
+            _ => "",
+        }
+        .to_owned();
+        self.speaker_basis = basis(&self.speaker_basis);
+        self.listener_basis = basis(&self.listener_basis);
+        // A person who cannot be told is nobody in particular: the key is `unknown` and what
+        // was said about them stays as a description.
+        if self.speaker_basis == "unknown" && !is_generic(&self.speaker) {
+            if self.speaker_desc.trim().is_empty() {
+                self.speaker_desc = std::mem::take(&mut self.speaker);
+            }
+            self.speaker = "unknown".to_owned();
+        }
+        match self.audience.as_str() {
+            "group" => {
+                if !is_generic(&self.listener) && self.listener_desc.trim().is_empty() {
+                    self.listener_desc = std::mem::take(&mut self.listener);
+                }
+                self.listener = "everyone".to_owned();
+            }
+            "self" => self.listener = "self".to_owned(),
+            "unknown" => {
+                if !is_generic(&self.listener) && self.listener_desc.trim().is_empty() {
+                    self.listener_desc = std::mem::take(&mut self.listener);
+                }
+                self.listener = "unknown".to_owned();
+            }
+            _ if self.listener_basis == "unknown" && !is_generic(&self.listener) => {
+                if self.listener_desc.trim().is_empty() {
+                    self.listener_desc = std::mem::take(&mut self.listener);
+                }
+                self.listener = "unknown".to_owned();
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -474,17 +553,18 @@ fn schema(expected: usize) -> Value {
         "type": "object",
         "properties": {
             "scene": text("One or two sentences: where, when and what happens on this page."),
-            "page_note": text("What the translator must remember on this page: who is who, what to avoid."),
+            "page_note": text("What the translator must remember on this page: who is who (by sex, age and look, not by name), what to avoid."),
             "characters": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "name": text("The one name this character is called."),
+                        "name": text("The label of the character (sex, age, look) until the page gives a real name; then that name."),
                         "aliases": { "type": "array", "items": { "type": "string" } },
                         "gender": text("man, woman, boy, girl, or unknown."),
                         "age": text("A number or a stage: child, teenager, young adult, adult, middle-aged, elderly."),
                         "role": text("Who the character is in the story."),
+                        "look": text("What identifies the character in the picture: hair, clothes, build, marks."),
                         "speech_style": text("How the character talks: polite, rough, childish, archaic, ..."),
                         "relationships": {
                             "type": "array",
@@ -528,11 +608,18 @@ fn schema(expected: usize) -> Value {
                         },
                         "kind": { "type": "string", "enum": ["speech", "thought", "narration", "sfx", "sign", "other"] },
                         "text": text("The line, corrected when OCR misread it; otherwise copied unchanged."),
-                        "speaker": text("The character who says or thinks it."),
-                        "listener": text("The character spoken to; 'self' for a thought."),
+                        "speaker": text("The label of the character who says or thinks it; 'narrator', or 'unknown' when nobody can be told."),
+                        "speaker_desc": text("What identifies the speaker here: look, or the voice of one who is not seen."),
+                        "speaker_basis": { "type": "string", "enum": ["seen", "inferred", "unknown"] },
+                        "listener": text("The label of the character spoken to; 'self' for a thought, 'everyone' for a group, 'unknown'."),
+                        "listener_desc": text("What identifies the listener, or who the group is (ages, sexes, relation to the speaker)."),
+                        "listener_basis": { "type": "string", "enum": ["seen", "inferred", "unknown"] },
+                        "audience": { "type": "string", "enum": ["one", "group", "self", "unknown"] },
                         "self": text("The word the speaker uses for themselves."),
-                        "you": text("The word the speaker uses for the listener."),
-                        "tone": text("Two or three words.")
+                        "you": text("The word the speaker uses for the listener (the plural for a group)."),
+                        "tone": text("Two or three words."),
+                        "cues": text("What in the text shows the register: I/you words, endings, honorifics."),
+                        "exception": text("Why this line needs other words than the usual pair of its direction; empty otherwise.")
                     },
                     "required": ["id", "speaker", "listener"]
                 }
@@ -558,30 +645,58 @@ sfx, sign or other.
 as kanji, noise from the drawing). Check it against the picture and the story. Copy the line \
 unchanged when it is right. Never translate it, never reword it, never add words that are not \
 on the page.
-- speaker: the name of the character who says or thinks it ('narrator' for narration, \
-'unknown' when nobody can be told). Follow the tail of the bubble, the positions and the story.
-- listener: the character spoken to ('self' for a thought, 'everyone', 'unknown').
-- Speaker and listener are names, never roles: not nurse, patient, visitor, customer, boss or \
-friend. The text says who is who: a person who is called 'Sasaki-kun' is Sasaki, 'Rio-san' is \
-Rio, and a name that is said in a line belongs to someone other than the speaker. Use the names \
-of 'Known so far' and the names that are said or written in the OCR lines. When a character has \
-no name yet, give a short label by look ('woman with long hair', 'man with glasses') and use \
-exactly that label on every page until the name is learned, then put the label in aliases. Two \
+- speaker: who says or thinks it ('narrator' for narration, 'unknown' when nobody can be told). \
+Follow the tail of the bubble, the positions and the story. A person is identified by what they \
+are, not by a name: give the label of 'Known so far' when the person is there, else a short \
+label made of what shows them (sex, age, the most telling look or clothes): 'man about 30 with \
+glasses and a suit', 'girl with twin tails in a school uniform', 'old woman in a kimono'. Use \
+exactly that label on every page. A real name counts only when the page says or writes it (a \
+line that calls someone, a name tag, a caption): then it is the name of that person, and the \
+label goes in aliases. Never make up a name from a look, never use a role such as nurse, patient \
+or boss as the label, and never take the person who is called in a line for the speaker. Two \
 people who answer each other are two different characters, and nobody speaks to themself \
 except in a thought.
+- speaker_desc: what identifies the speaker on this line, in a few words: the look, or the \
+voice (deep, high, old, childish) of a speaker who is not in the picture.
+- speaker_basis: seen (the tail or the mouth shows them), inferred (the chain of balloons, the \
+person who answers, who is in the scene, the way of speaking) or unknown.
+- listener: the person spoken to, labelled the same way; 'self' for a thought, 'everyone' for a \
+group, 'unknown'. listener_desc and listener_basis work like speaker_desc and speaker_basis \
+(the gaze, the body, who answers, who is named in the line).
+- audience: one (a single person), group (several people, a crowd, a class, an army, a \
+broadcast: say who they are in listener_desc: how old, which sex, how they stand to the speaker), \
+self (a thought or a talk to oneself) or unknown (it cannot be told, even from the context).
 - self and you: the words the speaker uses for themselves and for the listener in {target}, \
 chosen from age, sex, rank, closeness and manner of speaking.
-- tone: two or three words (polite, rough, teasing, tender, scared, ...).
+- tone: two or three words (polite, rough, teasing, tender, scared, ...), read from the face, the \
+lettering, the punctuation and the story.
+- cues: what in the text of the line shows the register: the words for I and you (俺, 僕, 私, \
+あたし, お前, 君, あなた), the ending (です/ます, だ, ぜ, わ, ～なさい), the honorific, the title.
+- exception: empty for a line that follows the usual words of its direction. Otherwise the \
+reason in a few words (quarrel, taunt, threat, tenderness, pretence, a talk to a child, quoting \
+someone), and then self and you are the words that this line needs.
 
 Also answer: scene, page_note (what the translator must remember on this page), characters \
-(new ones, or what you learned about known ones: name, aliases, gender, age, role, speech_style, \
-relationships with the pronouns they use) and terms (names of people, places, organizations, \
+(new ones, or what you learned about known ones: name, aliases, gender, age, look, role, \
+speech_style, relationships with the pronouns they use) and terms (names of people, places, organizations, \
 titles and recurring words, with the {target} rendering to use).
 
 Rules:
-- Decide gender, age and manner from how a person speaks first (pronouns such as 俺 or 僕, \
-sentence endings such as ぞ or わ, honorifics) and from the picture, never from hair, glasses or \
-build alone.
+- Recognize a person by the look; decide their gender, age and manner from how they speak first \
+(pronouns such as 俺 or 僕, sentence endings such as ぞ or わ, honorifics) and from the picture, \
+never from hair, glasses or build alone. Write down the look of every character (look) so that \
+the translator can tell the people of a page apart without a name.
+- A speaker who is not in the picture (the tail leaves the panel, a voice from a phone or from \
+behind a door): find out who from the chain of balloons, who answers, who is in the scene and \
+how it is said, and say it is inferred; when nothing tells, speaker is 'unknown' and \
+speaker_desc says what the voice is like. The same for a listener. Never give an unknown person \
+a name or the pair of someone else; choose words that fit what is known (see the pronoun \
+rules).
+- Words to a group are not the pair of a person: audience is group and you is the plural form \
+that fits the group.
+- The tone and the situation decide the words as much as the relationship: the same two people \
+speak differently in a quarrel, in front of others, when one mocks the other or when they are \
+tender. Take the register from the tone, the cues and the scene, not from the names.
 - Keep the names, genders, ages and pronoun pairs of 'Known so far' unless the page clearly \
 shows otherwise. Report only what is new or changed.
 - A character has one name everywhere; other ways of calling them go in aliases. Honorifics \
@@ -614,7 +729,23 @@ either sex. Check the gender of the person the word is about before you write it
 B calls A 'anh' and calls themselves 'em' (not 'tôi - cô'); when A calls B 'chị' and calls \
 themselves 'em', B calls A 'em' and themselves 'chị'. A direction may differ only for a real \
 reason: a quarrel, a stranger who speaks formally, a talk to a child.
-- The first-person word of a thought is the one the character uses aloud, or 'mình'."
+- The first-person word of a thought is the one the character uses aloud, or 'mình'.
+- Tone and situation decide the pair as much as the relationship: the same two people say \
+'anh - em' tenderly, 'tôi - anh' coldly in anger or in front of others, 'tao - mày' in a fight, \
+'ta - ngươi' when one looks down on the other in a period or fantasy story, 'em - anh' or 'em - \
+chị' with fear or respect. Choose from the tone, the cues and the scene of the line. A line that \
+clearly leaves the usual pair of its direction gets an exception with the reason and the words \
+it needs.
+- To several people (audience group) the word for 'you' is a plural that fits who they are: \
+'các em' (children, students, juniors), 'các anh', 'các chị', 'các cô', 'các ông', 'các bà' \
+(a group of one sex, older or respected), 'các bạn' (peers), 'mọi người' (mixed or not known, \
+polite and neutral), 'các vị' (formal, respectful), 'bọn mày', 'chúng mày' (rude or contemptuous), \
+'các ngươi' (period story). The speaker's own word follows the same level ('tôi', 'anh', 'chị', \
+'cô', 'thầy', 'tao', 'ta').
+- An unknown speaker gets words that name no sex unless the voice, the manner or the words of \
+the source show one: 'tôi' for an adult, 'tớ' or 'mình' for a casual peer. An unknown listener \
+gets no word for 'you' when the sentence allows it (an imperative, no pronoun); when one is \
+needed, 'bạn' (neutral or polite), 'cậu' (casual, peers) and 'mày' only for a rude tone."
     } else {
         ""
     }
@@ -711,6 +842,9 @@ fn parse_page(text: &str, count: usize) -> anyhow::Result<PageOutput> {
     output
         .lines
         .retain(|line| line.id < count && seen.insert(line.id));
+    for line in &mut output.lines {
+        line.normalize();
+    }
     ensure!(
         !output.lines.is_empty(),
         "the answer has no line for any of the {count} OCR lines"
@@ -824,6 +958,7 @@ impl Bible {
                     gender: clip(&new.gender, FIELD_CHARS),
                     age: clip(&new.age, FIELD_CHARS),
                     role: clip(&new.role, FIELD_CHARS),
+                    look: clip(&new.look, 80),
                     speech_style: clip(&new.speech_style, FIELD_CHARS),
                     relationships: Vec::new(),
                 };
@@ -845,6 +980,7 @@ impl Bible {
         fill(&mut known.gender, &new.gender);
         fill(&mut known.age, &new.age);
         fill(&mut known.role, &new.role);
+        fill(&mut known.look, &new.look);
         fill(&mut known.speech_style, &new.speech_style);
         for alias in new.aliases.into_iter().chain([new.name]) {
             if !same_name(&alias, &known.name)
@@ -931,7 +1067,27 @@ impl Bible {
             self.merge_term(term.clone());
         }
         for line in &output.lines {
-            self.note_pair(&line.speaker, &line.listener, &line.self_word, &line.you);
+            // A line that leaves the usual words of its direction says nothing about them.
+            if line.exception.trim().is_empty() {
+                self.note_pair(&line.speaker, &line.listener, &line.self_word, &line.you);
+            }
+            // What shows a person on a line is kept for the people the work knows by a label.
+            if line.speaker_basis != "unknown" {
+                self.learn_look(&line.speaker, &line.speaker_desc);
+            }
+            if line.audience == "one" && line.listener_basis != "unknown" {
+                self.learn_look(&line.listener, &line.listener_desc);
+            }
+        }
+    }
+
+    /// Remembers what identifies a known character when nothing is known of how they look.
+    fn learn_look(&mut self, name: &str, desc: &str) {
+        if is_generic(name) || desc.trim().is_empty() {
+            return;
+        }
+        if let Some(index) = self.character_index(name) {
+            fill(&mut self.characters[index].look, &clip(desc, 80));
         }
     }
 
@@ -960,7 +1116,7 @@ impl Bible {
 
     fn profile(character: &Character) -> String {
         let mut parts = Vec::new();
-        for part in [&character.gender, &character.age, &character.role] {
+        for part in [&character.gender, &character.age, &character.look, &character.role] {
             if !part.trim().is_empty() {
                 parts.push(part.trim().to_owned());
             }
@@ -970,6 +1126,64 @@ impl Bible {
             let _ = write!(profile, "; speaks: {}", character.speech_style.trim());
         }
         profile
+    }
+
+    /// A character as a reader sees them, without the name: sex, age, look and role
+    /// ('young adult man, black hair and glasses, colleague'). Empty when nothing is known.
+    fn describe(character: &Character) -> String {
+        fn known(text: &str) -> Option<&str> {
+            let text = text.trim();
+            (!text.is_empty() && !text.eq_ignore_ascii_case("unknown")).then_some(text)
+        }
+        let person = match (known(&character.age), known(&character.gender)) {
+            (Some(age), Some(gender)) if age.chars().all(|c| c.is_ascii_digit()) => {
+                format!("{gender} about {age}")
+            }
+            (Some(age), Some(gender)) => format!("{age} {gender}"),
+            (None, Some(gender)) => gender.to_owned(),
+            (Some(age), None) => format!("{age} person"),
+            (None, None) => String::new(),
+        };
+        let mut parts = Vec::new();
+        if !person.is_empty() {
+            parts.push(person);
+        }
+        for part in [&character.look, &character.role] {
+            if !part.trim().is_empty() {
+                parts.push(clip(part, 40));
+            }
+        }
+        clip(&parts.join(", "), 90)
+    }
+
+    /// Who a speaker or a listener is, for the notes of the translator: what identifies them,
+    /// never their name. `key` is what the line holds, `desc` what the line says about them.
+    fn who(&self, key: &str, desc: &str, speaker: bool) -> String {
+        let desc = desc.trim();
+        match key.trim().to_lowercase().as_str() {
+            "narrator" | "narration" => return "the narrator".to_owned(),
+            "self" => return "themself (a thought)".to_owned(),
+            "everyone" => {
+                return if desc.is_empty() {
+                    "a group".to_owned()
+                } else {
+                    format!("a group ({})", clip(desc, 80))
+                };
+            }
+            "" | "unknown" | "none" | "n/a" | "?" => {
+                let who = if speaker { "an unknown speaker" } else { "an unknown listener" };
+                return if desc.is_empty() { who.to_owned() } else { format!("{who} ({})", clip(desc, 80)) };
+            }
+            _ => {}
+        }
+        if let Some(index) = self.character_index(key) {
+            let described = Self::describe(&self.characters[index]);
+            if !described.is_empty() {
+                return described;
+            }
+        }
+        // A person the work holds nothing on: what the line says, else the label it gave.
+        if desc.is_empty() { clip(key, 60) } else { clip(desc, 90) }
     }
 
     /// The glossary entries of the work: a profile for every character, the pair of words of
@@ -1061,6 +1275,16 @@ struct AnalyzedLine {
     /// How the speaker is related to the listener, when the work has said so.
     relation: String,
     corrected: Option<String>,
+    speaker_desc: String,
+    listener_desc: String,
+    speaker_basis: String,
+    listener_basis: String,
+    audience: String,
+    cues: String,
+    exception: String,
+    /// Who speaks and who listens as the notes describe them: sex, age, look; no names.
+    speaker_who: String,
+    listener_who: String,
 }
 
 /// What the vision model learned about one page: the notes for the translation model and the
@@ -1079,7 +1303,6 @@ pub struct PageAnalysis {
 impl PageAnalysis {
     fn new(output: &PageOutput, sources: &[String], bible: &Bible) -> Self {
         let mut lines = vec![AnalyzedLine::default(); sources.len()];
-        let mut cast: Vec<String> = Vec::new();
         for line in &output.lines {
             let Some(slot) = lines.get_mut(line.id) else {
                 continue;
@@ -1102,27 +1325,91 @@ impl PageAnalysis {
                     .map(|relationship| clip(&relationship.relation, 60))
                     .unwrap_or_default(),
                 corrected: accept_correction(&sources[line.id], &line.text),
+                speaker_desc: clip(&line.speaker_desc, 90),
+                listener_desc: clip(&line.listener_desc, 90),
+                speaker_basis: line.speaker_basis.clone(),
+                listener_basis: line.listener_basis.clone(),
+                audience: line.audience.clone(),
+                cues: clip(&line.cues, 80),
+                exception: clip(&line.exception, 60),
+                speaker_who: String::new(),
+                listener_who: String::new(),
             };
-            for name in [&line.speaker, &line.listener] {
-                if is_generic(name) {
-                    continue;
-                }
-                if let Some(index) = bible.character_index(name) {
-                    let character = &bible.characters[index];
-                    let entry = format!("{}: {}", character.name, Bible::profile(character));
-                    if !cast.contains(&entry) {
-                        cast.push(entry);
-                    }
-                }
-            }
         }
-        Self {
+        let mut page = Self {
             sources: sources.to_vec(),
             lines,
             scene: clip(&output.scene, 400),
             note: clip(&output.page_note, 600),
-            cast,
+            cast: Vec::new(),
+        };
+        page.refresh_who(bible);
+        page
+    }
+
+    /// Writes who speaks and who listens on every line the way the notes describe people (sex,
+    /// age, look; never a name), and the cast of the page. Two people of the page that the
+    /// description does not tell apart get a letter, so that a description is one person.
+    fn refresh_who(&mut self, bible: &Bible) {
+        for line in &mut self.lines {
+            line.speaker_who = bible.who(&line.speaker, &line.speaker_desc, true);
+            line.listener_who = bible.who(&line.listener, &line.listener_desc, false);
         }
+        // The characters of the page by first appearance, with the description they share.
+        let mut people: Vec<usize> = Vec::new();
+        for line in &self.lines {
+            for key in [&line.speaker, &line.listener] {
+                if is_generic(key) {
+                    continue;
+                }
+                if let Some(index) = bible.character_index(key) {
+                    if !people.contains(&index) {
+                        people.push(index);
+                    }
+                }
+            }
+        }
+        let described = |index: usize| {
+            let described = Bible::describe(&bible.characters[index]);
+            if described.is_empty() { clip(&bible.characters[index].name, 60) } else { described }
+        };
+        let mut labels: Vec<(usize, String)> = Vec::new();
+        for &index in &people {
+            let base = described(index);
+            let same: Vec<usize> = people.iter().copied().filter(|&other| described(other) == base).collect();
+            let label = if same.len() > 1 {
+                let letter = char::from(b'A' + u8::try_from(same.iter().position(|&other| other == index).unwrap_or(0)).unwrap_or(0));
+                format!("{base} ({letter})")
+            } else {
+                base
+            };
+            labels.push((index, label));
+        }
+        let label_of = |key: &str| {
+            bible
+                .character_index(key)
+                .and_then(|index| labels.iter().find(|(known, _)| *known == index))
+                .map(|(_, label)| label.clone())
+        };
+        for line in &mut self.lines {
+            if !is_generic(&line.speaker) {
+                if let Some(label) = label_of(&line.speaker) {
+                    line.speaker_who = label;
+                }
+            }
+            if !is_generic(&line.listener) {
+                if let Some(label) = label_of(&line.listener) {
+                    line.listener_who = label;
+                }
+            }
+        }
+        self.cast = labels
+            .iter()
+            .map(|(index, label)| {
+                let style = bible.characters[*index].speech_style.trim();
+                if style.is_empty() { label.clone() } else { format!("{label}; speaks: {style}") }
+            })
+            .collect();
     }
 
     fn same_page(&self, current: &[String]) -> bool {
@@ -1144,8 +1431,9 @@ impl PageAnalysis {
     }
 
     /// For every line of the page the words the notes decided for it, or `None` for a line the
-    /// notes give no pair for (narration, a thought, an unknown speaker). Empty when the page
-    /// changed since it was read. The translation is checked against these.
+    /// notes give no words for (narration, a thought, a sign). Lines to a group and lines of a
+    /// speaker nobody can tell have their words too. Empty when the page changed since it was
+    /// read. The translation is checked against these.
     #[must_use]
     pub fn expected_pairs(&self, current: &[String]) -> Vec<Option<ExpectedPair>> {
         if !self.same_page(current) {
@@ -1156,16 +1444,13 @@ impl PageAnalysis {
             .map(|line| {
                 let speech = line.kind.is_empty() || line.kind == "speech";
                 let (mine, yours) = (line.self_word.trim(), line.you.trim());
-                (speech
-                    && !is_generic(&line.speaker)
-                    && !is_generic(&line.listener)
-                    && !mine.is_empty()
-                    && !yours.is_empty())
-                .then(|| ExpectedPair {
-                    speaker: line.speaker.trim().to_owned(),
-                    listener: line.listener.trim().to_owned(),
-                    mine: mine.to_owned(),
-                    yours: yours.to_owned(),
+                (speech && !mine.is_empty() && !yours.is_empty() && line.audience != "self").then(|| {
+                    ExpectedPair {
+                        speaker: line.speaker_who.clone(),
+                        listener: line.listener_who.clone(),
+                        mine: mine.to_owned(),
+                        yours: yours.to_owned(),
+                    }
                 })
             })
             .collect()
@@ -1187,8 +1472,10 @@ impl PageAnalysis {
         }
         let mut notes = String::from(
             "Notes on this page from a vision model that saw the picture (you do not see it). \
-Follow them for who speaks to whom and for the words each speaker uses for themselves and for \
-the listener; the numbers are the ids of the segments.",
+People are described by their sex, age and look, never by name: match every description to the \
+person who speaks or listens. Follow the notes for who speaks to whom, for the words each \
+speaker uses for themselves and for the listener, and for the tone; the numbers are the ids of \
+the segments.",
         );
         if !self.scene.is_empty() {
             let _ = write!(notes, "\nScene: {}", self.scene);
@@ -1197,7 +1484,7 @@ the listener; the numbers are the ids of the segments.",
             let _ = write!(notes, "\nNote: {}", self.note);
         }
         if !self.cast.is_empty() {
-            notes.push_str("\nCharacters on this page:");
+            notes.push_str("\nPeople on this page:");
             for entry in &self.cast {
                 let _ = write!(notes, "\n- {entry}");
             }
@@ -1213,10 +1500,12 @@ the listener; the numbers are the ids of the segments.",
                 continue;
             }
             let kind = if line.kind.is_empty() { "speech" } else { &line.kind };
-            let speaker = if line.speaker.trim().is_empty() { "unknown" } else { line.speaker.trim() };
+            let speaker = if line.speaker_who.is_empty() { "an unknown speaker" } else { &line.speaker_who };
             let mut entry = format!("\n- {id} {kind}: {speaker}");
-            if !is_generic(&line.listener) || line.listener.trim().eq_ignore_ascii_case("self") {
-                let _ = write!(entry, " -> {}", line.listener.trim());
+            // Only a spoken line has someone it is said to: a group and an unknown listener
+            // included.
+            if matches!(kind, "speech") && !line.listener.trim().is_empty() {
+                let _ = write!(entry, " -> {}", line.listener_who);
                 if !line.relation.is_empty() {
                     let _ = write!(entry, " ({})", line.relation);
                 }
@@ -1226,13 +1515,30 @@ the listener; the numbers are the ids of the segments.",
                 words.push(format!("calls self \"{}\"", line.self_word));
             }
             if !line.you.is_empty() {
-                words.push(format!("calls the listener \"{}\"", line.you));
+                let who = if line.audience == "group" { "calls the group" } else { "calls the listener" };
+                words.push(format!("{who} \"{}\"", line.you));
             }
             if !words.is_empty() {
                 let _ = write!(entry, "; {}", words.join(", "));
             }
             if !line.tone.is_empty() {
-                let _ = write!(entry, "; {}", line.tone);
+                let _ = write!(entry, "; tone: {}", line.tone);
+            }
+            if !line.exception.is_empty() {
+                let _ = write!(entry, "; differs from their usual words: {}", line.exception);
+            }
+            // How sure the vision model is, said only when it is not sure.
+            let mut doubts = Vec::new();
+            for (side, basis) in [("speaker", &line.speaker_basis), ("listener", &line.listener_basis)] {
+                if basis == "inferred" || basis == "unknown" {
+                    doubts.push(format!("{side} {basis}"));
+                }
+            }
+            if !doubts.is_empty() {
+                let _ = write!(entry, "; ({})", doubts.join(", "));
+            }
+            if !line.cues.is_empty() {
+                let _ = write!(entry, "; source cues: {}", line.cues);
             }
             if notes.chars().count() + entry.chars().count() > INSTRUCTIONS_CHARS {
                 notes.push_str("\n- ...");
@@ -1449,7 +1755,7 @@ mod tests {
 
     const ANSWER: &str = r#"{
         "scene": "A hospital room.",
-        "page_note": "Sasaki is a man.",
+        "page_note": "The young man is a colleague of the woman.",
         "characters": [
             {"name": "Sasaki", "gender": "man", "age": "young adult", "role": "Rio's colleague",
              "speech_style": "rough but kind",
@@ -1557,8 +1863,13 @@ mod tests {
         assert_eq!(texts[2], "…");
         let notes = analysis.instructions(&lines);
         assert!(notes.contains("Scene: A hospital room."));
-        assert!(notes.contains("Sasaki: man, young adult, Rio's colleague; speaks: rough but kind"));
-        assert!(notes.contains("- 0 speech: Sasaki -> Yuu; calls self \"tôi\", calls the listener \"cậu\"; teasing"));
+        assert!(notes.contains("- young adult man, Rio's colleague; speaks: rough but kind"));
+        assert!(notes.contains("never by name"));
+        // The speaker is described, not named; Yuu is nobody the work knows, so the label stays.
+        assert!(notes.contains(
+            "- 0 speech: young adult man, Rio's colleague -> Yuu; calls self \"tôi\", calls the listener \"cậu\"; tone: teasing"
+        ));
+        assert!(!notes.contains("Sasaki"), "the notes never name a person");
         assert!(notes.chars().count() <= INSTRUCTIONS_CHARS + 20);
         assert!(!notes.contains("- 2 "), "a line nobody described has no note");
         // A page whose lines changed since it was read gets no notes and no corrections.
@@ -1572,6 +1883,11 @@ mod tests {
         let system = system_prompt(Language::Vietnamese);
         assert!(system.contains("translated into Vietnamese"));
         assert!(system.contains("never from hair, glasses or build alone"));
+        assert!(system.contains("A person is identified by what they are, not by a name"));
+        assert!(system.contains("audience: one"));
+        assert!(system.contains("Words to a group are not the pair of a person"));
+        assert!(system.contains("To several people (audience group)"));
+        assert!(system.contains("An unknown speaker gets words that name no sex"));
         assert!(system.contains("never 'con' or 'cháu'"));
         assert!(system.contains("for men and boys only"), "a word of one sex is not for the other");
         assert!(system.contains("The two directions of a pair fit each other"));
@@ -1675,7 +1991,7 @@ mod tests {
         let pairs = analysis.expected_pairs(&lines);
         assert_eq!(pairs.len(), 3);
         let first = pairs[0].as_ref().unwrap();
-        assert_eq!((first.speaker.as_str(), first.listener.as_str()), ("Sasaki", "Yuu"));
+        assert_eq!((first.speaker.as_str(), first.listener.as_str()), ("young adult man, Rio's colleague", "Yuu"));
         assert_eq!((first.mine.as_str(), first.yours.as_str()), ("tôi", "cậu"));
         assert!(pairs[2].is_none(), "a line nobody described has no pair");
         // A page that changed since it was read has none.
@@ -1731,5 +2047,162 @@ mod tests {
         let known = bible.character_index("Sasaki").unwrap();
         let rio = &bible.characters[known].relationships[0];
         assert_eq!((rio.self_word.as_str(), rio.you.as_str()), ("anh", "em"), "two votes for anh - em");
+    }
+
+    fn notes_of(json: &str, lines: usize, characters: &[&str]) -> (Bible, String) {
+        let mut bible = Bible::default();
+        for character in characters {
+            bible.merge_character(serde_json::from_str(character).unwrap());
+        }
+        let output = parse_page(json, lines).unwrap();
+        bible.merge_output(&output);
+        let sources: Vec<String> = (0..lines).map(|id| format!("line {id}")).collect();
+        let analysis = PageAnalysis::new(&output, &sources, &bible);
+        let notes = analysis.instructions(&sources);
+        (bible, notes)
+    }
+
+    #[test]
+    fn a_line_to_a_group_or_from_a_voice_nobody_sees_is_not_a_direction() {
+        let (bible, notes) = notes_of(
+            r#"{"lines": [
+                {"id": 0, "kind": "speech", "speaker": "Sasaki", "listener": "the three girls",
+                 "audience": "group", "listener_desc": "three teenage girls", "self": "cô", "you": "các em",
+                 "tone": "stern"},
+                {"id": 1, "kind": "speech", "speaker": "man at the door", "speaker_basis": "unknown",
+                 "speaker_desc": "deep male voice", "listener": "Sasaki", "self": "tôi", "you": "cô"},
+                {"id": 2, "kind": "speech", "speaker": "Sasaki", "listener": "someone", "listener_basis": "unknown",
+                 "self": "tôi", "you": "bạn", "tone": "calm"}
+            ]}"#,
+            3,
+            &[r#"{"name": "Sasaki", "gender": "woman", "age": "adult", "look": "black bun, white coat", "role": "teacher"}"#],
+        );
+        // Nobody is counted as someone's listener or as a speaker for these lines.
+        assert!(bible.tally.is_empty(), "{:?}", bible.tally);
+        assert!(bible.characters[0].relationships.is_empty());
+        assert!(notes.contains("a group (three teenage girls)"), "{notes}");
+        assert!(notes.contains("calls the group \"các em\""), "{notes}");
+        assert!(notes.contains("an unknown speaker (deep male voice)"), "{notes}");
+        assert!(notes.contains("(speaker unknown)"), "{notes}");
+        assert!(notes.contains("an unknown listener (someone)"), "{notes}");
+        assert!(notes.contains("(listener unknown)"), "{notes}");
+        assert!(notes.contains("adult woman, black bun, white coat, teacher"), "{notes}");
+    }
+
+    #[test]
+    fn a_line_that_says_who_it_is_said_to_by_the_context_is_marked_inferred() {
+        let (_, notes) = notes_of(
+            r#"{"lines": [{"id": 0, "kind": "speech", "speaker": "Sasaki", "speaker_basis": "inferred",
+                "listener": "Rio", "listener_basis": "seen", "self": "anh", "you": "em",
+                "cues": "俺/お前, だぜ"}]}"#,
+            1,
+            &[
+                r#"{"name": "Sasaki", "gender": "man", "age": "young adult"}"#,
+                r#"{"name": "Rio", "gender": "girl", "age": "teenager"}"#,
+            ],
+        );
+        assert!(notes.contains("young adult man -> teenager girl; calls self \"anh\", calls the listener \"em\""), "{notes}");
+        assert!(notes.contains("(speaker inferred)") && !notes.contains("listener seen"), "{notes}");
+        assert!(notes.contains("source cues: 俺/お前, だぜ"), "{notes}");
+    }
+
+    #[test]
+    fn two_people_a_description_does_not_tell_apart_get_a_letter_and_the_others_do_not() {
+        let (_, notes) = notes_of(
+            r#"{"lines": [
+                {"id": 0, "kind": "speech", "speaker": "Mika", "listener": "Rina", "self": "tớ", "you": "cậu"},
+                {"id": 1, "kind": "speech", "speaker": "Rina", "listener": "Mika", "self": "tớ", "you": "cậu"},
+                {"id": 2, "kind": "speech", "speaker": "Mika", "listener": "Ken", "self": "em", "you": "anh"}
+            ]}"#,
+            3,
+            &[
+                r#"{"name": "Mika", "gender": "girl", "age": "teenager"}"#,
+                r#"{"name": "Rina", "gender": "girl", "age": "teenager"}"#,
+                r#"{"name": "Ken", "gender": "man", "age": "young adult", "look": "glasses"}"#,
+            ],
+        );
+        assert!(notes.contains("- 0 speech: teenager girl (A) -> teenager girl (B)"), "{notes}");
+        assert!(notes.contains("- 1 speech: teenager girl (B) -> teenager girl (A)"), "{notes}");
+        assert!(notes.contains("-> young adult man, glasses;"), "{notes}");
+        for name in ["Mika", "Rina", "Ken"] {
+            assert!(!notes.contains(name), "{name} in {notes}");
+        }
+    }
+
+    #[test]
+    fn the_look_of_a_person_is_kept_from_the_lines_and_an_exception_is_no_evidence() {
+        let mut bible = Bible::default();
+        bible.merge_output(
+            &parse_page(
+                r#"{"lines": [
+                    {"id": 0, "speaker": "man with glasses", "speaker_desc": "tall, glasses, grey suit",
+                     "listener": "Rio", "listener_desc": "girl in a uniform", "self": "tôi", "you": "cô"},
+                    {"id": 1, "speaker": "man with glasses", "listener": "Rio", "self": "tao", "you": "mày",
+                     "exception": "quarrel"}
+                ]}"#,
+                2,
+            )
+            .unwrap(),
+        );
+        let known = bible.character_index("man with glasses").unwrap();
+        assert_eq!(bible.characters[known].look, "tall, glasses, grey suit");
+        // Only the first line is a vote for the direction; the quarrel is not.
+        assert_eq!(bible.tally.len(), 1);
+        assert_eq!(bible.tally[0].1, vec![(("tôi".to_owned(), "cô".to_owned()), 1)]);
+        assert_eq!(bible.characters[known].relationships[0].you, "cô");
+    }
+
+    #[test]
+    fn the_audience_and_the_basis_are_read_the_way_models_write_them() {
+        let output = parse_page(
+            r#"{"lines": [
+                {"id": 0, "speaker": "A", "listener": "the class", "audience": "Crowd"},
+                {"id": 1, "speaker": "A", "listener": "A", "audience": "monologue"},
+                {"id": 2, "speaker": "A", "listener": "B", "audience": "someone else", "speaker_basis": "Seen"},
+                {"id": 3, "speaker": "A", "listener": "B", "audience": "unclear"}
+            ]}"#,
+            4,
+        )
+        .unwrap();
+        let by = |id: usize| &output.lines[id];
+        assert_eq!((by(0).audience.as_str(), by(0).listener.as_str(), by(0).listener_desc.as_str()), ("group", "everyone", "the class"));
+        assert_eq!((by(1).audience.as_str(), by(1).listener.as_str()), ("self", "self"));
+        assert_eq!((by(2).audience.as_str(), by(2).listener.as_str(), by(2).speaker_basis.as_str()), ("one", "B", "seen"));
+        assert_eq!((by(3).audience.as_str(), by(3).listener.as_str(), by(3).listener_desc.as_str()), ("unknown", "unknown", "B"));
+    }
+
+    #[test]
+    fn a_group_and_an_unknown_speaker_have_the_words_the_translation_is_held_to() {
+        let lines = sources(&["a", "b", "c"]);
+        let (bible, _) = notes_of(
+            r#"{"lines": [
+                {"id": 0, "kind": "speech", "speaker": "Sasaki", "listener": "x", "audience": "group",
+                 "listener_desc": "the students", "self": "cô", "you": "các em"},
+                {"id": 1, "kind": "speech", "speaker": "x", "speaker_basis": "unknown", "listener": "Sasaki",
+                 "speaker_desc": "a man's voice", "self": "tôi", "you": "cô"},
+                {"id": 2, "kind": "thought", "speaker": "Sasaki", "listener": "self", "self": "mình"}
+            ]}"#,
+            3,
+            &[r#"{"name": "Sasaki", "gender": "woman", "age": "adult", "role": "teacher"}"#],
+        );
+        let output = parse_page(
+            r#"{"lines": [
+                {"id": 0, "kind": "speech", "speaker": "Sasaki", "listener": "x", "audience": "group",
+                 "listener_desc": "the students", "self": "cô", "you": "các em"},
+                {"id": 1, "kind": "speech", "speaker": "x", "speaker_basis": "unknown", "listener": "Sasaki",
+                 "speaker_desc": "a man's voice", "self": "tôi", "you": "cô"},
+                {"id": 2, "kind": "thought", "speaker": "Sasaki", "listener": "self", "self": "mình"}
+            ]}"#,
+            3,
+        )
+        .unwrap();
+        let analysis = PageAnalysis::new(&output, &lines, &bible);
+        let pairs = analysis.expected_pairs(&lines);
+        let group = pairs[0].as_ref().unwrap();
+        assert_eq!((group.mine.as_str(), group.yours.as_str()), ("cô", "các em"));
+        assert_eq!(group.listener, "a group (the students)");
+        let unseen = pairs[1].as_ref().unwrap();
+        assert_eq!(unseen.speaker, "an unknown speaker (a man's voice)");
+        assert!(pairs[2].is_none(), "a thought has no pair to hold the translation to");
     }
 }

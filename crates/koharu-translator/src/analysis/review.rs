@@ -125,9 +125,10 @@ their choices can clash. You now see the whole work as text and you settle the w
 so that they fit the story and are the same wherever the same people talk to each other.
 
 What you do:
-- Find out who the characters really are. The readers sometimes named a speaker by a role \
-(nurse, patient, visitor, customer) or took two people for one, because the names were not known \
-on the first pages. The text tells: a name said in a line belongs to someone other than the \
+- Find out who the characters really are. The readers describe people by a label (sex, age, \
+look) and give a real name only when a page says it; they sometimes named a speaker by a role \
+(nurse, patient, visitor, customer), took two people for one, or took one person for two because \
+the same person was labelled differently on two pages. The text tells: a name said in a line belongs to someone other than the \
 speaker, people who answer each other are different people, and nobody speaks to themself \
 except in a thought. When the text shows who really says or hears a line, list that line in \
 changes with speaker and/or listener set to the right name. Use the names of the list; add a \
@@ -150,6 +151,14 @@ in characters the pair that holds for most of the work, and list in changes each
 must use other words: page (counted from 1), id (the number of the line), self and/or you. \
 Give the line a word only when it differs from the pair of its direction, or when the line has \
 no pair (a thought uses the word the character uses aloud, or 'mình').
+- A line to a group, a line of a speaker or to a listener that nobody could tell ([group], \
+[unknown speaker], [unknown listener]) is no direction: make no pair for it. Change one of its \
+words only when it does not fit the people or the tone (a plural 'you' that does not suit the \
+group, a word that names a sex for a voice that shows none). A line marked exception keeps its \
+words: list it only when they are wrong.
+- The tone and the situation of a line matter as much as the relation: a quarrel, a taunt, \
+tenderness or a talk in front of others can make a pair other than the usual one right for a \
+line.
 - Do not list a line that is already right. Do not touch the lines of narration, signs or \
 sound effects.
 - Keep your thinking short: the answer is a table of pairs and a short list of lines.
@@ -179,8 +188,18 @@ fn page_digest(number: usize, page: &PageAnalysis) -> Option<String> {
         }
         any = true;
         let kind = if line.kind.is_empty() { "speech" } else { &line.kind };
-        let speaker = if line.speaker.trim().is_empty() { "unknown" } else { line.speaker.trim() };
-        let listener = if line.listener.trim().is_empty() { "unknown" } else { line.listener.trim() };
+        // A person nobody can tell and a group are not characters: they are shown as what they
+        // are, with what the reader said about them.
+        let who = |key: &str, desc: &str, what: &str| {
+            let desc = if desc.trim().is_empty() { String::new() } else { format!(": {}", clip(desc, 60)) };
+            match key.trim() {
+                "" | "unknown" => format!("[unknown {what}{desc}]"),
+                "everyone" => format!("[group{desc}]"),
+                name => name.to_owned(),
+            }
+        };
+        let speaker = who(&line.speaker, &line.speaker_desc, "speaker");
+        let listener = who(&line.listener, &line.listener_desc, "listener");
         let _ = write!(digest, "{id} {kind} {speaker} -> {listener}");
         if !line.relation.is_empty() {
             let _ = write!(digest, " ({})", line.relation);
@@ -191,6 +210,9 @@ fn page_digest(number: usize, page: &PageAnalysis) -> Option<String> {
         }
         if !line.tone.is_empty() {
             let _ = write!(digest, " | {}", line.tone);
+        }
+        if !line.exception.is_empty() {
+            let _ = write!(digest, " | exception: {}", line.exception);
         }
         if let Some(text) = texts.get(id) {
             let _ = write!(
@@ -337,6 +359,13 @@ impl PageAnalysis {
                 }
                 if !fix.listener.is_empty() {
                     line.listener = fix.listener.clone();
+                    if !is_generic(&line.listener) {
+                        line.audience = "one".to_owned();
+                        line.listener_desc.clear();
+                    }
+                }
+                if !fix.speaker.is_empty() && !is_generic(&line.speaker) {
+                    line.speaker_desc.clear();
                 }
             }
             line.speaker = bible.canonical(&line.speaker);
@@ -360,6 +389,9 @@ impl PageAnalysis {
                         line.you = fix.you.clone();
                     }
                 }
+                // A line that was read as an exception keeps the words the reader gave it for
+                // the tone and the situation; every other line takes the pair of its direction.
+                _ if !line.exception.is_empty() => {}
                 _ => {
                     if let Some(pair) = pair {
                         if !pair.self_word.trim().is_empty() {
@@ -381,22 +413,7 @@ impl PageAnalysis {
                 changed += 1;
             }
         }
-        let mut cast: Vec<String> = Vec::new();
-        for line in &self.lines {
-            for name in [&line.speaker, &line.listener] {
-                if is_generic(name) {
-                    continue;
-                }
-                if let Some(index) = bible.character_index(name) {
-                    let character = &bible.characters[index];
-                    let entry = format!("{}: {}", character.name, Bible::profile(character));
-                    if !cast.contains(&entry) {
-                        cast.push(entry);
-                    }
-                }
-            }
-        }
-        self.cast = cast;
+        self.refresh_who(bible);
         changed
     }
 }
@@ -751,7 +768,7 @@ mod tests {
         assert!(analysis.lines[3].self_word.is_empty());
         let notes = analysis.instructions(&analysis.sources.clone());
         assert!(notes.contains("calls the listener \"chị\""));
-        assert!(analysis.cast.iter().any(|entry| entry.starts_with("Sasaki: man")));
+        assert!(analysis.cast.iter().any(|entry| entry.starts_with("young adult man")));
     }
 
     #[test]
@@ -870,5 +887,68 @@ mod tests {
         assert_eq!(config.review_models[0].model, "deepseek-ai/deepseek-v4.1-flash");
         assert_eq!(config.review_models[0].reasoning, Some(false), "DeepSeek does not think in the review");
         assert_eq!(config.review_models[1].reasoning, None, "the fallback follows review_reasoning");
+    }
+
+    const QUARREL: &str = r#"{
+        "characters": [
+            {"name": "Sasaki", "gender": "man", "age": "young adult", "look": "glasses",
+             "relationships": [{"with": "Rio", "self": "tôi", "you": "cô"}]},
+            {"name": "Rio", "gender": "woman", "age": "adult", "look": "long hair"}
+        ],
+        "lines": [
+            {"id": 0, "kind": "speech", "speaker": "Sasaki", "listener": "Rio", "self": "tôi", "you": "cô"},
+            {"id": 1, "kind": "speech", "speaker": "Sasaki", "listener": "Rio", "self": "tao", "you": "mày",
+             "tone": "furious", "exception": "quarrel"},
+            {"id": 2, "kind": "speech", "speaker": "Sasaki", "listener": "everyone", "audience": "group",
+             "listener_desc": "the staff", "self": "tôi", "you": "mọi người"},
+            {"id": 3, "kind": "speech", "speaker": "someone", "speaker_basis": "unknown",
+             "speaker_desc": "a child's voice", "listener": "Sasaki", "self": "em", "you": "anh"}
+        ]
+    }"#;
+
+    #[test]
+    fn a_line_read_as_an_exception_keeps_its_words_and_the_others_take_the_pair() {
+        let mut bible = Bible::default();
+        let mut analysis = page(QUARREL, 4, &mut bible);
+        // The reader gave line 0 a stray word; the pair of the direction puts it right.
+        analysis.lines[0].you = "chị".to_owned();
+        analysis.apply_review(&bible, None);
+        assert_eq!(analysis.lines[0].you, "cô");
+        assert_eq!(
+            (analysis.lines[1].self_word.as_str(), analysis.lines[1].you.as_str()),
+            ("tao", "mày"),
+            "the quarrel keeps its own words"
+        );
+        // A group and an unknown speaker are no direction: their words are not touched.
+        assert_eq!(analysis.lines[2].you, "mọi người");
+        assert_eq!((analysis.lines[3].self_word.as_str(), analysis.lines[3].you.as_str()), ("em", "anh"));
+        let notes = analysis.instructions(&analysis.sources.clone());
+        assert!(notes.contains("differs from their usual words: quarrel"), "{notes}");
+        assert!(notes.contains("calls the group \"mọi người\""), "{notes}");
+    }
+
+    #[test]
+    fn the_translation_is_held_to_the_usual_pair_even_when_a_line_is_an_exception() {
+        let mut bible = Bible::default();
+        let mut analysis = page(QUARREL, 4, &mut bible);
+        analysis.apply_review(&bible, None);
+        let mut book = PairBook::default();
+        // The quarrel does not stop the direction from being locked.
+        assert_eq!(super::settle::seed_pairs(&mut book, &bible, &[Some(analysis)]), 1);
+        assert_eq!(book.entries(), [("Sasaki -> Rio".to_owned(), "tôi - cô".to_owned())]);
+    }
+
+    #[test]
+    fn the_editor_sees_a_group_and_an_unseen_voice_as_what_they_are() {
+        let mut bible = Bible::default();
+        let analysis = page(QUARREL, 4, &mut bible);
+        let digest = page_digest(0, &analysis).unwrap();
+        assert!(digest.contains("2 speech Sasaki -> [group: the staff]"), "{digest}");
+        assert!(digest.contains("3 speech [unknown speaker: a child's voice] -> Sasaki"), "{digest}");
+        assert!(digest.contains("| exception: quarrel"), "{digest}");
+        let system = system_prompt(Language::Vietnamese);
+        assert!(system.contains("is no direction: make no pair for it"));
+        assert!(system.contains("A line marked exception keeps its words"));
+        assert!(system.contains("describe people by a label (sex, age, look)"));
     }
 }

@@ -27,10 +27,13 @@ pub(super) fn seed_pairs(book: &mut PairBook, bible: &Bible, results: &[Option<P
     let mut directions: Vec<((String, String), Vec<(String, String)>)> = Vec::new();
     for page in results.iter().flatten() {
         for line in &page.lines {
+            // An exception is no evidence of the usual words, and a group or an unknown person is
+            // no direction.
             if is_generic(&line.speaker)
                 || is_generic(&line.listener)
                 || line.self_word.trim().is_empty()
                 || line.you.trim().is_empty()
+                || !line.exception.is_empty()
             {
                 continue;
             }

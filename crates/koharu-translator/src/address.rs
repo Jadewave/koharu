@@ -48,12 +48,11 @@ pub(crate) struct Declared {
 
 impl Declared {
     /// What the notes of a page decided for a line, written the way a translation declares it.
-    /// `None` for names or words that make no pair.
+    /// `None` when a word is missing.
     pub(crate) fn expected(expected: &ExpectedPair) -> Option<Self> {
+        // The people are described (sex, age, look) or not known at all: only the words count,
+        // so a description, a group or an unknown speaker is as good as a name.
         let (from, to) = (norm_name(&expected.speaker), norm_name(&expected.listener));
-        if GENERIC.contains(&from.as_str()) || GENERIC.contains(&to.as_str()) || from == to {
-            return None;
-        }
         Some(Self {
             from,
             to,
@@ -779,7 +778,8 @@ mod tests {
         let pair = expect("Sasaki-kun", "Rio", "Tôi", "chị").unwrap();
         assert_eq!((pair.from.as_str(), pair.to.as_str()), ("sasaki", "rio"));
         assert_eq!(pair.pair(), ("tôi".to_owned(), "chị".to_owned()));
-        assert!(expect("unknown", "Rio", "tôi", "chị").is_none());
+        // A description, a group or an unknown speaker is as good as a name.
+        assert!(expect("unknown speaker", "a group (three students)", "tôi", "các em").is_some());
         assert!(expect("Sasaki", "Rio", "", "chị").is_none());
     }
 
