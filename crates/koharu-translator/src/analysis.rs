@@ -19,7 +19,9 @@
 //! what is known of the characters go with it, so that a panel is never read alone.
 //!
 //! Once every page is read, the pairs of words of every direction are settled by the number of
-//! lines that used them (see `settle`), without another model.
+//! lines that used them (see `settle`), and the whole work is read again as text (see `review`)
+//! by the models of `analysis.review_models`, DeepSeek first, before the local model translates
+//! anything.
 
 use std::{collections::HashSet, fmt::Write as _, sync::Arc};
 
@@ -28,6 +30,7 @@ use image::DynamicImage;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
+mod review;
 mod settle;
 
 use crate::{
@@ -60,10 +63,26 @@ pub struct AnalysisConfig {
     pub enabled: bool,
     /// The models that read the pages, in the order they are tried for every page.
     pub models: Vec<AnalysisModel>,
+    /// The models of the second reading, in the order they are tried for every part of the
+    /// work. It is text only, so these are names, not `AnalysisModel`s. DeepSeek comes first:
+    /// it settles the pronouns of the whole work before the local model translates a page.
+    pub review_models: Vec<ReviewModel>,
     /// Lets the models think while they read a page. Slower and it needs `max_tokens` to be
-    /// large. Off by default.
+    /// large. Off by default: the second reading (`review`) is where thinking pays.
     pub reasoning: bool,
     pub max_tokens: u32,
+    /// After every page is read, the `review_models` read the whole work again as text, settle
+    /// the words for "I" and "you" of every pair of characters and correct the notes of the
+    /// pages that disagree with it.
+    pub review: bool,
+    /// Lets the models of the second reading think. Unlike a page, the whole work is one
+    /// decision, and thinking pays there.
+    pub review_reasoning: bool,
+    /// The most tokens a model of the second reading may write, thinking included.
+    pub review_max_tokens: u32,
+    /// The size of one request of the second reading, in characters of the pages' text; a
+    /// longer work is read in several parts.
+    pub review_chars: usize,
     /// The longest side of the page picture that is sent, in pixels.
     pub image_max_dimension: u32,
     /// The longest side of a panel picture that is sent, in pixels.
@@ -77,6 +96,15 @@ pub struct AnalysisConfig {
 const DEEPSEEK: &str = "deepseek-ai/deepseek-v4.1-flash";
 /// The vision model of the analysis.
 const NEMOTRON_VL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
+
+/// A model of the second reading.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReviewModel {
+    pub model: String,
+    /// Lets this model think during the review. Unset: follows `review_reasoning`.
+    #[serde(default)]
+    pub reasoning: Option<bool>,
+}
 
 /// A model of the analysis chain.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -105,10 +133,20 @@ impl Default for AnalysisConfig {
         Self {
             enabled: true,
             models: vec![model(NEMOTRON_VL, None), model(DEEPSEEK, None)],
+            // DeepSeek answers the review without thinking; the vision model, its fallback,
+            // follows `review_reasoning`.
+            review_models: vec![
+                ReviewModel { model: DEEPSEEK.to_owned(), reasoning: Some(false) },
+                ReviewModel { model: NEMOTRON_VL.to_owned(), reasoning: None },
+            ],
             reasoning: false,
             // A page is answered in about two thousand tokens: a model that loops (the log of one
             // page wrote the same phrase until the limit) is cut off early.
             max_tokens: 6144,
+            review: true,
+            review_reasoning: true,
+            review_max_tokens: 32768,
+            review_chars: 60_000,
             image_max_dimension: 1600,
             panel_max_dimension: 1024,
             right_to_left: true,
@@ -1278,6 +1316,20 @@ impl Translator {
                     images.extend(page.panels.iter().map(|panel| panel.picture.clone()));
                     (images, View::PageAndPanels(&page.panels))
                 };
+                // Shows in the log what the model is really sent: with `vision` off it is no
+                // picture at all, with panels it is the page and one picture for every panel.
+                tracing::info!(
+                    page = number + 1,
+                    model = %entry.model,
+                    images = images.len(),
+                    panels = page.panels.len(),
+                    view = match &view {
+                        View::Text => "text only",
+                        View::Page => "whole page",
+                        View::PageAndPanels(_) => "whole page and panels",
+                    },
+                    "sending the page to the analysis model"
+                );
                 let chat = remote::Chat {
                     system: system.clone(),
                     user: user_prompt(
@@ -1340,13 +1392,19 @@ impl Translator {
 
         let settled = bible.settle_pairs();
         tracing::info!(settled, "directions settled by the number of lines that used a pair");
-        // What most lines of a direction used is its pair: a line that strayed does not make the
-        // notes of the pages disagree.
-        for page in results.iter_mut().flatten() {
-            page.apply_pairs(&bible);
-        }
-        for problem in bible.address_conflicts() {
-            tracing::warn!(%problem, "a settled pair cannot be right");
+        let reviewed = config.review
+            && self
+                .review_work(&config, &providers, language, &mut bible, &mut results, &mut dead, &stop)
+                .await;
+        if !reviewed {
+            // Nobody read the work again: what most lines of a direction used is its pair, so
+            // that a line that strayed does not make the notes of the pages disagree.
+            for page in results.iter_mut().flatten() {
+                page.apply_review(&bible, None);
+            }
+            for problem in bible.address_conflicts() {
+                tracing::warn!(%problem, "a settled pair cannot be right");
+            }
         }
 
         // What the whole work decided replaces what an earlier run of it wrote.
@@ -1596,13 +1654,15 @@ mod tests {
         assert_eq!(config.models[1].model, DEEPSEEK);
         assert!(config.right_to_left);
         assert!(config.models.iter().all(|model| !model.model.contains("nano")));
-        // An old file that still names the settings of the second reading or of the panels
-        // of a model is read; those are gone.
-        let parsed: AnalysisConfig = serde_json::from_str(
-            r#"{"models": [{"model": "a/b", "panels": true}], "review": true, "review_models": []}"#,
-        )
-        .unwrap();
+        // The second reading starts with DeepSeek, which does not think, then the vision model.
+        assert_eq!(config.review_models[0].model, DEEPSEEK);
+        assert_eq!(config.review_models[0].reasoning, Some(false));
+        assert_eq!(config.review_models[1].model, NEMOTRON_VL);
+        // An old file that names the panels of a model is still read; that setting is gone.
+        let parsed: AnalysisConfig =
+            serde_json::from_str(r#"{"models": [{"model": "a/b", "panels": true}]}"#).unwrap();
         assert!(parsed.enabled && parsed.models.len() == 1 && parsed.models[0].vision);
+        assert_eq!(parsed.review_models, config.review_models, "an unset chain is the default");
     }
 
     #[test]

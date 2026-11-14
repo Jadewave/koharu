@@ -1,17 +1,16 @@
-//! The pairs of words a work settles on.
+//! The pairs of words a work settles on, without a model.
 //!
 //! The pages are read one by one, so what the model chose on page 3 can clash with what it
-//! chose on page 40: a pair flips between "anh - em" and "tôi - cô". There is no second reading
-//! of the whole work: the pages are read with their panels and the story so far (see the
-//! parent module), and what is left is settled here without a model.
+//! chose on page 40: a pair flips between "anh - em" and "tôi - cô". What this module does:
 //!
 //! - every direction (speaker to listener) gets the pair most of its lines used, over what its
-//!   first line said (`settle_pairs`);
-//! - the pair is written into the notes of every page (`apply_pairs`), so that the lines of a
-//!   direction do not disagree with each other;
+//!   first line said (`settle_pairs`), so a stray first line does not decide the direction;
 //! - the pairs all lines of a direction agree on are locked for the translation (`seed_pairs`);
 //! - the pairs that cannot be right (a word of one sex for a person of the other, two
-//!   directions of one pair that do not fit) are named (`address_conflicts`) and logged.
+//!   directions of one pair that do not fit) are named (`address_conflicts`): the review asks
+//!   the editor about them, and without a review they are logged.
+//!
+//! Writing the settled words into the notes of the pages is the job of `review`.
 
 use super::*;
 use crate::address::PairBook;
@@ -59,7 +58,7 @@ pub(super) fn seed_pairs(book: &mut PairBook, bible: &Bible, results: &[Option<P
 impl Bible {
     /// The words of one direction: what `speaker` calls themselves and `listener`, when the
     /// work has settled it. Names are matched through the aliases.
-    fn pair(&self, speaker: &str, listener: &str) -> Option<&Relationship> {
+    pub(super) fn pair(&self, speaker: &str, listener: &str) -> Option<&Relationship> {
         let character = &self.characters[self.character_index(speaker)?];
         let target = self.character_index(listener);
         character.relationships.iter().find(|relationship| {
@@ -70,77 +69,12 @@ impl Bible {
 
     /// The name a character goes by in the notes: the name of the character the given name
     /// or alias belongs to; other names (narrator, self, ...) stay as they are.
-    fn canonical(&self, name: &str) -> String {
+    pub(super) fn canonical(&self, name: &str) -> String {
         if is_generic(name) {
             return name.trim().to_owned();
         }
         self.character_index(name)
             .map_or_else(|| name.trim().to_owned(), |index| self.characters[index].name.clone())
-    }
-}
-
-impl PageAnalysis {
-    /// Puts the settled words into the notes of the page: a line gets the speaker and listener
-    /// under the names the characters have now, then the pair of its direction, and the cast of
-    /// the page is written again from the characters as they are now. Returns how many lines
-    /// ended up different than before.
-    pub(super) fn apply_pairs(&mut self, bible: &Bible) -> usize {
-        let mut changed = 0;
-        for line in &mut self.lines {
-            if line.kind.is_empty() && line.speaker.trim().is_empty() {
-                continue;
-            }
-            let before = (
-                line.speaker.clone(),
-                line.listener.clone(),
-                line.self_word.clone(),
-                line.you.clone(),
-            );
-            line.speaker = bible.canonical(&line.speaker);
-            line.listener = bible.canonical(&line.listener);
-            let pair = if is_generic(&line.speaker) || is_generic(&line.listener) {
-                None
-            } else {
-                bible.pair(&line.speaker, &line.listener)
-            };
-            if let Some(pair) = pair {
-                if !pair.relation.trim().is_empty() {
-                    line.relation = clip(&pair.relation, 60);
-                }
-                if !pair.self_word.trim().is_empty() {
-                    line.self_word = clip(&pair.self_word, 40);
-                }
-                if !pair.you.trim().is_empty() {
-                    line.you = clip(&pair.you, 40);
-                }
-            }
-            if (
-                line.speaker.clone(),
-                line.listener.clone(),
-                line.self_word.clone(),
-                line.you.clone(),
-            ) != before
-            {
-                changed += 1;
-            }
-        }
-        let mut cast: Vec<String> = Vec::new();
-        for line in &self.lines {
-            for name in [&line.speaker, &line.listener] {
-                if is_generic(name) {
-                    continue;
-                }
-                if let Some(index) = bible.character_index(name) {
-                    let character = &bible.characters[index];
-                    let entry = format!("{}: {}", character.name, Bible::profile(character));
-                    if !cast.contains(&entry) {
-                        cast.push(entry);
-                    }
-                }
-            }
-        }
-        self.cast = cast;
-        changed
     }
 }
 
@@ -332,45 +266,10 @@ mod tests {
     }"#;
 
     #[test]
-    fn a_page_gets_the_pair_of_its_direction_under_the_names_of_the_characters() {
-        let mut bible = Bible::default();
-        let mut analysis = page(FIRST, 4, &mut bible);
-        analysis.lines[0].you = "chị".to_owned();
-        let changed = analysis.apply_pairs(&bible);
-        // Line 0 takes the pair of its direction; line 1 has its listener "Rio-san" written as
-        // "Rio"; the thought and the narration are not touched.
-        assert_eq!(changed, 2);
-        assert_eq!(analysis.lines[1].listener, "Rio");
-        assert_eq!((analysis.lines[0].self_word.as_str(), analysis.lines[0].you.as_str()), ("tôi", "cô"));
-        assert_eq!(analysis.lines[2].self_word, "mình");
-        assert!(analysis.lines[3].self_word.is_empty());
-        let notes = analysis.instructions(&analysis.sources.clone());
-        assert!(notes.contains("calls the listener \"cô\""));
-        assert!(analysis.cast.iter().any(|entry| entry.starts_with("Sasaki: man")));
-        assert_eq!(analysis.apply_pairs(&bible), 0, "nothing left to change");
-    }
-
-    #[test]
-    fn a_line_with_blank_words_gets_the_pair_and_an_unknown_speaker_gets_nothing() {
-        let mut bible = Bible::default();
-        let mut analysis = page(
-            r#"{"lines": [
-                {"id": 0, "kind": "speech", "speaker": "Sasaki", "listener": "Rio"},
-                {"id": 1, "kind": "speech", "speaker": "unknown", "listener": "Rio"}]}"#,
-            2,
-            &mut bible,
-        );
-        bible.merge_output(&parse_page(FIRST, 4).unwrap());
-        assert_eq!(analysis.apply_pairs(&bible), 1);
-        assert_eq!(analysis.lines[0].you, "cô");
-        assert!(analysis.lines[1].you.is_empty());
-    }
-
-    #[test]
     fn the_translation_is_held_to_the_pairs_all_lines_agree_on() {
         let mut bible = Bible::default();
         let mut analysis = page(FIRST, 4, &mut bible);
-        analysis.apply_pairs(&bible);
+        analysis.apply_review(&bible, None);
         let mut book = PairBook::default();
         assert_eq!(seed_pairs(&mut book, &bible, &[Some(analysis.clone()), None]), 1);
         assert_eq!(book.entries(), [("Sasaki -> Rio".to_owned(), "tôi - cô".to_owned())]);
