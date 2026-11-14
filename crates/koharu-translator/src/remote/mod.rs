@@ -10,6 +10,7 @@ mod minimax;
 mod openai;
 mod openai_compatible;
 mod openrouter;
+mod usage;
 
 use anyhow::Context;
 use futures::{FutureExt, future::BoxFuture, future::join_all};
@@ -28,6 +29,7 @@ pub use minimax::MiniMaxConfig;
 pub use openai::OpenAiConfig;
 pub use openai_compatible::OpenAiCompatibleConfig;
 pub(crate) use openai_compatible::Chat;
+pub use usage::{TokenUsage, Tokens, reset_token_usage, token_usage};
 pub use openrouter::OpenRouterConfig;
 
 use crate::{
@@ -253,6 +255,8 @@ pub(super) async fn send_json<T: DeserializeOwned>(
             message: text.chars().take(4096).collect(),
         });
     }
+
+    usage::record(provider, &text);
 
     serde_json::from_str(&text)
         .with_context(|| format!("failed to decode {provider} response"))

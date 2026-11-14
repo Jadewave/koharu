@@ -80,9 +80,10 @@ impl Processor {
         inputs: Vec<StageInput>,
         stop: &(impl Fn() -> bool + Send + Sync),
     ) -> bool {
-        // A new run: whatever an earlier run left over is stale.
+        // A new run: whatever an earlier run left over is stale, and the tokens are counted anew.
         self.pending().clear();
         self.analysis().clear();
+        self.translator.reset_token_usage();
         if !self.translator.analysis_enabled() {
             return false;
         }
@@ -377,6 +378,11 @@ impl Processor {
                 "translator returned {} translations for {expected} segments",
                 translated.len()
             );
+        }
+        // Everything the models of the providers used in this run so far, the analysis included.
+        let used = self.translator.token_usage();
+        if used.total().requests > 0 {
+            tracing::info!(tokens = %used, "tokens used by the providers in this run");
         }
 
         let mut translated = translated.into_iter();

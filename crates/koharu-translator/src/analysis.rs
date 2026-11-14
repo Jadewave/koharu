@@ -13,8 +13,13 @@
 //! is skipped for the rest of the run. A page that no model could read is translated the way
 //! it was before, without notes.
 //!
-//! Once every page is read, the whole work is read again as text (see `review`) by the models of
-//! `analysis.review_models`, DeepSeek first, before the local model translates anything.
+//! Every model is shown the page the way a reader sees it: the whole page first, for the layout
+//! and for where everyone stands, then, when the page has panels, every panel on its own in the
+//! order it is read, large enough to see faces and balloons. The page the story left off on and
+//! what is known of the characters go with it, so that a panel is never read alone.
+//!
+//! Once every page is read, the pairs of words of every direction are settled by the number of
+//! lines that used them (see `settle`), without another model.
 
 use std::{collections::HashSet, fmt::Write as _, sync::Arc};
 
@@ -23,7 +28,7 @@ use image::DynamicImage;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
-mod review;
+mod settle;
 
 use crate::{
     Error, GenerationConfig, Language, ProvidersConfig, Translator,
@@ -55,26 +60,10 @@ pub struct AnalysisConfig {
     pub enabled: bool,
     /// The models that read the pages, in the order they are tried for every page.
     pub models: Vec<AnalysisModel>,
-    /// The models of the second reading, in the order they are tried for every part of the
-    /// work. It is text only, so these are names, not `AnalysisModel`s. DeepSeek comes first:
-    /// it settles the pronouns of the whole work before the local model translates a page.
-    pub review_models: Vec<ReviewModel>,
     /// Lets the models think while they read a page. Slower and it needs `max_tokens` to be
-    /// large. Off by default: the second reading (`review`) is where thinking pays.
+    /// large. Off by default.
     pub reasoning: bool,
     pub max_tokens: u32,
-    /// After every page is read, the `review_models` read the whole work again as text, settle
-    /// the words for "I" and "you" of every pair of characters and correct the notes of the
-    /// pages that disagree with it.
-    pub review: bool,
-    /// Lets the models think during the second reading.
-    pub review_reasoning: bool,
-    /// The most tokens one request of the second reading may use, thinking included. A model
-    /// that spends all of them thinking is asked again without thinking.
-    pub review_max_tokens: u32,
-    /// How many characters of the pages one request of the second reading carries; a longer
-    /// work is read in several parts.
-    pub review_chars: usize,
     /// The longest side of the page picture that is sent, in pixels.
     pub image_max_dimension: u32,
     /// The longest side of a panel picture that is sent, in pixels.
@@ -89,27 +78,14 @@ const DEEPSEEK: &str = "deepseek-ai/deepseek-v4.1-flash";
 /// The vision model of the analysis.
 const NEMOTRON_VL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
 
-/// A model of the second reading.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ReviewModel {
-    pub model: String,
-    /// Lets this model think during the review. Unset: follows `[analysis] review_reasoning`.
-    #[serde(default)]
-    pub reasoning: Option<bool>,
-}
-
 /// A model of the analysis chain.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisModel {
     pub model: String,
-    /// Whether the model is sent the page picture. Set it to false for a model without
+    /// Whether the model is sent the page and its panels. Set it to false for a model without
     /// vision, which then only reads the text.
     #[serde(default = "yes")]
     pub vision: bool,
-    /// Sends the panels of the page one by one, in reading order, instead of the whole page
-    /// (when the page has at least two panels that hold text).
-    #[serde(default)]
-    pub panels: bool,
     /// Lets this model think while it reads a page. Unset: follows `[analysis] reasoning`.
     #[serde(default)]
     pub reasoning: Option<bool>,
@@ -121,29 +97,18 @@ const fn yes() -> bool {
 
 impl Default for AnalysisConfig {
     fn default() -> Self {
-        let model = |name: &str, panels: bool, reasoning: Option<bool>| AnalysisModel {
+        let model = |name: &str, reasoning: Option<bool>| AnalysisModel {
             model: name.to_owned(),
             vision: true,
-            panels,
             reasoning,
         };
         Self {
             enabled: true,
-            models: vec![model(NEMOTRON_VL, false, None), model(DEEPSEEK, true, None)],
-            // DeepSeek answers the review without thinking; the vision model, its fallback, follows
-            // `review_reasoning`.
-            review_models: vec![
-                ReviewModel { model: DEEPSEEK.to_owned(), reasoning: Some(false) },
-                ReviewModel { model: NEMOTRON_VL.to_owned(), reasoning: None },
-            ],
+            models: vec![model(NEMOTRON_VL, None), model(DEEPSEEK, None)],
             reasoning: false,
             // A page is answered in about two thousand tokens: a model that loops (the log of one
             // page wrote the same phrase until the limit) is cut off early.
             max_tokens: 6144,
-            review: true,
-            review_reasoning: true,
-            review_max_tokens: 32768,
-            review_chars: 60_000,
             image_max_dimension: 1600,
             panel_max_dimension: 1024,
             right_to_left: true,
@@ -170,14 +135,14 @@ struct PanelPicture {
     lines: Vec<usize>,
 }
 
-/// Panels beyond this many on one page are not sent one by one; the page is sent whole.
+/// Panels beyond this many on one page are not sent one by one; only the whole page is sent.
 const MAX_PANELS: usize = 10;
 /// A panel smaller than this on a side is not sent.
 const MIN_PANEL_SIDE: f64 = 32.0;
 
 /// One page to read: its picture (with the boxes and numbers of the OCR lines drawn on it,
-/// scaled down and encoded once), its panels when a model of the chain reads them one by one,
-/// and the OCR lines, in the order of the numbers.
+/// scaled down and encoded once), its panels when it has at least two that hold text, and the
+/// OCR lines, in the order of the numbers.
 #[derive(Clone)]
 pub struct AnalysisPage {
     picture: String,
@@ -195,11 +160,11 @@ impl AnalysisPage {
     ) -> anyhow::Result<Self> {
         let config = analysis_config().unwrap_or_default();
         let scaled = shrink_to(image, config.image_max_dimension.max(256))?;
-        let wants_panels = config.models.iter().any(|model| model.vision && model.panels);
+        let wants_panels = config.models.iter().any(|model| model.vision);
         let panels = match layout {
             Some(layout) if wants_panels => {
                 panel_pictures(image, layout, segments.len(), &config).unwrap_or_else(|error| {
-                    tracing::warn!(%error, "could not cut the panels of a page; it is sent whole");
+                    tracing::warn!(%error, "could not cut the panels of a page; only the whole page is sent");
                     Vec::new()
                 })
             }
@@ -305,9 +270,9 @@ fn crop_rect(panel: Rect, width: u32, height: u32) -> Option<(u32, u32, u32, u32
     Some((left as u32, top as u32, (right - left) as u32, (bottom - top) as u32))
 }
 
-/// The pictures of the panels that hold OCR lines, in reading order. Empty when the page should
-/// be sent whole: fewer than two such panels, more than `MAX_PANELS`, or an OCR line that no
-/// picture holds.
+/// The pictures of the panels that hold OCR lines, in reading order. Empty when the panels are
+/// not worth sending: fewer than two such panels, more than `MAX_PANELS`, or an OCR line that no
+/// picture holds (the whole page is sent anyway).
 fn panel_pictures(
     image: &Arc<DynamicImage>,
     layout: &PanelLayout,
@@ -623,11 +588,18 @@ enum View<'a> {
     Text,
     /// The whole page in one picture.
     Page,
-    /// One picture for every panel, in reading order.
-    Panels(&'a [PanelPicture]),
+    /// The whole page, then one picture for every panel, in reading order.
+    PageAndPanels(&'a [PanelPicture]),
 }
 
-fn user_prompt(number: usize, total: usize, segments: &[String], bible: &Bible, view: &View<'_>) -> String {
+fn user_prompt(
+    number: usize,
+    total: usize,
+    segments: &[String],
+    bible: &Bible,
+    previous: Option<&str>,
+    view: &View<'_>,
+) -> String {
     let mut prompt = format!("Page {} of {total}. ", number + 1);
     match view {
         View::Page => prompt.push_str("The picture of the page is attached.\n"),
@@ -635,20 +607,33 @@ fn user_prompt(number: usize, total: usize, segments: &[String], bible: &Bible, 
             "No picture is attached: decide from the text only, and answer 'unknown' where a \
 speaker cannot be told.\n",
         ),
-        View::Panels(panels) => {
+        View::PageAndPanels(panels) => {
             let _ = writeln!(
                 prompt,
-                "The page is attached as {} pictures, one for each panel, in the order the panels \
-are read; picture 1 is the first panel and the story goes on in the next picture. The same \
-character in different panels is the same person. The red boxes carry the numbers of the OCR \
-lines.",
+                "{} pictures are attached. Picture 1 is the whole page: use it for the layout, for \
+who stands where and for which balloon points at whom. The next {} pictures are the panels of the \
+page in the order they are read, each one enlarged: panel 1 is the first one and the story goes on \
+in the next panel. A panel is part of the whole page, never a page of its own: read it in the \
+light of the pictures before it. The same character in different panels is the same person. The \
+red boxes carry the same numbers of the OCR lines in every picture.",
+                panels.len() + 1,
                 panels.len()
             );
             for (position, panel) in panels.iter().enumerate() {
                 let lines: Vec<String> = panel.lines.iter().map(ToString::to_string).collect();
-                let _ = writeln!(prompt, "Picture {}: lines {}", position + 1, lines.join(", "));
+                let _ = writeln!(prompt, "Panel {}: lines {}", position + 1, lines.join(", "));
             }
         }
+    }
+    match previous.map(str::trim).filter(|scene| !scene.is_empty()) {
+        Some(scene) => {
+            let _ = writeln!(
+                prompt,
+                "The previous page ended like this (the story goes on from it): {}",
+                clip(scene, 400)
+            );
+        }
+        None => {}
     }
     let known = bible.prompt_json();
     if known.is_empty() {
@@ -1268,6 +1253,9 @@ impl Translator {
         let mut bible = Bible::default();
         let mut dead: HashSet<String> = HashSet::new();
         let mut results: Vec<Option<PageAnalysis>> = Vec::with_capacity(pages.len());
+        // The scene of the page read last: the next page goes on from it.
+        let mut previous = String::new();
+        let usage_before = remote::token_usage();
 
         for (number, page) in pages.iter().enumerate() {
             if stop() {
@@ -1280,19 +1268,26 @@ impl Translator {
                 if dead.contains(&entry.model) {
                     continue;
                 }
+                // The whole page comes first, so that the panels that follow are read in its context.
                 let (images, view) = if !entry.vision {
                     (Vec::new(), View::Text)
-                } else if entry.panels && !page.panels.is_empty() {
-                    (
-                        page.panels.iter().map(|panel| panel.picture.clone()).collect(),
-                        View::Panels(&page.panels),
-                    )
-                } else {
+                } else if page.panels.is_empty() {
                     (vec![page.picture.clone()], View::Page)
+                } else {
+                    let mut images = vec![page.picture.clone()];
+                    images.extend(page.panels.iter().map(|panel| panel.picture.clone()));
+                    (images, View::PageAndPanels(&page.panels))
                 };
                 let chat = remote::Chat {
                     system: system.clone(),
-                    user: user_prompt(number, pages.len(), &page.segments, &bible, &view),
+                    user: user_prompt(
+                        number,
+                        pages.len(),
+                        &page.segments,
+                        &bible,
+                        Some(&previous),
+                        &view,
+                    ),
                     images,
                     schema_name: "manga_page_analysis",
                     schema: schema(count),
@@ -1325,6 +1320,7 @@ impl Translator {
             }
             match result {
                 Some((model, output)) => {
+                    previous = clip(&output.scene, 400);
                     bible.merge_output(&output);
                     let analysis = PageAnalysis::new(&output, &page.segments, &bible);
                     tracing::info!(
@@ -1344,16 +1340,13 @@ impl Translator {
 
         let settled = bible.settle_pairs();
         tracing::info!(settled, "directions settled by the number of lines that used a pair");
-        let reviewed = config.review
-            && self
-                .review_work(&config, &providers, language, &mut bible, &mut results, &mut dead, &stop)
-                .await;
-        if !reviewed {
-            // Nobody read the work again: what most lines of a direction used is its pair, so
-            // that a line that strayed does not make the notes of the pages disagree.
-            for page in results.iter_mut().flatten() {
-                page.apply_review(&bible, None);
-            }
+        // What most lines of a direction used is its pair: a line that strayed does not make the
+        // notes of the pages disagree.
+        for page in results.iter_mut().flatten() {
+            page.apply_pairs(&bible);
+        }
+        for problem in bible.address_conflicts() {
+            tracing::warn!(%problem, "a settled pair cannot be right");
         }
 
         // What the whole work decided replaces what an earlier run of it wrote.
@@ -1374,13 +1367,14 @@ impl Translator {
         // reading are what the translation is held to.
         if let Ok(mut book) = self.pairs.lock() {
             book.clear();
-            let seeded = review::seed_pairs(&mut book, &bible, &results);
+            let seeded = settle::seed_pairs(&mut book, &bible, &results);
             tracing::info!(seeded, "pronoun pairs of the analysis given to the translation");
         }
         tracing::info!(
             characters = bible.characters.len(),
             terms = bible.terms.len(),
             pages = results.iter().filter(|page| page.is_some()).count(),
+            tokens = %remote::token_usage().since(&usage_before),
             "analysis finished"
         );
         Ok(results)
@@ -1525,11 +1519,12 @@ mod tests {
         assert!(system.contains("The two directions of a pair fit each other"));
         assert!(!system_prompt(Language::English).contains("Vietnamese pronouns"));
         let mut bible = Bible::default();
-        assert!(user_prompt(0, 2, &sources(&["a"]), &bible, &View::Page).contains("Known so far: nothing yet."));
+        assert!(user_prompt(0, 2, &sources(&["a"]), &bible, None, &View::Page).contains("Known so far: nothing yet."));
         bible.merge_output(&parse_page(ANSWER, 3).unwrap());
-        let user = user_prompt(1, 2, &sources(&["おい", "ゆう"]), &bible, &View::Text);
+        let user = user_prompt(1, 2, &sources(&["おい", "ゆう"]), &bible, Some("A hospital room."), &View::Text);
         assert!(user.starts_with("Page 2 of 2. No picture is attached"));
         assert!(user.contains("\"Sasaki\""));
+        assert!(user.contains("The previous page ended like this (the story goes on from it): A hospital room."));
         assert!(user.contains("1: \"ゆう\""));
         assert!(user.ends_with("(ids 0 to 1)."));
     }
@@ -1577,9 +1572,11 @@ mod tests {
             lines,
         };
         let panels = [panel(vec![0, 1]), panel(vec![2])];
-        let user = user_prompt(0, 3, &sources(&["a", "b", "c"]), &Bible::default(), &View::Panels(&panels));
-        assert!(user.contains("attached as 2 pictures, one for each panel"));
-        assert!(user.contains("Picture 1: lines 0, 1\nPicture 2: lines 2\n"));
+        let user = user_prompt(0, 3, &sources(&["a", "b", "c"]), &Bible::default(), None, &View::PageAndPanels(&panels));
+        assert!(user.contains("3 pictures are attached. Picture 1 is the whole page"));
+        assert!(user.contains("The next 2 pictures are the panels"));
+        assert!(user.contains("Panel 1: lines 0, 1\nPanel 2: lines 2\n"));
+        assert!(!user.contains("The previous page"), "the first page has none");
         assert!(user.contains("2: \"c\""));
     }
 
@@ -1597,18 +1594,15 @@ mod tests {
         assert_eq!(config.models.len(), 2, "the nano omni model is gone");
         assert_eq!(config.models[0].model, NEMOTRON_VL);
         assert_eq!(config.models[1].model, DEEPSEEK);
-        assert!(!config.models[0].panels && config.models[1].panels);
         assert!(config.right_to_left);
         assert!(config.models.iter().all(|model| !model.model.contains("nano")));
-        // The second reading starts with DeepSeek and falls back on the vision model.
-        assert_eq!(config.review_models[0].model, DEEPSEEK);
-        assert_eq!(config.review_models[0].reasoning, Some(false), "DeepSeek does not think in the review");
-        assert_eq!(config.review_models[1].model, NEMOTRON_VL);
-        let parsed: AnalysisConfig =
-            serde_json::from_str(r#"{"models": [{"model": "a/b"}]}"#).unwrap();
+        // An old file that still names the settings of the second reading or of the panels
+        // of a model is read; those are gone.
+        let parsed: AnalysisConfig = serde_json::from_str(
+            r#"{"models": [{"model": "a/b", "panels": true}], "review": true, "review_models": []}"#,
+        )
+        .unwrap();
         assert!(parsed.enabled && parsed.models.len() == 1 && parsed.models[0].vision);
-        assert!(!parsed.models[0].panels, "panels are off unless asked for");
-        assert_eq!(parsed.review_models, AnalysisConfig::default().review_models, "an unset chain is the default");
     }
 
     #[test]

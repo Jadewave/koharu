@@ -23,7 +23,8 @@ use koharu_ml::Device;
 use error::{Error, Result};
 use local::LocalTranslator;
 
-pub use analysis::{AnalysisConfig, AnalysisModel, ReviewModel, AnalysisPage, PageAnalysis, PanelLayout};
+pub use analysis::{AnalysisConfig, AnalysisModel, AnalysisPage, PageAnalysis, PanelLayout};
+pub use remote::{TokenUsage, Tokens};
 pub use backend::{ExpectedPair, GlossaryEntry, TranslationContext, TranslationRequest};
 
 /// Whether a segment has anything to translate: sound effects made only of punctuation or
@@ -284,6 +285,19 @@ impl LoadedLocal {
 }
 
 impl Translator {
+    /// The tokens the models of the providers have used (by provider and model) since the last
+    /// `reset_token_usage`: the analysis, the translations and the glossary included. The local
+    /// model uses no provider and is not counted.
+    #[must_use]
+    pub fn token_usage(&self) -> TokenUsage {
+        remote::token_usage()
+    }
+
+    /// Starts counting the tokens from zero (a new run of a work).
+    pub fn reset_token_usage(&self) {
+        remote::reset_token_usage();
+    }
+
     pub fn from_config(
         device: Device,
         providers: koharu_config::Config<ProvidersConfig>,
