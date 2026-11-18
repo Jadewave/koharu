@@ -2,13 +2,6 @@ name: Build, Test and Publish Koharu
 
 on:
   push:
-    branches:
-      - hf-headless
-      - main
-  pull_request:
-    branches:
-      - hf-headless
-      - main
   workflow_dispatch:
 
 env:
