@@ -50,7 +50,7 @@ RUN set -eux; \
     else \
         echo "GitHub download failed, falling back to the PyPI wheel"; \
         pip3 download "onnxruntime==${ORT_VERSION}" --no-deps --only-binary=:all: \
-            --break-system-packages -d /tmp/ort/whl; \
+            -d /tmp/ort/whl; \
         unzip -p /tmp/ort/whl/onnxruntime-*.whl "onnxruntime/capi/libonnxruntime.so.${ORT_VERSION}" \
             > /opt/ort/libonnxruntime.so; \
     fi; \
