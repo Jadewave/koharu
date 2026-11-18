@@ -31,7 +31,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use super::{StageInput, StageProcessor, finish, generation};
+use super::{StageInput, StageProcessor, finish, generation, text_mask};
 use crate::{DetectionModel, ModelCell};
 
 const MODEL_ID: &str = "mayocream/koharu-layout-rfdetr-seg-2xl-1152";
@@ -290,8 +290,12 @@ async fn write_page(
     if let Some(region) = input.region {
         detections.retain(|detection| intersects(detection.bbox, region));
     }
-    non_maximum_suppression(&mut detections, 0.5);
-    suppress_nested_text(&mut detections, NESTED_TEXT_CONTAINMENT);
+    // A text that is dropped as a duplicate of another, or as nested in a larger one, is not
+    // OCR'd or translated twice, but its glyphs are on the page all the same, and the mask of the
+    // text that was kept does not necessarily reach them: its mask still goes into the text mask.
+    let mut dropped = non_maximum_suppression(&mut detections, 0.5);
+    dropped.extend(suppress_nested_text(&mut detections, NESTED_TEXT_CONTAINMENT));
+    dropped.retain(|detection| detection.label == "text");
     sort_by_layout(&mut detections);
 
     let image = image.to_rgb8();
@@ -299,7 +303,7 @@ async fn write_page(
         .context("failed to write detected regions")?;
     link_dialogue_regions(edit, &regions, generation)
         .context("failed to associate detected text with dialogue regions")?;
-    write_masks(input, edit, page, &detections, size)
+    write_masks(input, edit, page, &detections, &dropped, &image, size)
         .await
         .context("failed to write detection masks")
 }
@@ -1395,9 +1399,11 @@ async fn write_masks(
     edit: &mut koharu_scene::Edit,
     page: EntityId,
     detections: &[KoharuLayoutDetection],
+    dropped: &[KoharuLayoutDetection],
+    image: &RgbImage,
     size: ImageSize,
 ) -> Result<()> {
-    write_mask(input, edit, page, detections, size).await?;
+    write_mask(input, edit, page, detections, dropped, image, size).await?;
     edit.remove_asset(page, &AssetRole::new("bubble-mask")?)?;
     Ok(())
 }
@@ -1407,15 +1413,32 @@ async fn write_mask(
     edit: &mut koharu_scene::Edit,
     page: EntityId,
     detections: &[KoharuLayoutDetection],
+    dropped: &[KoharuLayoutDetection],
+    image: &RgbImage,
     size: ImageSize,
 ) -> Result<()> {
+    let masked = detections.iter().chain(dropped);
     let mut mask = if size.width > 0 && size.height > 0 {
         let radius = ((size.width.max(size.height) as f32 / 1024.0) * 6.0)
             .round()
             .clamp(1.0, 255.0) as u8;
-        closed_mask_for(detections, "text", size, radius)
+        let mut mask = closed_mask_for(masked, "text", size, radius);
+        // What the instance masks still miss inside the boxes of the texts: strokes on a
+        // background of one colour (see `text_mask`).
+        let boxes = detections
+            .iter()
+            .filter(|detection| detection.label == "text")
+            .map(|detection| detection.bbox)
+            .collect::<Vec<_>>();
+        let added = text_mask::complete_text_mask(image, &boxes, &mut mask, radius);
+        tracing::debug!(
+            dropped = dropped.len(),
+            added,
+            "text mask completed with the masks of dropped texts and the strokes the masks missed"
+        );
+        mask
     } else {
-        mask_for(detections, "text", size)
+        mask_for(masked, "text", size)
     };
     if let Some(bounds) = input.region {
         preserve_mask_outside_region(input, page, "text-mask", bounds, &mut mask).await?;
@@ -1486,22 +1509,26 @@ fn region_kind(label: &str) -> Result<RegionKind> {
     .map_err(Into::into)
 }
 
-fn mask_for(detections: &[KoharuLayoutDetection], label: &str, size: ImageSize) -> GrayImage {
+fn mask_for<'a>(
+    detections: impl IntoIterator<Item = &'a KoharuLayoutDetection>,
+    label: &str,
+    size: ImageSize,
+) -> GrayImage {
     let mut mask = GrayImage::new(size.width, size.height);
-    for detection in detections.iter().filter(|value| value.label == label) {
+    for detection in detections.into_iter().filter(|value| value.label == label) {
         stamp_mask(&mut mask, &detection.mask, 0, 0);
     }
     mask
 }
 
-fn closed_mask_for(
-    detections: &[KoharuLayoutDetection],
+fn closed_mask_for<'a>(
+    detections: impl IntoIterator<Item = &'a KoharuLayoutDetection>,
     label: &str,
     size: ImageSize,
     radius: u8,
 ) -> GrayImage {
     let masks = detections
-        .iter()
+        .into_iter()
         .filter(|detection| detection.label == label)
         .map(|detection| &detection.mask)
         .filter(|mask| valid_mask(mask) && mask.width > 0 && mask.height > 0)
@@ -1666,7 +1693,11 @@ fn detection_order(left: &KoharuLayoutDetection, right: &KoharuLayoutDetection) 
         .then_with(|| left.label.cmp(&right.label))
 }
 
-fn non_maximum_suppression(detections: &mut Vec<KoharuLayoutDetection>, threshold: f32) {
+/// Keeps the best of the detections that overlap and returns the others.
+fn non_maximum_suppression(
+    detections: &mut Vec<KoharuLayoutDetection>,
+    threshold: f32,
+) -> Vec<KoharuLayoutDetection> {
     detections.sort_by(|left, right| {
         right
             .score
@@ -1674,16 +1705,20 @@ fn non_maximum_suppression(detections: &mut Vec<KoharuLayoutDetection>, threshol
             .then_with(|| detection_order(left, right))
     });
     let mut kept = Vec::with_capacity(detections.len());
+    let mut dropped = Vec::new();
     for candidate in detections.drain(..) {
         let suppressed = kept.iter().any(|existing: &KoharuLayoutDetection| {
             existing.label == candidate.label
                 && suppression_overlap(existing, &candidate) >= threshold
         });
-        if !suppressed {
+        if suppressed {
+            dropped.push(candidate);
+        } else {
             kept.push(candidate);
         }
     }
     *detections = kept;
+    dropped
 }
 
 /// Bubble regions are instance-segmentation results, so rectangle IoU alone is
@@ -1913,30 +1948,36 @@ fn intersection_over_union(left: [f32; 4], right: [f32; 4]) -> f32 {
 
 /// Drops text boxes that lie (at least `containment` of their area) inside a larger
 /// text box. NMS only removes boxes with IoU above its threshold, so a small box
-/// fully contained in a big one survives it and would be OCR'd and translated twice.
-fn suppress_nested_text(detections: &mut Vec<KoharuLayoutDetection>, containment: f32) {
+/// fully contained in a big one survives it and would be OCR'd and translated twice. Returns the
+/// dropped boxes: their glyphs are still on the page.
+fn suppress_nested_text(
+    detections: &mut Vec<KoharuLayoutDetection>,
+    containment: f32,
+) -> Vec<KoharuLayoutDetection> {
     let boxes = detections
         .iter()
         .map(|detection| (detection.label == "text", detection.bbox))
         .collect::<Vec<_>>();
-    let mut index = 0;
-    detections.retain(|detection| {
-        let current = index;
-        index += 1;
-        if detection.label != "text" {
-            return true;
-        }
+    let mut kept = Vec::with_capacity(detections.len());
+    let mut dropped = Vec::new();
+    for (current, detection) in detections.drain(..).enumerate() {
         let own = area(detection.bbox);
-        if own <= 0.0 {
-            return true;
+        let nested = detection.label == "text"
+            && own > 0.0
+            && boxes.iter().enumerate().any(|(other, (is_text, bbox))| {
+                other != current
+                    && *is_text
+                    && area(*bbox) > own
+                    && intersection_area(detection.bbox, *bbox) / own >= containment
+            });
+        if nested {
+            dropped.push(detection);
+        } else {
+            kept.push(detection);
         }
-        !boxes.iter().enumerate().any(|(other, (is_text, bbox))| {
-            other != current
-                && *is_text
-                && area(*bbox) > own
-                && intersection_area(detection.bbox, *bbox) / own >= containment
-        })
-    });
+    }
+    *detections = kept;
+    dropped
 }
 
 fn intersection_area(left: [f32; 4], right: [f32; 4]) -> f32 {
@@ -2478,6 +2519,49 @@ mod tests {
 
         assert_eq!(detections.len(), 1, "duplicate bubble masks should be suppressed");
         assert_eq!(detections[0].score, 0.9);
+    }
+
+    #[test]
+    fn the_mask_of_a_text_dropped_as_a_duplicate_or_as_nested_still_reaches_the_text_mask() {
+        let text = |score: f32, bbox: [f32; 4], x: u32| KoharuLayoutDetection {
+            label_id: 0,
+            label: "text".to_owned(),
+            score,
+            bbox,
+            area: 1,
+            mask: KoharuLayoutMask {
+                x,
+                y: 0,
+                width: 1,
+                height: 1,
+                pixels: vec![255],
+            },
+        };
+        let mut detections = vec![
+            text(0.9, [0.0, 0.0, 100.0, 100.0], 0),
+            // Nested in the first.
+            text(0.8, [20.0, 20.0, 80.0, 80.0], 3),
+            // A duplicate of the first.
+            text(0.6, [0.0, 0.0, 98.0, 100.0], 5),
+        ];
+        let mut dropped = non_maximum_suppression(&mut detections, 0.5);
+        dropped.extend(suppress_nested_text(&mut detections, 0.8));
+        assert_eq!(detections.len(), 1);
+        assert_eq!(dropped.len(), 2);
+
+        let size = ImageSize {
+            width: 8,
+            height: 1,
+        };
+        assert_eq!(
+            mask_for(&detections, "text", size).as_raw(),
+            &[255, 0, 0, 0, 0, 0, 0, 0],
+            "the kept text alone leaves the glyphs of the others uncovered"
+        );
+        assert_eq!(
+            mask_for(detections.iter().chain(&dropped), "text", size).as_raw(),
+            &[255, 0, 0, 255, 0, 255, 0, 0]
+        );
     }
 
     #[test]

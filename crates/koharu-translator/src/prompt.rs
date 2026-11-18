@@ -24,6 +24,11 @@ pub(crate) fn prompts(request: &TranslationRequest) -> anyhow::Result<(String, S
                 } else {
                     None
                 },
+                draft: request
+                    .drafts
+                    .get(id)
+                    .map(String::as_str)
+                    .filter(|draft| !draft.trim().is_empty()),
             })
             .collect(),
     };
@@ -697,12 +702,16 @@ fn translation_rules(request: &TranslationRequest) -> String {
             Notes of the analysis:
             - The additional instructions hold notes from a vision model that saw the pages (they start with 'Notes on this page'). They are authoritative for who speaks to whom and for the words of 'I' and 'you'. For every segment that has a note, use exactly its speaker, its listener and the words it gives ('calls self', 'calls the listener'): they win over your own reading of the story, over the evidence list above, and over a glossary address pair (a line whose note differs from the pair of its direction is an exception the note already holds).
             - Decide a pair yourself, from the evidence above, only for a segment that has no note. A thought keeps the word its note gives, or 'mình'.
-            - The notes stand in for the picture, which you do not see: never invent a speaker or a listener they do not name.
             - The notes describe people by sex, age and look, not by name. Match each description to the person who speaks or listens, and decide the words from who that person is: their sex, their age, their rank and how close they are to the other. A name said inside a line is linked to a person through the character entries of the glossary (they hold the look). The same description is the same person in every segment of the page.
             - A note marked (speaker inferred) or (listener inferred) was worked out from the context, not seen: still use its words. A note marked (speaker unknown) or (listener unknown) has no known person: take the words the note gives, add no word that names a sex, and let the sentence go without a pronoun when Vietnamese allows it.
             - A line 'to a group' is said to several people: use the plural the note gives ('các em', 'các bạn', 'mọi người', 'các vị', 'bọn mày', ...) and the speaker's word for themselves toward them, in the register of the tone. A 'themself (a thought)' line is an inner voice: plain and short, in the speaker's own manner.
             - The tone and the source cues of a note set the register of the whole sentence, not only the pronouns: polite or formal tones take full polite forms (ạ, vâng, xin, làm ơn); rough, angry or contemptuous tones take blunt short words and no softening particles; tender, teasing or shy tones take soft particles (nhé, nhỉ, mà, đấy). A note that says it differs from their usual words is an exception for that line only: use its words there and go back to the usual ones in the next segment.
         "}.trim_end());
+        prompt.push_str(if request.image.is_some() || !request.page_images.is_empty() {
+            "\n- You see the page too. The notes were made by a model that read it with its panels and the whole story: use the picture to check what looks wrong, never to change a pair that the notes settled for the whole work, and never invent a speaker or a listener the notes do not allow."
+        } else {
+            "\n- The notes stand in for the picture, which you do not see: never invent a speaker or a listener they do not name."
+        });
     }
 
     if request.wants_speaker() {
@@ -737,6 +746,15 @@ fn translation_rules(request: &TranslationRequest) -> String {
             When the attached original page image shows red outlines tagged with numbers, each number is the id of the segment whose text lies inside that outline: use the outline to find the segment's bubble and follow its tail to the speaker, and read the text itself from the input segments, not from the outlines.
             Use the attached original page image as visual context for who speaks and who listens, whether a bubble is speech, thought, or narration, the characters' gender, age, and mood, and for tone, layout, and ambiguous OCR.
             Translate only the supplied segments; do not add text seen in the image that is absent from the input segments.
+        "}.trim_end());
+    }
+    if request.has_drafts() {
+        prompt.push_str("\n\n");
+        prompt.push_str(indoc! {"
+            Drafts:
+            - A segment may carry a `draft`: a first translation by a model that saw the page and read the whole story. It is a draft, not the answer. Translate every segment yourself from its source text and the picture, and keep of the draft only what is right.
+            - Write the final translation the way a good translator of comics would: all of the meaning of the source and nothing else, in words a native reader would say aloud, with the tone, the humour, the hesitation and the emphasis of the speaker, short enough for the balloon. Do not translate word for word, and do not bend the meaning to make it sound better.
+            - Correct what is wrong in the draft: a mistranslated word, a lost nuance, a wrong name or term (the glossary decides), a word that does not suit the speaker, a word for 'I' or 'you' that is not the one of the notes (the notes win), a sentence that reads like a translation. A segment without a draft is translated the same way.
         "}.trim_end());
     }
     prompt
@@ -787,6 +805,9 @@ struct TranslationInputSegment<'a> {
     /// 1-based page of the segment when several pages are translated together.
     #[serde(skip_serializing_if = "Option::is_none")]
     page: Option<usize>,
+    /// A first translation by a model that saw the page; a draft to improve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1299,5 +1320,44 @@ mod tests {
         let mut noted = noted.with_speakers();
         noted.remove_image();
         assert!(noted.wants_speaker());
+    }
+
+    #[test]
+    fn a_draft_goes_beside_its_segment_and_the_translator_is_told_to_improve_it() {
+        let plain = TranslationRequest::new(["a", "b"], Language::Vietnamese);
+        assert!(!translation_rules(&plain).contains("Drafts:"));
+        let (_, user) = prompts(&plain).unwrap();
+        assert!(!user.contains("draft"));
+
+        let request = plain
+            .clone()
+            .with_drafts(vec!["Xin chào".to_owned(), String::new()]);
+        assert!(request.has_drafts());
+        let rules = translation_rules(&request);
+        assert!(rules.contains("Drafts:") && rules.contains("It is a draft, not the answer"));
+        assert!(rules.contains("the notes win"));
+        let (_, user) = prompts(&request).unwrap();
+        let input: serde_json::Value = serde_json::from_str(&user).unwrap();
+        assert_eq!(input["segments"][0]["draft"], "Xin chào");
+        assert!(input["segments"][1].get("draft").is_none(), "an empty draft is not sent");
+        // Drafts of the wrong length, or all empty, are ignored.
+        assert!(!plain.clone().with_drafts(vec!["x".to_owned()]).has_drafts());
+        assert!(!plain.with_drafts(vec![String::new(), " ".to_owned()]).has_drafts());
+        // A subset keeps the drafts of its own segments.
+        let subset = request.select(&[1, 0]);
+        assert_eq!(subset.drafts, ["", "Xin chào"]);
+    }
+
+    #[test]
+    fn a_translator_that_sees_the_page_is_told_to_check_the_notes_against_it() {
+        let noted = TranslationRequest::new(["a"], Language::Vietnamese)
+            .with_pairs(vec![pair("Sasaki", "anh")]);
+        let blind = translation_rules(&noted);
+        assert!(blind.contains("The notes stand in for the picture, which you do not see"));
+        let seeing = translation_rules(
+            &noted.with_image(std::sync::Arc::new(image::DynamicImage::new_rgb8(4, 4))),
+        );
+        assert!(seeing.contains("You see the page too"));
+        assert!(!seeing.contains("which you do not see"));
     }
 }

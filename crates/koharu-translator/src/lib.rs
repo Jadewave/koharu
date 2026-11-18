@@ -8,6 +8,7 @@ mod language;
 mod local;
 mod loop_guard;
 mod model;
+mod polish;
 mod prompt;
 mod provider;
 mod remote;
@@ -23,9 +24,10 @@ use koharu_ml::Device;
 use error::{Error, Result};
 use local::LocalTranslator;
 
-pub use analysis::{AnalysisConfig, AnalysisModel, AnalysisPage, PageAnalysis, PanelLayout, ReviewModel};
+pub use analysis::{AnalysisConfig, AnalysisModel, AnalysisPage, PageAnalysis, PanelLayout};
 pub use remote::{TokenUsage, Tokens};
 pub use backend::{ExpectedPair, GlossaryEntry, TranslationContext, TranslationRequest};
+pub use polish::Polished;
 
 /// Whether a segment has anything to translate: sound effects made only of punctuation or
 /// placeholder glyphs do not, and are not sent to the model.
@@ -268,6 +270,8 @@ pub struct Translator {
     glossary: Arc<std::sync::Mutex<Glossary>>,
     /// The pronoun pair of every direction (who speaks to whom) that the translations confirmed.
     pairs: Arc<std::sync::Mutex<address::PairBook>>,
+    /// The story of the work as the analysis told it, for the model that translates every page.
+    story: Arc<std::sync::Mutex<polish::Story>>,
     client: reqwest::Client,
     device: Device,
 }
@@ -309,6 +313,7 @@ impl Translator {
             memory: Arc::new(std::sync::Mutex::new(TranslationMemory::default())),
             glossary: Arc::new(std::sync::Mutex::new(Glossary::default())),
             pairs: Arc::new(std::sync::Mutex::new(address::PairBook::default())),
+            story: Arc::new(std::sync::Mutex::new(polish::Story::default())),
             client: koharu_runtime::http_client()?,
             device,
         })
@@ -948,6 +953,9 @@ impl Translator {
         }
         if let Ok(mut pairs) = self.pairs.lock() {
             pairs.clear();
+        }
+        if let Ok(mut story) = self.story.lock() {
+            *story = polish::Story::default();
         }
     }
 

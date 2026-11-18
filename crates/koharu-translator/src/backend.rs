@@ -41,6 +41,10 @@ pub struct TranslationRequest {
     /// Asks the model to write `speaker` before every `text` although no page image is attached,
     /// so that what it wrote can be checked against `pairs`.
     pub speakers: bool,
+    /// For each segment, a first translation made by a model that saw the page (empty where it
+    /// made none). The translator reads it as a draft to improve, not as the answer. Empty when
+    /// there are no drafts.
+    pub drafts: Vec<String>,
 }
 
 impl TranslationRequest {
@@ -60,6 +64,7 @@ impl TranslationRequest {
             segment_pages: Vec::new(),
             pairs: Vec::new(),
             speakers: false,
+            drafts: Vec::new(),
         }
     }
 
@@ -105,6 +110,21 @@ impl TranslationRequest {
         self
     }
 
+    /// A first translation for every segment (see `drafts`). `drafts` must have one entry for each
+    /// segment and at least one that is not empty, else it is ignored.
+    #[must_use]
+    pub fn with_drafts(mut self, drafts: Vec<String>) -> Self {
+        if drafts.len() == self.segments.len() && drafts.iter().any(|draft| !draft.trim().is_empty()) {
+            self.drafts = drafts;
+        }
+        self
+    }
+
+    /// Whether the segments come with a first translation.
+    pub(crate) fn has_drafts(&self) -> bool {
+        !self.drafts.is_empty()
+    }
+
     /// Makes the model write who speaks to whom before each translation (see `speakers`).
     #[must_use]
     pub fn with_speakers(mut self) -> Self {
@@ -132,6 +152,9 @@ impl TranslationRequest {
         }
         if self.pairs.len() == self.segments.len() {
             subset.pairs = indices.iter().map(|&index| self.pairs[index].clone()).collect();
+        }
+        if self.drafts.len() == self.segments.len() {
+            subset.drafts = indices.iter().map(|&index| self.drafts[index].clone()).collect();
         }
         subset
     }

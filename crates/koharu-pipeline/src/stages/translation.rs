@@ -187,6 +187,12 @@ impl StageProcessor for Processor {
     }
 
     async fn load(&self) -> Result<()> {
+        // The pages the vision model read are translated again by the final model (see
+        // `polish`): the model of the user translates only what that cannot, and is loaded when
+        // such a page comes.
+        if self.translator.polish_enabled() && !self.analysis().is_empty() {
+            return Ok(());
+        }
         self.translator.load_model(&self.config.model).await
     }
 
@@ -272,6 +278,46 @@ impl Processor {
             .as_ref()
             .map(|analysis| analysis.instructions(&read))
             .filter(|notes| !notes.is_empty());
+        // The vision model translated the page as it read it, and its notes, its draft and the
+        // story of the work go, with the whole page, to the model that translates it again.
+        if notes.is_some()
+            && let Some(analysis) = analysis.as_ref()
+            && self.translator.polish_enabled()
+        {
+            let translatable = current.translatable();
+            let boxes: Vec<_> = translatable.iter().map(|&target| current.boxes[target]).collect();
+            let picture = input
+                .images
+                .get(&input.scene, input.page, "source")
+                .await?
+                .map(|image| Arc::new(mark_segments(&image, &boxes, 0)));
+            match self
+                .translator
+                .polish_page(
+                    self.config.target_language,
+                    analysis,
+                    &read,
+                    picture,
+                    self.config.instructions.as_deref(),
+                )
+                .await
+            {
+                Ok(Some(done)) if done.translations.len() == translatable.len() => {
+                    let used = self.translator.token_usage();
+                    tracing::info!(by = %done.by, lines = translatable.len(), tokens = %used, "page translated");
+                    let own = translatable
+                        .iter()
+                        .zip(done.translations)
+                        .map(|(&target, text)| (current.targets[target].0, text))
+                        .collect();
+                    return Ok((Provider::OpenAiCompatible.into(), own));
+                }
+                Ok(_) => tracing::warn!("no final translation for this page; it is translated the old way"),
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "final translation failed; the page is translated the old way");
+                }
+            }
+        }
         if notes.is_none()
             && Translator::supports_vision(&self.config.model, &self.config.generation)
             && let Some(image) = input.images.get(&input.scene, input.page, "source").await?

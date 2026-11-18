@@ -5,12 +5,11 @@
 //!
 //! - every direction (speaker to listener) gets the pair most of its lines used, over what its
 //!   first line said (`settle_pairs`), so a stray first line does not decide the direction;
+//! - the pair is written into the notes of every page (`apply_pairs`), so that the lines of a
+//!   direction do not disagree with each other; a line read as an exception keeps its words;
 //! - the pairs all lines of a direction agree on are locked for the translation (`seed_pairs`);
 //! - the pairs that cannot be right (a word of one sex for a person of the other, two
-//!   directions of one pair that do not fit) are named (`address_conflicts`): the review asks
-//!   the editor about them, and without a review they are logged.
-//!
-//! Writing the settled words into the notes of the pages is the job of `review`.
+//!   directions of one pair that do not fit) are named (`address_conflicts`) and logged.
 
 use super::*;
 use crate::address::PairBook;
@@ -78,6 +77,60 @@ impl Bible {
         }
         self.character_index(name)
             .map_or_else(|| name.trim().to_owned(), |index| self.characters[index].name.clone())
+    }
+}
+
+impl PageAnalysis {
+    /// Puts the settled words into the notes of the page: a line gets the speaker and listener
+    /// under the names the characters have now, then the pair of its direction (unless it is an
+    /// exception), and the cast of the page is written again from the characters as they are
+    /// now. Returns how many lines ended up different than before.
+    pub(super) fn apply_pairs(&mut self, bible: &Bible) -> usize {
+        let mut changed = 0;
+        for line in &mut self.lines {
+            if line.kind.is_empty() && line.speaker.trim().is_empty() {
+                continue;
+            }
+            let before = (
+                line.speaker.clone(),
+                line.listener.clone(),
+                line.self_word.clone(),
+                line.you.clone(),
+            );
+            line.speaker = bible.canonical(&line.speaker);
+            line.listener = bible.canonical(&line.listener);
+            let pair = if is_generic(&line.speaker) || is_generic(&line.listener) {
+                None
+            } else {
+                bible.pair(&line.speaker, &line.listener)
+            };
+            if let Some(pair) = pair {
+                if !pair.relation.trim().is_empty() {
+                    line.relation = clip(&pair.relation, 60);
+                }
+                // A line that was read as an exception keeps the words the reader gave it for
+                // the tone and the situation; every other line takes the pair of its direction.
+                if line.exception.is_empty() {
+                    if !pair.self_word.trim().is_empty() {
+                        line.self_word = clip(&pair.self_word, 40);
+                    }
+                    if !pair.you.trim().is_empty() {
+                        line.you = clip(&pair.you, 40);
+                    }
+                }
+            }
+            if (
+                line.speaker.clone(),
+                line.listener.clone(),
+                line.self_word.clone(),
+                line.you.clone(),
+            ) != before
+            {
+                changed += 1;
+            }
+        }
+        self.refresh_who(bible);
+        changed
     }
 }
 
@@ -272,7 +325,7 @@ mod tests {
     fn the_translation_is_held_to_the_pairs_all_lines_agree_on() {
         let mut bible = Bible::default();
         let mut analysis = page(FIRST, 4, &mut bible);
-        analysis.apply_review(&bible, None);
+        analysis.apply_pairs(&bible);
         let mut book = PairBook::default();
         assert_eq!(seed_pairs(&mut book, &bible, &[Some(analysis.clone()), None]), 1);
         assert_eq!(book.entries(), [("Sasaki -> Rio".to_owned(), "tôi - cô".to_owned())]);
@@ -280,6 +333,72 @@ mod tests {
         analysis.lines[1].you = "em".to_owned();
         let mut other = PairBook::default();
         assert_eq!(seed_pairs(&mut other, &bible, &[Some(analysis)]), 0);
+    }
+
+    const QUARREL: &str = r#"{
+        "characters": [
+            {"name": "Sasaki", "gender": "man", "age": "young adult", "look": "glasses",
+             "relationships": [{"with": "Rio", "self": "tôi", "you": "cô"}]},
+            {"name": "Rio", "gender": "woman", "age": "adult", "look": "long hair"}
+        ],
+        "lines": [
+            {"id": 0, "kind": "speech", "speaker": "Sasaki", "listener": "Rio", "self": "tôi", "you": "cô"},
+            {"id": 1, "kind": "speech", "speaker": "Sasaki", "listener": "Rio", "self": "tao", "you": "mày",
+             "tone": "furious", "exception": "quarrel"},
+            {"id": 2, "kind": "speech", "speaker": "Sasaki", "listener": "everyone", "audience": "group",
+             "listener_desc": "the staff", "self": "tôi", "you": "mọi người"},
+            {"id": 3, "kind": "speech", "speaker": "someone", "speaker_basis": "unknown",
+             "speaker_desc": "a child's voice", "listener": "Sasaki", "self": "em", "you": "anh"}
+        ]
+    }"#;
+
+    #[test]
+    fn a_page_gets_the_pair_of_its_direction_under_the_names_of_the_characters() {
+        let mut bible = Bible::default();
+        let mut analysis = page(FIRST, 4, &mut bible);
+        analysis.lines[0].you = "chị".to_owned();
+        let changed = analysis.apply_pairs(&bible);
+        // Line 0 takes the pair of its direction; line 1 has its listener "Rio-san" written as
+        // "Rio"; the thought and the narration are not touched.
+        assert_eq!(changed, 2);
+        assert_eq!(analysis.lines[1].listener, "Rio");
+        assert_eq!((analysis.lines[0].self_word.as_str(), analysis.lines[0].you.as_str()), ("tôi", "cô"));
+        assert_eq!(analysis.lines[2].self_word, "mình");
+        assert!(analysis.lines[3].self_word.is_empty());
+        assert!(analysis.cast.iter().any(|entry| entry.starts_with("young adult man")));
+        assert_eq!(analysis.apply_pairs(&bible), 0, "nothing left to change");
+    }
+
+    #[test]
+    fn a_line_read_as_an_exception_keeps_its_words_and_the_others_take_the_pair() {
+        let mut bible = Bible::default();
+        let mut analysis = page(QUARREL, 4, &mut bible);
+        // The reader gave line 0 a stray word; the pair of the direction puts it right.
+        analysis.lines[0].you = "chị".to_owned();
+        analysis.apply_pairs(&bible);
+        assert_eq!(analysis.lines[0].you, "cô");
+        assert_eq!(
+            (analysis.lines[1].self_word.as_str(), analysis.lines[1].you.as_str()),
+            ("tao", "mày"),
+            "the quarrel keeps its own words"
+        );
+        // A group and an unknown speaker are no direction: their words are not touched.
+        assert_eq!(analysis.lines[2].you, "mọi người");
+        assert_eq!((analysis.lines[3].self_word.as_str(), analysis.lines[3].you.as_str()), ("em", "anh"));
+        let notes = analysis.instructions(&analysis.sources.clone());
+        assert!(notes.contains("differs from their usual words: quarrel"), "{notes}");
+        assert!(notes.contains("calls the group \"mọi người\""), "{notes}");
+    }
+
+    #[test]
+    fn the_translation_is_held_to_the_usual_pair_even_when_a_line_is_an_exception() {
+        let mut bible = Bible::default();
+        let mut analysis = page(QUARREL, 4, &mut bible);
+        analysis.apply_pairs(&bible);
+        let mut book = PairBook::default();
+        // The quarrel does not stop the direction from being locked.
+        assert_eq!(seed_pairs(&mut book, &bible, &[Some(analysis)]), 1);
+        assert_eq!(book.entries(), [("Sasaki -> Rio".to_owned(), "tôi - cô".to_owned())]);
     }
 
     fn cast(json: &str) -> Bible {

@@ -1,6 +1,7 @@
 mod detection;
 mod inpainting;
 mod ocr;
+mod text_mask;
 mod translation;
 
 use std::{collections::BTreeSet, sync::Arc};
