@@ -96,10 +96,10 @@ pub struct AnalysisConfig {
     pub right_to_left: bool,
 }
 
-/// The vision model of the analysis.
-const NEMOTRON_VL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
-/// The model that reads a batch when the vision model fails or leaves pages out of its answer.
+/// The model that reads every batch first.
 const NEMOTRON_BOLT: &str = "nvidia/nemotron-3.5-bolt-e4b";
+/// The model that reads a batch when the first one fails or leaves pages out of its answer.
+const NEMOTRON_VL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
 
 /// A model of the analysis chain.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -129,7 +129,7 @@ impl Default for AnalysisConfig {
         };
         Self {
             enabled: true,
-            models: vec![model(NEMOTRON_VL), model(NEMOTRON_BOLT)],
+            models: vec![model(NEMOTRON_BOLT), model(NEMOTRON_VL)],
             // The model the user chose for the translation (the local one) writes the final
             // translation of every page.
             translate: true,
@@ -2366,12 +2366,12 @@ mod tests {
     }
 
     #[test]
-    fn the_default_chain_is_the_vision_model_then_the_small_one() {
+    fn the_default_chain_is_the_small_model_then_the_large_one() {
         let config = AnalysisConfig::default();
         assert!(config.models.iter().all(|model| model.vision));
         assert_eq!(config.models.len(), 2);
-        assert_eq!(config.models[0].model, NEMOTRON_VL);
-        assert_eq!(config.models[1].model, NEMOTRON_BOLT);
+        assert_eq!(config.models[0].model, NEMOTRON_BOLT);
+        assert_eq!(config.models[1].model, NEMOTRON_VL);
         assert!(config.right_to_left);
         // Twelve pictures go in one request, two of them the last pages of the request before,
         // and the model of the translation writes the final text.
