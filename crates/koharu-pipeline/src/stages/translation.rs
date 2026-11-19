@@ -274,22 +274,14 @@ impl Processor {
             .as_ref()
             .map(|analysis| analysis.instructions(&read))
             .filter(|notes| !notes.is_empty());
-        // The vision model translated the page as it read it, and its notes, its draft and the
-        // story of the work go, with the cleaned page when the model sees pictures, to the model
-        // the user chose, which writes the final translation.
+        // The vision model translated the page as it read it. Its decisions for every line and
+        // its draft go to the model the user chose, which writes the final translation without
+        // the picture and without the story.
         if notes.is_some()
             && let Some(analysis) = analysis.as_ref()
             && self.translator.polish_enabled()
         {
             let translatable = current.translatable();
-            let boxes: Vec<_> = translatable.iter().map(|&target| current.boxes[target]).collect();
-            let picture = if Translator::supports_vision(&self.config.model, &self.config.generation) {
-                inpainted_page(input)
-                    .await?
-                    .map(|image| Arc::new(mark_segments(&image, &boxes, 0)))
-            } else {
-                None
-            };
             match self
                 .translator
                 .polish_page(
@@ -298,7 +290,6 @@ impl Processor {
                     self.config.target_language,
                     analysis,
                     &read,
-                    picture,
                     self.config.instructions.as_deref(),
                 )
                 .await
