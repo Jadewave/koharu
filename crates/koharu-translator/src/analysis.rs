@@ -13,17 +13,19 @@
 //! is skipped for the rest of the run. A page that no model could read is translated the way
 //! it was before, without notes.
 //!
-//! The pages are sent in batches of `analysis.pages_per_request` (twelve by default): one
-//! request carries the cleaned pictures (the lettering inpainted away, the red boxes numbered
-//! like the OCR lines) of consecutive pages and all their OCR lines, so the model reads a
-//! scene instead of a page and keeps who is who from one page to the next. Pages that a model
-//! leaves out of its answer go to the next model of the chain, and a single page may be read
-//! with its panels (see `pages_per_request`).
+//! The pages are sent in requests of `analysis.pages_per_request` pictures (twelve by default).
+//! A picture is the page with its lettering inpainted away and the OCR lines marked by numbered
+//! red boxes, compressed without loss (lossless WebP). The first request carries twelve new
+//! pages. Every later one carries the last `analysis.overlap_pages` pages of the request before
+//! (two by default: read already, only there to show where the story left off, with what was
+//! decided for their lines), the story so far, what is known of the characters, and new pages
+//! for the rest. The model thinks before it answers and decides, for every line, who speaks,
+//! who listens and which words they use for "I" and "you". Pages that a model leaves out of its
+//! answer go to the next model of the chain, and a single page may be read with its panels (see
+//! `pages_per_request`).
 //!
-//! What is known of the characters and the scene the story left off on go with every request.
-//!
-//! Once every page is read, the pairs of words of every direction are settled by the number of
-//! lines that used them (see `settle`), without another model.
+//! The model that translates afterwards (see `polish`) is not told the story: it follows the
+//! decisions for every line and the draft.
 
 use std::{collections::HashSet, fmt::Write as _, sync::Arc};
 
@@ -36,7 +38,7 @@ mod settle;
 
 use crate::{
     Error, GenerationConfig, Language, ProvidersConfig, Translator,
-    backend::{ExpectedPair, GlossaryEntry, encode_image, shrink_to},
+    backend::{ExpectedPair, GlossaryEntry, encode_lossless_webp, shrink_to},
     remote,
 };
 
@@ -69,18 +71,23 @@ pub struct AnalysisConfig {
     /// the vision model and the story of the work. Off: the draft of the vision model is the
     /// translation.
     pub translate: bool,
-    /// The size of the story of the work sent with every page, in characters.
+    /// The size of the story so far sent with every request after the first, in characters.
     pub story_chars: usize,
-    /// How many consecutive pages one request carries (one picture each). One page per request
-    /// is the only way a page is sent with its panels.
+    /// How many pictures one request carries, one for each page. One page per request is the
+    /// only way a page is sent with its panels.
     pub pages_per_request: usize,
-    /// Lets the models think while they read. Slower and it needs `max_tokens` to be large.
-    /// Off by default.
+    /// How many of those pictures, from the second request on, are the last pages of the
+    /// request before: they were read already and are only there for the model to see where
+    /// the story left off. The rest of the request is new pages.
+    pub overlap_pages: usize,
+    /// Lets the models think while they read, when the model does not say it itself. Slower
+    /// and it needs `max_tokens` to be large.
     pub reasoning: bool,
     /// The most tokens the answer to one request may take: it holds the notes and the draft of
     /// every line of every page of the batch.
     pub max_tokens: u32,
-    /// The longest side of the page picture that is sent, in pixels.
+    /// The longest side of the page picture that is sent, in pixels. The picture is shrunk to
+    /// this and then compressed without loss (lossless WebP).
     pub image_max_dimension: u32,
     /// The longest side of a panel picture that is sent, in pixels.
     pub panel_max_dimension: u32,
@@ -113,10 +120,12 @@ const fn yes() -> bool {
 
 impl Default for AnalysisConfig {
     fn default() -> Self {
+        // Both models think: who speaks to whom, and so which words they use for each other,
+        // is decided by reasoning over the pictures.
         let model = |name: &str| AnalysisModel {
             model: name.to_owned(),
             vision: true,
-            reasoning: None,
+            reasoning: Some(true),
         };
         Self {
             enabled: true,
@@ -126,16 +135,35 @@ impl Default for AnalysisConfig {
             translate: true,
             story_chars: 4000,
             pages_per_request: 12,
-            reasoning: false,
+            overlap_pages: 2,
+            reasoning: true,
             // A page is answered with the notes and the draft of every line in about five
-            // thousand tokens, and twelve pages share one answer: a model that loops (the log
-            // of one page wrote the same phrase until the limit) is cut off at the limit.
-            max_tokens: 32768,
+            // thousand tokens, twelve pages share one answer and the thinking comes on top of
+            // it: a model that loops (the log of one page wrote the same phrase until the
+            // limit) is cut off at the limit.
+            max_tokens: 49152,
             image_max_dimension: 1600,
             panel_max_dimension: 1024,
             right_to_left: true,
         }
     }
+}
+
+/// A lossless WebP file smaller than this share of the raw pixels' size is reported.
+const MIN_WEBP_SAVING: f64 = 95.0;
+
+/// The picture as the data URL of a lossless WebP. The size it saves is logged: how much
+/// smaller than the raw pixels it is depends on the page (screentone compresses worse than
+/// flat white), so a page that saves less than `MIN_WEBP_SAVING` percent is a warning.
+fn picture_url(image: &DynamicImage, what: &str) -> anyhow::Result<String> {
+    let encoded = encode_lossless_webp(image)?;
+    let saved = format!("{:.1}%", encoded.saved_percent());
+    if encoded.saved_percent() < MIN_WEBP_SAVING {
+        tracing::warn!(what, %saved, bytes = encoded.encoded_bytes(), "the lossless WebP of a picture saves less than 95% of its raw pixels");
+    } else {
+        tracing::debug!(what, %saved, bytes = encoded.encoded_bytes(), "picture encoded as lossless WebP");
+    }
+    Ok(encoded.data_url())
 }
 
 /// A rectangle: left, top, right and bottom, in page pixels.
@@ -196,7 +224,7 @@ impl AnalysisPage {
             _ => Vec::new(),
         };
         Ok(Self {
-            picture: encode_image(&scaled)?.data_url(),
+            picture: picture_url(&scaled, "page")?,
             panels,
             segments,
         })
@@ -325,7 +353,7 @@ fn panel_pictures(
         let crop = Arc::new(image.crop_imm(x, y, width, height));
         let scaled = shrink_to(&crop, config.panel_max_dimension.max(256))?;
         pictures.push(PanelPicture {
-            picture: encode_image(&scaled)?.data_url(),
+            picture: picture_url(&scaled, "panel")?,
             lines: held,
         });
     }
@@ -529,8 +557,6 @@ impl Line {
 struct PageOutput {
     #[serde(deserialize_with = "lenient_string")]
     scene: String,
-    #[serde(deserialize_with = "lenient_string")]
-    page_note: String,
     characters: Vec<Character>,
     terms: Vec<Term>,
     lines: Vec<Line>,
@@ -546,7 +572,6 @@ fn schema(expected: usize) -> Value {
         "type": "object",
         "properties": {
             "scene": text("One or two sentences: where, when and what happens on this page."),
-            "page_note": text("What the translator must remember on this page: who is who (by sex, age and look, not by name), what to avoid."),
             "characters": {
                 "type": "array",
                 "items": {
@@ -615,7 +640,8 @@ fn schema(expected: usize) -> Value {
                         "exception": text("Why this line needs other words than the usual pair of its direction; empty otherwise."),
                         "draft": text("The translation of `text` into the target language, written with the words chosen in self and you; empty for a line with nothing to translate.")
                     },
-                    "required": ["id", "speaker", "listener", "draft"]
+                    // Who speaks, to whom and with which words is decided for every line.
+                    "required": ["id", "kind", "speaker", "listener", "audience", "self", "you", "draft"]
                 }
             },
             "summary": text("One to three sentences: what happens on this page, who does what to whom and why, so that the story can be followed from the summaries alone.")
@@ -697,7 +723,11 @@ group, 'unknown'. listener_desc and listener_basis work like speaker_desc and sp
 broadcast: say who they are in listener_desc: how old, which sex, how they stand to the speaker), \
 self (a thought or a talk to oneself) or unknown (it cannot be told, even from the context).
 - self and you: the words the speaker uses for themselves and for the listener in {target}, \
-chosen from age, sex, rank, closeness and manner of speaking.
+chosen from age, sex, rank, closeness and manner of speaking. They are decided for every line, \
+speech and thought alike, and never left empty (a sound effect or a sign may have none). Decide \
+in this order: who speaks, who listens, how they stand to each other in this scene, then the \
+words. Name the speaker and the listener on every line, also when they are the same as on the \
+line before: the translator who comes after you has no picture and uses exactly your words.
 - tone: two or three words (polite, rough, teasing, tender, scared, ...), read from the face, the \
 lettering, the punctuation and the story.
 - cues: what in the text of the line shows the register: the words for I and you (俺, 僕, 私, \
@@ -713,7 +743,7 @@ term on every page. A sound effect gets the word a {target} reader expects, a si
 translated too. No notes, no explanations, no brackets, no quotation marks around the line. \
 Empty for a line with nothing to translate.
 
-Also answer: scene, page_note (what the translator must remember on this page), summary (one to \
+Also answer: scene, summary (one to \
 three sentences: what happens on this page, who does what to whom and why; someone who reads \
 only the summaries has to be able to follow the story), characters \
 (new ones, or what you learned about known ones: name, aliases, gender, age, look, role, \
@@ -863,44 +893,90 @@ red boxes carry the same numbers of the OCR lines in every picture.",
     prompt
 }
 
-/// The prompt of a batch: the pages `numbers` (from 0, in reading order), each with its picture
-/// (when `pictures`) and its OCR lines, which are numbered from 0 on every page.
+/// A page of the request before, sent again so that the model sees where the story left off.
+/// The model does not answer for it.
+struct ContextPage<'a> {
+    /// The number of the page, from 0.
+    number: usize,
+    page: &'a AnalysisPage,
+    /// What was decided for its lines the first time (see `PageAnalysis::decisions`); empty
+    /// when no model could read the page.
+    decided: String,
+}
+
+/// What happened on the pages read so far, in reading order: the nearest pages when there is
+/// no room for all. `summaries` holds the number of a page (from 0) and what happens on it.
+fn story_so_far(summaries: &[(usize, String)], limit: usize) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0;
+    for (number, summary) in summaries.iter().rev() {
+        let summary = summary.trim();
+        if summary.is_empty() {
+            continue;
+        }
+        let line = format!("page {}: {summary}", number + 1);
+        let size = line.chars().count() + 1;
+        if used + size > limit {
+            break;
+        }
+        used += size;
+        kept.push(line);
+    }
+    kept.reverse();
+    kept.join("\n")
+}
+
+/// The prompt of a request: the new pages `numbers` (from 0, in reading order), each with its
+/// picture (when `pictures`) and its OCR lines, which are numbered from 0 on every page. From
+/// the second request on `context` holds the last pages of the request before, whose pictures
+/// come first, and `story` what happened so far.
 fn batch_prompt(
     numbers: &[usize],
     total: usize,
     pages: &[&AnalysisPage],
+    context: &[ContextPage<'_>],
+    story: &str,
     bible: &Bible,
-    previous: Option<&str>,
     pictures: bool,
 ) -> String {
     let consecutive = numbers.windows(2).all(|pair| pair[1] == pair[0] + 1);
-    let list = if consecutive {
+    let new = if consecutive {
         format!(
-            "Pages {} to {} of {total}, consecutive pages of one story in reading order.",
+            "pages {} to {}",
             numbers[0] + 1,
             numbers[numbers.len() - 1] + 1
         )
     } else {
         let named: Vec<String> = numbers.iter().map(|number| (number + 1).to_string()).collect();
-        format!(
-            "Pages {} of {total}, in reading order; the pages between them are not part of this \
-request.",
-            named.join(", ")
-        )
+        format!("pages {} (the pages between them are not part of this request)", named.join(", "))
     };
-    let mut prompt = format!("{list}\n");
+    let mut prompt = format!("New {new} of {total}, in reading order.\n");
+    let read = context.len();
     if pictures {
-        let _ = writeln!(
-            prompt,
-            "{} pictures are attached, one for every page, in order: picture 1 is page {}, picture \
-{} is page {}. Use each for the layout, for who stands where and for which balloon points at \
+        if let (Some(first), Some(last)) = (context.first(), context.last()) {
+            let _ = writeln!(
+                prompt,
+                "{} pictures are attached. Pictures 1 to {read} are pages {} to {}, which you read \
+already: they are only here so that you see where the story left off, so do not answer for them. \
+Pictures {} to {} are the new pages: answer for these.",
+                read + pages.len(),
+                first.number + 1,
+                last.number + 1,
+                read + 1,
+                read + pages.len()
+            );
+        } else {
+            let _ = writeln!(
+                prompt,
+                "{} pictures are attached, one for every page, in order.",
+                pages.len()
+            );
+        }
+        prompt.push_str(
+            "Use each picture for the layout, for who stands where and for which balloon points at \
 whom. The red boxes carry the numbers of the OCR lines of their own page. The pages follow one \
 another: the same character on different pages is the same person, and a line can answer someone \
-who spoke on an earlier page, so read the pictures as one scene.",
-            pages.len(),
-            numbers[0] + 1,
-            pages.len(),
-            numbers[numbers.len() - 1] + 1
+who spoke on an earlier page, so read the pictures as one scene.\n",
         );
     } else {
         prompt.push_str(
@@ -908,12 +984,8 @@ who spoke on an earlier page, so read the pictures as one scene.",
 speaker cannot be told.\n",
         );
     }
-    if let Some(scene) = previous.map(str::trim).filter(|scene| !scene.is_empty()) {
-        let _ = writeln!(
-            prompt,
-            "The page before the first one ended like this (the story goes on from it): {}",
-            clip(scene, 400)
-        );
+    if !story.trim().is_empty() {
+        let _ = writeln!(prompt, "Story so far, page by page:\n{}", story.trim());
     }
     let known = bible.prompt_json();
     if known.is_empty() {
@@ -921,11 +993,23 @@ speaker cannot be told.\n",
     } else {
         let _ = writeln!(prompt, "Known so far (keep it consistent): {known}");
     }
+    for page in context {
+        if page.decided.trim().is_empty() {
+            continue;
+        }
+        let _ = writeln!(
+            prompt,
+            "Page {} (read already; keep the same words for the same people):{}",
+            page.number + 1,
+            page.decided
+        );
+    }
     for (position, page) in pages.iter().enumerate() {
         let _ = writeln!(
             prompt,
-            "Picture {} (page {}), OCR lines:",
+            "New page {} (picture {}, page {}), OCR lines:",
             position + 1,
+            read + position + 1,
             numbers[position] + 1
         );
         for (id, segment) in page.segments.iter().enumerate() {
@@ -935,9 +1019,10 @@ speaker cannot be told.\n",
     }
     let _ = write!(
         prompt,
-        "Answer with one entry in `pages` for each of the {} pictures, in order, with `page` set \
-to the number of the picture. Each entry holds the lines of its own page (ids from 0, as listed \
-above) and its own scene and summary. Keep the optional fields of a line short.",
+        "Answer with one entry in `pages` for each of the {} new pages, in order, with `page` set \
+to the number of the new page (1 for the first). Each entry holds the lines of its own page (ids \
+from 0, as listed above) and its own scene and summary. For every line say who speaks, who \
+listens and the words for 'I' and 'you'. Keep the optional fields of a line short.",
         pages.len()
     );
     prompt
@@ -1294,46 +1379,6 @@ impl Bible {
         profile
     }
 
-    /// The cast of the whole work, one line for each character: the names (the translator reads
-    /// them in the lines), who they are, how they talk and what they call the others.
-    fn cast_lines(&self) -> Vec<String> {
-        self.characters
-            .iter()
-            .map(|character| {
-                let mut names = vec![character.name.trim().to_owned()];
-                names.extend(character.aliases.iter().take(3).map(|alias| alias.trim().to_owned()));
-                let mut line = names.join(" / ");
-                let who = Self::describe(character);
-                if !who.is_empty() {
-                    let _ = write!(line, ": {who}");
-                }
-                if !character.speech_style.trim().is_empty() {
-                    let _ = write!(line, "; speaks {}", clip(&character.speech_style, 60));
-                }
-                let calls: Vec<String> = character
-                    .relationships
-                    .iter()
-                    .filter(|relationship| {
-                        !relationship.self_word.trim().is_empty() && !relationship.you.trim().is_empty()
-                    })
-                    .take(6)
-                    .map(|relationship| {
-                        format!(
-                            "to {} \"{}\" / \"{}\"",
-                            clip(&relationship.with, 30),
-                            relationship.self_word.trim(),
-                            relationship.you.trim()
-                        )
-                    })
-                    .collect();
-                if !calls.is_empty() {
-                    let _ = write!(line, "; says {}", calls.join(", "));
-                }
-                clip(&line, 320)
-            })
-            .collect()
-    }
-
     /// A character as a reader sees them, without the name: sex, age, look and role
     /// ('young adult man, black hair and glasses, colleague'). Empty when nothing is known.
     fn describe(character: &Character) -> String {
@@ -1502,16 +1547,8 @@ pub struct PageAnalysis {
     /// The OCR lines the page was read with; the notes only apply while the page still has them.
     sources: Vec<String>,
     lines: Vec<AnalyzedLine>,
-    scene: String,
-    note: String,
     /// What happens on the page (the scene when the model wrote no summary).
     summary: String,
-    /// The profiles of the characters that speak or are spoken to on the page.
-    cast: Vec<String>,
-    /// The place of the page among the pages the work was read from, and their number: the
-    /// story of the work is told page by page in the same order.
-    position: usize,
-    total: usize,
 }
 
 impl PageAnalysis {
@@ -1554,23 +1591,18 @@ impl PageAnalysis {
         let mut page = Self {
             sources: sources.to_vec(),
             lines,
-            scene: clip(&output.scene, 400),
-            note: clip(&output.page_note, 600),
             summary: if output.summary.trim().is_empty() {
                 clip(&output.scene, 400)
             } else {
                 clip(&output.summary, 400)
             },
-            cast: Vec::new(),
-            position: 0,
-            total: 0,
         };
         page.refresh_who(bible);
         page
     }
 
     /// Writes who speaks and who listens on every line the way the notes describe people (sex,
-    /// age, look; never a name), and the cast of the page. Two people of the page that the
+    /// age, look; never a name). Two people of the page that the
     /// description does not tell apart get a letter, so that a description is one person.
     fn refresh_who(&mut self, bible: &Bible) {
         for line in &mut self.lines {
@@ -1625,13 +1657,6 @@ impl PageAnalysis {
                 }
             }
         }
-        self.cast = labels
-            .iter()
-            .map(|(index, label)| {
-                let style = bible.characters[*index].speech_style.trim();
-                if style.is_empty() { label.clone() } else { format!("{label}; speaks: {style}") }
-            })
-            .collect();
     }
 
     fn same_page(&self, current: &[String]) -> bool {
@@ -1688,17 +1713,33 @@ impl PageAnalysis {
         self.lines.iter().map(|line| line.draft.trim().to_owned()).collect()
     }
 
+    /// What was decided for every line of the page, one line each, for the pages that go with
+    /// the next request: who speaks to whom and the words for "I" and "you".
+    fn decisions(&self) -> String {
+        let mut text = String::new();
+        for (id, line) in self.lines.iter().enumerate() {
+            if line.speaker.trim().is_empty() {
+                continue;
+            }
+            let source = self.sources.get(id).map_or("", String::as_str);
+            let quoted = serde_json::to_string(&clip(line.corrected.as_deref().unwrap_or(source), 60))
+                .unwrap_or_default();
+            let speaker = if line.speaker_who.is_empty() { "unknown" } else { &line.speaker_who };
+            let listener = if line.listener_who.is_empty() { "unknown" } else { &line.listener_who };
+            let _ = write!(text, "\n  {id}: {quoted} {speaker} -> {listener}");
+            if !line.self_word.is_empty() || !line.you.is_empty() {
+                let _ = write!(text, "; I \"{}\", you \"{}\"", line.self_word, line.you);
+            }
+        }
+        text
+    }
+
     /// What happens on the page.
     #[must_use]
     pub fn summary(&self) -> &str {
         &self.summary
     }
 
-    /// The place of the page among the pages the work was read from (0 until the work is read).
-    #[must_use]
-    pub fn position(&self) -> usize {
-        self.position
-    }
 
     /// How many lines the vision model corrected.
     #[must_use]
@@ -1715,24 +1756,12 @@ impl PageAnalysis {
             return String::new();
         }
         let mut notes = String::from(
-            "Notes on this page from a vision model that read the picture and its panels. \
-People are described by their sex, age and look, never by name: match every description to the \
-person who speaks or listens. Follow the notes for who speaks to whom, for the words each \
-speaker uses for themselves and for the listener, and for the tone; the numbers are the ids of \
-the segments.",
+            "Decisions of a vision model that read the pictures of this page, one for every \
+segment (the numbers are the ids of the segments): who speaks, to whom, the words the speaker \
+uses for themselves and for the listener, and the tone. People are described by their sex, age \
+and look, never by name: match every description to the person who speaks or listens. Use \
+exactly these words for \"I\" and \"you\" in every line.",
         );
-        if !self.scene.is_empty() {
-            let _ = write!(notes, "\nScene: {}", self.scene);
-        }
-        if !self.note.is_empty() {
-            let _ = write!(notes, "\nNote: {}", self.note);
-        }
-        if !self.cast.is_empty() {
-            notes.push_str("\nPeople on this page:");
-            for entry in &self.cast {
-                let _ = write!(notes, "\n- {entry}");
-            }
-        }
         notes.push_str("\nSegments:");
         for (id, line) in self.lines.iter().enumerate() {
             // A line the vision model said nothing about gets no note, instead of a made-up one.
@@ -1845,28 +1874,48 @@ impl Translator {
         let mut previous = String::new();
         let usage_before = remote::token_usage();
 
+        // The first request carries `size` new pages. Every later one starts with the last
+        // `overlap` pages of the request before (already read, shown again for the story) and
+        // fills the rest with new pages.
         let size = config.pages_per_request.max(1);
-        for (batch_number, batch) in pages.chunks(size).enumerate() {
+        let overlap = config.overlap_pages.min(size - 1);
+        let mut summaries: Vec<(usize, String)> = Vec::new();
+        let mut next = 0;
+        while next < pages.len() {
             if stop() {
                 results.resize(pages.len(), None);
                 break;
             }
-            let first = batch_number * size;
+            let from = next.saturating_sub(overlap);
+            let end = (next + size - (next - from)).min(pages.len());
+            let context: Vec<ContextPage<'_>> = (from..next)
+                .map(|number| ContextPage {
+                    number,
+                    page: &pages[number],
+                    decided: results[number]
+                        .as_ref()
+                        .map(PageAnalysis::decisions)
+                        .unwrap_or_default(),
+                })
+                .collect();
+            let story = story_so_far(&summaries, config.story_chars);
             let outputs = self
                 .read_batch(
                     &config,
                     &providers,
                     &generation,
                     &system,
-                    (first, pages.len()),
-                    batch,
+                    (next, pages.len()),
+                    &pages[next..end],
+                    &context,
+                    &story,
                     &bible,
                     &previous,
                     &mut dead,
                 )
                 .await;
-            for (offset, (page, output)) in batch.iter().zip(outputs).enumerate() {
-                let number = first + offset;
+            for (offset, (page, output)) in pages[next..end].iter().zip(outputs).enumerate() {
+                let number = next + offset;
                 match output {
                     Some((model, output)) => {
                         previous = clip(&output.scene, 400);
@@ -1878,6 +1927,7 @@ impl Translator {
                             corrections = analysis.corrections(),
                             "page analysed"
                         );
+                        summaries.push((number, analysis.summary().to_owned()));
                         results.push(Some(analysis));
                     }
                     None => {
@@ -1886,6 +1936,7 @@ impl Translator {
                     }
                 }
             }
+            next = end;
         }
 
         let settled = bible.settle_pairs();
@@ -1920,24 +1971,6 @@ impl Translator {
             let seeded = settle::seed_pairs(&mut book, &bible, &results);
             tracing::info!(seeded, "pronoun pairs of the analysis given to the translation");
         }
-        // The story of the work, for the model that translates every page: what happens on each
-        // page, and who is who.
-        let total = results.len();
-        for (position, page) in results.iter_mut().enumerate() {
-            if let Some(page) = page {
-                page.position = position;
-                page.total = total;
-            }
-        }
-        if let Ok(mut story) = self.story.lock() {
-            *story = crate::polish::Story {
-                summaries: results
-                    .iter()
-                    .map(|page| page.as_ref().map(|page| page.summary.clone()).unwrap_or_default())
-                    .collect(),
-                cast: bible.cast_lines(),
-            };
-        }
         tracing::info!(
             characters = bible.characters.len(),
             terms = bible.terms.len(),
@@ -1953,7 +1986,9 @@ impl Translator {
     /// of its answer, leaves that page to the next one. A batch of one page is read the way a
     /// single page is, with its panels when it has them. The result has one entry for every
     /// page of `batch`: the model that read it and what it read, `None` when none could.
-    /// `place` is the number of the first page of the batch (from 0) and the number of pages.
+    /// `place` is the number of the first page of the batch (from 0) and the number of pages;
+    /// `context` are the pages of the request before that go along with it and `story` what
+    /// happened on the pages read so far.
     #[allow(clippy::too_many_arguments)]
     async fn read_batch(
         &self,
@@ -1963,6 +1998,8 @@ impl Translator {
         system: &str,
         place: (usize, usize),
         batch: &[AnalysisPage],
+        context: &[ContextPage<'_>],
+        story: &str,
         bible: &Bible,
         previous: &str,
         dead: &mut HashSet<String>,
@@ -1980,7 +2017,7 @@ impl Translator {
                 continue;
             }
             let counts: Vec<usize> = unread.iter().map(|&index| batch[index].segments.len()).collect();
-            let (chat, single) = if let [index] = unread.as_slice() {
+            let (chat, single) = if let ([index], true) = (unread.as_slice(), context.is_empty()) {
                 let page = &batch[*index];
                 let number = first + index;
                 // The whole page comes first, so that the panels that follow are read in its context.
@@ -2023,21 +2060,27 @@ impl Translator {
                 (chat, true)
             } else {
                 let pages: Vec<&AnalysisPage> = unread.iter().map(|&index| &batch[index]).collect();
+                // The pages already read come first, then the new ones.
                 let images: Vec<String> = if entry.vision {
-                    pages.iter().map(|page| page.picture.clone()).collect()
+                    context
+                        .iter()
+                        .map(|page| page.page)
+                        .chain(pages.iter().copied())
+                        .map(|page| page.picture.clone())
+                        .collect()
                 } else {
                     Vec::new()
                 };
                 tracing::info!(
                     pages = pages.len(),
+                    context = context.len(),
                     from = first + unread[0] + 1,
                     model = %entry.model,
                     images = images.len(),
                     "sending a batch of pages to the analysis model"
                 );
                 // After a failure the unread pages may not be next to each other: each one is
-                // named by its own number, and the scene before the batch only goes with a
-                // request that starts at its first page.
+                // named by its own number.
                 let numbers: Vec<usize> = unread.iter().map(|&index| first + index).collect();
                 let chat = remote::Chat {
                     system: system.to_owned(),
@@ -2045,8 +2088,9 @@ impl Translator {
                         &numbers,
                         total,
                         &pages,
+                        context,
+                        story,
                         bible,
-                        (unread[0] == 0).then_some(previous),
                         entry.vision,
                     ),
                     images,
@@ -2220,9 +2264,11 @@ mod tests {
         assert_eq!(texts[1], "りおさん、さみしがってるぞ");
         assert_eq!(texts[2], "…");
         let notes = analysis.instructions(&lines);
-        assert!(notes.contains("Scene: A hospital room."));
-        assert!(notes.contains("- young adult man, Rio's colleague; speaks: rough but kind"));
         assert!(notes.contains("never by name"));
+        // The decisions for the lines go to the model of the translation, the story does not.
+        assert!(!notes.contains("Scene:") && !notes.contains("Note:"), "{notes}");
+        assert!(!notes.contains("People on this page"), "{notes}");
+        assert!(!notes.contains("A hospital room"), "{notes}");
         // The speaker is described, not named; Yuu is nobody the work knows, so the label stays.
         assert!(notes.contains(
             "- 0 speech: young adult man, Rio's colleague -> Yuu; calls self \"tôi\", calls the listener \"cậu\"; tone: teasing"
@@ -2327,9 +2373,14 @@ mod tests {
         assert_eq!(config.models[0].model, NEMOTRON_VL);
         assert_eq!(config.models[1].model, NEMOTRON_BOLT);
         assert!(config.right_to_left);
-        // Twelve pages go in one request, and the model of the translation writes the final text.
+        // Twelve pictures go in one request, two of them the last pages of the request before,
+        // and the model of the translation writes the final text.
         assert_eq!(config.pages_per_request, 12);
+        assert_eq!(config.overlap_pages, 2);
         assert!(config.translate);
+        // Both models think.
+        assert!(config.reasoning);
+        assert!(config.models.iter().all(|model| model.reasoning == Some(true)));
         // An old file that names the panels of a model or the settings of the second reading
         // is still read; those settings are gone.
         let parsed: AnalysisConfig = serde_json::from_str(
@@ -2603,30 +2654,27 @@ mod tests {
         let analysis_scene = PageAnalysis::new(&scene, &sources(&["a"]), &Bible::default());
         assert_eq!(analysis_scene.summary(), "A hospital room.");
 
-        let image = std::sync::Arc::new(image::DynamicImage::new_rgb8(8, 8));
         let request = crate::polish::polish_request(
             &analysis,
             &lines,
             Language::Vietnamese,
             Some("Keep it light."),
-            "Story of the work, told by the vision model.",
-            Some(image),
         )
         .unwrap();
         let instructions = request.instructions.clone().unwrap();
-        // The user's words come first, then the story, then the notes of the page.
+        // The user's words come first, then the decisions for the lines. No story.
         let user = instructions.find("Keep it light.").unwrap();
-        let story = instructions.find("Story of the work").unwrap();
-        let notes = instructions.find("Notes on this page").unwrap();
-        assert!(user < story && story < notes, "{instructions}");
-        assert!(!instructions.contains("you do not see it"), "the translator sees the page");
-        assert_eq!(request.drafts, ["Này, Yuu.", "", "Rio-san kìa."]);
-        assert!(request.has_notes() && request.has_drafts() && request.image.is_some());
+        let notes = instructions.find("Decisions of a vision model").unwrap();
+        assert!(user < notes, "{instructions}");
+        assert!(!instructions.contains("Story of the work"), "{instructions}");
+        assert!(request.standalone, "no remembered lines and no profiles are added");
+                assert_eq!(request.drafts, ["Này, Yuu.", "", "Rio-san kìa."]);
+        assert!(request.has_notes() && request.has_drafts() && request.image.is_none());
         assert_eq!(request.pairs.len(), 3);
         assert!(request.pairs[1].is_none(), "a sound effect has no pair");
         // Notes of another page are no notes for this one.
         assert!(
-            crate::polish::polish_request(&analysis, &sources(&["x"]), Language::Vietnamese, None, "", None).is_none()
+            crate::polish::polish_request(&analysis, &sources(&["x"]), Language::Vietnamese, None).is_none()
         );
     }
 
@@ -2673,14 +2721,61 @@ mod tests {
     #[test]
     fn the_batch_prompt_numbers_the_pictures_and_restarts_the_lines_on_every_page() {
         let (first, second) = (page_of(&["one", "two"]), page_of(&["three"]));
-        let prompt = batch_prompt(&[4, 5], 30, &[&first, &second], &Bible::default(), None, true);
-        assert!(prompt.contains("Pages 5 to 6 of 30"), "{prompt}");
+        let prompt = batch_prompt(&[4, 5], 30, &[&first, &second], &[], "", &Bible::default(), true);
+        assert!(prompt.contains("New pages 5 to 6 of 30"), "{prompt}");
         assert!(prompt.contains("2 pictures are attached"), "{prompt}");
-        assert!(prompt.contains("Picture 1 (page 5), OCR lines:\n0: \"one\"\n1: \"two\""), "{prompt}");
-        assert!(prompt.contains("Picture 2 (page 6), OCR lines:\n0: \"three\""), "{prompt}");
+        assert!(prompt.contains("New page 1 (picture 1, page 5), OCR lines:\n0: \"one\"\n1: \"two\""), "{prompt}");
+        assert!(prompt.contains("New page 2 (picture 2, page 6), OCR lines:\n0: \"three\""), "{prompt}");
+        assert!(!prompt.contains("Story so far"), "the first request has no story: {prompt}");
         // Pages that are not next to each other are named one by one.
-        let gap = batch_prompt(&[0, 7], 30, &[&first, &second], &Bible::default(), None, false);
-        assert!(gap.contains("Pages 1, 8 of 30"), "{gap}");
+        let gap = batch_prompt(&[0, 7], 30, &[&first, &second], &[], "", &Bible::default(), false);
+        assert!(gap.contains("pages 1, 8"), "{gap}");
         assert!(gap.contains("No picture is attached"), "{gap}");
+    }
+
+    #[test]
+    fn a_later_request_starts_with_the_last_pages_read_and_the_story_so_far() {
+        let (old, new) = (page_of(&["old line"]), page_of(&["new line"]));
+        let context = [ContextPage {
+            number: 9,
+            page: &old,
+            decided: "\n  0: \"old line\" girl -> boy; I \"em\", you \"anh\"".to_owned(),
+        }];
+        let story = story_so_far(&[(8, "A fight.".to_owned()), (9, "A truce.".to_owned())], 4000);
+        let prompt = batch_prompt(&[10], 30, &[&new], &context, &story, &Bible::default(), true);
+        assert!(prompt.contains("2 pictures are attached. Pictures 1 to 1 are pages 10 to 10"), "{prompt}");
+        assert!(prompt.contains("do not answer for them"), "{prompt}");
+        assert!(prompt.contains("Story so far, page by page:\npage 9: A fight.\npage 10: A truce."), "{prompt}");
+        assert!(prompt.contains("Page 10 (read already; keep the same words for the same people):\n  0: \"old line\" girl -> boy; I \"em\", you \"anh\""), "{prompt}");
+        // The lines to answer for are the new page's, numbered after the picture of the old one.
+        assert!(prompt.contains("New page 1 (picture 2, page 11), OCR lines:\n0: \"new line\""), "{prompt}");
+        assert!(!prompt.contains("\n0: \"old line\"\nAnswer"), "{prompt}");
+    }
+
+    #[test]
+    fn the_story_keeps_the_nearest_pages_when_there_is_no_room() {
+        let summaries: Vec<(usize, String)> = (0..40)
+            .map(|page| (page, format!("Page number {page} has a long summary of what happens in it.")))
+            .collect();
+        let story = story_so_far(&summaries, 300);
+        assert!(story.chars().count() <= 300, "{}", story.chars().count());
+        assert!(story.contains("page 40:"), "the page just read stays");
+        assert!(!story.contains("page 1:"), "the far past goes first");
+        assert!(story.find("page 39:").unwrap() < story.find("page 40:").unwrap(), "reading order");
+        assert!(story_so_far(&[(0, "  ".to_owned())], 100).is_empty());
+    }
+
+    #[test]
+    fn the_decisions_of_a_page_are_shown_again_with_the_next_request() {
+        let lines = sources(&["おい ゆう", "りおさん さみしがつてるぞ", "…"]);
+        let output = parse_page(ANSWER, 3).unwrap();
+        let mut bible = Bible::default();
+        bible.merge_output(&output);
+        let analysis = PageAnalysis::new(&output, &lines, &bible);
+        let decided = analysis.decisions();
+        assert!(decided.contains("\n  0: "), "{decided}");
+        assert!(decided.contains(" -> "), "who speaks to whom: {decided}");
+        assert!(decided.contains("I \"tôi\", you \"cậu\""), "{decided}");
+        assert!(!decided.contains("\n  2: "), "a line nobody spoke has no decision: {decided}");
     }
 }
