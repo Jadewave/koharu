@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::{drawing::draw_filled_rect_mut, rect::Rect};
 use koharu_scene::{
-    Authored, EntityId, Geometry, LanguageTag, Origin, PanelRegion, RegionSpec, SourceText,
-    Translation,
+    Authored, EntityId, Geometry, LanguageTag, Origin, PanelRegion, RasterLayer, RasterLayerKind,
+    RegionSpec, SourceText, Translation,
 };
 use koharu_translator::{
     AnalysisPage, PageAnalysis, PanelLayout, Provider, TranslationRequest, Translator,
@@ -102,11 +102,11 @@ impl Processor {
             if translatable.is_empty() {
                 continue;
             }
-            let image = match input.images.get(&input.scene, input.page, "source").await {
+            let image = match inpainted_page(input).await {
                 Ok(Some(image)) => image,
                 Ok(None) => continue,
                 Err(error) => {
-                    tracing::warn!(%error, "could not load a page for the analysis");
+                    tracing::warn!(%error, "could not load the cleaned page for the analysis");
                     continue;
                 }
             };
@@ -187,12 +187,8 @@ impl StageProcessor for Processor {
     }
 
     async fn load(&self) -> Result<()> {
-        // The pages the vision model read are translated again by the final model (see
-        // `polish`): the model of the user translates only what that cannot, and is loaded when
-        // such a page comes.
-        if self.translator.polish_enabled() && !self.analysis().is_empty() {
-            return Ok(());
-        }
+        // The model of the translation writes the final translation of the pages the analysis
+        // read (see `polish`) as well as the ones it did not.
         self.translator.load_model(&self.config.model).await
     }
 
@@ -279,21 +275,26 @@ impl Processor {
             .map(|analysis| analysis.instructions(&read))
             .filter(|notes| !notes.is_empty());
         // The vision model translated the page as it read it, and its notes, its draft and the
-        // story of the work go, with the whole page, to the model that translates it again.
+        // story of the work go, with the cleaned page when the model sees pictures, to the model
+        // the user chose, which writes the final translation.
         if notes.is_some()
             && let Some(analysis) = analysis.as_ref()
             && self.translator.polish_enabled()
         {
             let translatable = current.translatable();
             let boxes: Vec<_> = translatable.iter().map(|&target| current.boxes[target]).collect();
-            let picture = input
-                .images
-                .get(&input.scene, input.page, "source")
-                .await?
-                .map(|image| Arc::new(mark_segments(&image, &boxes, 0)));
+            let picture = if Translator::supports_vision(&self.config.model, &self.config.generation) {
+                inpainted_page(input)
+                    .await?
+                    .map(|image| Arc::new(mark_segments(&image, &boxes, 0)))
+            } else {
+                None
+            };
             match self
                 .translator
                 .polish_page(
+                    &self.config.model,
+                    self.config.generation,
                     self.config.target_language,
                     analysis,
                     &read,
@@ -310,7 +311,7 @@ impl Processor {
                         .zip(done.translations)
                         .map(|(&target, text)| (current.targets[target].0, text))
                         .collect();
-                    return Ok((Provider::OpenAiCompatible.into(), own));
+                    return Ok((self.config.model.provider.into(), own));
                 }
                 Ok(_) => tracing::warn!("no final translation for this page; it is translated the old way"),
                 Err(error) => {
@@ -563,6 +564,37 @@ const DIGITS: [[&str; 7]; 10] = [
     ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
     ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
 ];
+
+/// The page as the analysis sees it: the source image with the cleanup layer the inpainting
+/// stage drew over it, so the lettering is gone and the words are only in the OCR lines. A page
+/// without a cleanup layer (nothing was inpainted) is its source image. The translation waits
+/// for the inpainting of every page, so the layer is there when the analysis starts.
+async fn inpainted_page(input: &StageInput) -> Result<Option<Arc<DynamicImage>>> {
+    let Some(source) = input.images.get(&input.scene, input.page, "source").await? else {
+        return Ok(None);
+    };
+    let cleanup = input.scene.children(input.page)?.find(|entity| {
+        input
+            .scene
+            .component::<RasterLayer>(*entity)
+            .ok()
+            .flatten()
+            .is_some_and(|layer| layer.kind == RasterLayerKind::Cleanup)
+    });
+    let Some(cleanup) = cleanup else {
+        return Ok(Some(source));
+    };
+    let Some(overlay) = input.images.get(&input.scene, cleanup, "source").await? else {
+        return Ok(Some(source));
+    };
+    if (overlay.width(), overlay.height()) != (source.width(), source.height()) {
+        tracing::warn!(page = %input.page, "the cleanup layer does not fit the page; the source image is used");
+        return Ok(Some(source));
+    }
+    let mut composite = source.to_rgba8();
+    image::imageops::overlay(&mut composite, &overlay.to_rgba8(), 0, 0);
+    Ok(Some(Arc::new(DynamicImage::ImageRgba8(composite))))
+}
 
 /// A copy of the page with a red outline around every segment's box and a tag with the
 /// segment id (`first_id` plus its position) above it, so a vision model can tell which bubble each line belongs to. The
