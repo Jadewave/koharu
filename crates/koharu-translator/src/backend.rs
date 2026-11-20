@@ -255,13 +255,17 @@ pub(crate) fn encode_image(image: &DynamicImage) -> anyhow::Result<EncodedImage>
     })
 }
 
-/// The picture of a page for the vision models of the analysis, as a data URL: lossless WebP.
-/// An inpainted page is mostly flat colour, which WebP stores in a small part of its size, and
-/// nothing is blurred: the numbers and the boxes drawn on the page and the small lettering of
-/// the balloons stay sharp. The pages of one request travel in one body, so their size adds up.
-pub(crate) fn encode_image_lossless(image: &DynamicImage) -> anyhow::Result<String> {
+/// The quality of the WebP pictures sent to the vision models of the analysis.
+const ANALYSIS_WEBP_QUALITY: f32 = 90.0;
+
+/// The picture of a page for the vision models of the analysis, as a data URL: lossy WebP at
+/// quality 90. An inpainted page is mostly flat colour, which WebP stores in a small part of
+/// its size, and at this quality the numbers and the boxes drawn on the page stay sharp. The
+/// pages of one request travel in one body, so their size adds up.
+pub(crate) fn encode_image_webp(image: &DynamicImage) -> anyhow::Result<String> {
     let rgb = image.to_rgb8();
-    let encoded = webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height()).encode_lossless();
+    let encoded = webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+        .encode(ANALYSIS_WEBP_QUALITY);
     Ok(format!("data:image/webp;base64,{}", STANDARD.encode(&*encoded)))
 }
 
@@ -297,20 +301,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_analysis_picture_is_lossless_webp() {
+    fn the_analysis_picture_is_webp_and_keeps_the_marks_readable() {
         // Flat areas with thin coloured lines, like a cleaned page with numbered boxes.
         let mut page = RgbImage::from_pixel(120, 80, image::Rgb([255, 255, 255]));
         for x in 10..110 {
             page.put_pixel(x, 20, image::Rgb([220, 30, 30]));
-            page.put_pixel(x, 21, image::Rgb([17, 99, 201]));
+            page.put_pixel(x, 21, image::Rgb([220, 30, 30]));
         }
         let page = DynamicImage::ImageRgb8(page);
-        let url = encode_image_lossless(&page).unwrap();
+        let url = encode_image_webp(&page).unwrap();
         let encoded = url.strip_prefix("data:image/webp;base64,").expect("a WebP data URL");
         let bytes = STANDARD.decode(encoded).unwrap();
         let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP)
             .unwrap()
             .to_rgb8();
-        assert_eq!(decoded, page.to_rgb8(), "no pixel changes");
+        assert_eq!(decoded.dimensions(), (120, 80));
+        // Lossy: the pixels are close, not equal. Flat white stays white, the line stays red.
+        let (white, red) = (decoded.get_pixel(60, 60), decoded.get_pixel(60, 20));
+        assert!(white.0.iter().all(|&channel| channel >= 250), "{white:?}");
+        assert!(red[0] > 180 && red[1] < 90 && red[2] < 90, "{red:?}");
     }
 }

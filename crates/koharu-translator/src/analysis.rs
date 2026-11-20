@@ -11,7 +11,7 @@
 //!
 //! The pages go to the model in windows of `batch_pages` pages, one request each. A page is the
 //! cleaned page (the lettering erased, a red box with the number of the OCR line where each
-//! line stood), encoded as lossless WebP, followed in the prompt by its OCR text. The first
+//! line stood), encoded as WebP (quality 90), followed in the prompt by its OCR text. The first
 //! `overlap_pages` pages of a window are the last pages of the window before it: they are sent
 //! again as context only, with what was read of them, so that a conversation that crosses the
 //! end of a window is not cut and a character keeps the same label.
@@ -35,7 +35,7 @@ mod settle;
 
 use crate::{
     Error, GenerationConfig, Language, Translator,
-    backend::{ExpectedPair, GlossaryEntry, encode_image_lossless, shrink_to},
+    backend::{ExpectedPair, GlossaryEntry, encode_image_webp, shrink_to},
     remote,
 };
 
@@ -148,7 +148,7 @@ impl Default for AnalysisConfig {
 }
 
 /// One page to read: its picture (with the boxes and numbers of the OCR lines drawn on it,
-/// scaled down and encoded once, as a lossless WebP data URL) and the OCR lines, in the order
+/// scaled down and encoded once, as a WebP data URL) and the OCR lines, in the order
 /// of the numbers.
 #[derive(Clone)]
 pub struct AnalysisPage {
@@ -163,7 +163,7 @@ impl AnalysisPage {
         let config = analysis_config().unwrap_or_default();
         let scaled = shrink_to(image, config.image_max_dimension.max(256))?;
         Ok(Self {
-            picture: encode_image_lossless(&scaled)?,
+            picture: encode_image_webp(&scaled)?,
             segments,
         })
     }
