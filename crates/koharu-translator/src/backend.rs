@@ -231,27 +231,11 @@ pub(crate) fn shrink_to(
 
 pub(crate) struct EncodedImage {
     pub(crate) data: String,
-    mime: &'static str,
-    /// The size of the pixels (RGB, one byte per channel) and of the encoded file.
-    raw_bytes: usize,
-    encoded_bytes: usize,
 }
 
 impl EncodedImage {
     pub(crate) fn data_url(&self) -> String {
-        format!("data:{};base64,{}", self.mime, self.data)
-    }
-
-    /// How much smaller the encoded file is than the raw pixels, in percent.
-    pub(crate) fn saved_percent(&self) -> f64 {
-        if self.raw_bytes == 0 {
-            return 0.0;
-        }
-        100.0 * (1.0 - self.encoded_bytes as f64 / self.raw_bytes as f64)
-    }
-
-    pub(crate) fn encoded_bytes(&self) -> usize {
-        self.encoded_bytes
+        format!("data:image/jpeg;base64,{}", self.data)
     }
 }
 
@@ -266,35 +250,8 @@ pub(crate) fn encode_image(image: &DynamicImage) -> anyhow::Result<EncodedImage>
             image::ExtendedColorType::Rgb8,
         )
         .context("failed to encode translation image")?;
-    let bytes = bytes.into_inner();
     Ok(EncodedImage {
-        raw_bytes: rgb.as_raw().len(),
-        encoded_bytes: bytes.len(),
-        data: STANDARD.encode(bytes),
-        mime: "image/jpeg",
-    })
-}
-
-/// The image as a lossless WebP: every pixel is kept, at the slowest and smallest setting of
-/// libwebp (method 6, effort 100). The alpha channel is dropped (a page has none that matters),
-/// which is a third of what a lossless file would otherwise carry.
-pub(crate) fn encode_lossless_webp(image: &DynamicImage) -> anyhow::Result<EncodedImage> {
-    let rgb = image.to_rgb8();
-    let mut config = webp::WebPConfig::new()
-        .map_err(|()| anyhow::anyhow!("failed to create the WebP encoder configuration"))?;
-    config.lossless = 1;
-    // For a lossless file `quality` is the effort spent on making it small, not a loss.
-    config.quality = 100.0;
-    config.method = 6;
-    config.exact = 0;
-    let memory = webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
-        .encode_advanced(&config)
-        .map_err(|error| anyhow::anyhow!("failed to encode the image as WebP: {error:?}"))?;
-    Ok(EncodedImage {
-        raw_bytes: rgb.as_raw().len(),
-        encoded_bytes: memory.len(),
-        data: STANDARD.encode(&*memory),
-        mime: "image/webp",
+        data: STANDARD.encode(bytes.into_inner()),
     })
 }
 

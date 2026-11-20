@@ -1,27 +1,28 @@
 //! The final translation of a page.
 //!
-//! The vision model reads every page with its cleaned picture (see `analysis`): it decides who
-//! speaks to whom and with which words, writes a first translation of every line, and tells the
-//! story of the work page by page. Then the model the user chose for the translation (the local
-//! one) translates the page again for the reader. It is sent
+//! The vision model reads every page with its panels (see `analysis`): it decides who speaks to
+//! whom and with which words, writes a first translation of every line, and tells the story of
+//! the work page by page. Then a second model, DeepSeek by default, translates the page again
+//! for the reader: it sees the whole page, and is sent
 //!
 //! - the notes of the page (who speaks to whom, the words for "I" and "you", the tone),
 //! - the draft of the vision model for every line, to improve and not to copy,
 //! - the story of the work: the cast, what happened before the page and what comes next,
 //! - what the glossary and the memory of the translator add to every translation.
 //!
-//! The translation of a model is already held to the notes (see `with_consistent_pairs`): a line
-//! that uses other words for "I" and "you" than the note of the line decided is translated again
-//! with those words spelled out. When the model fails, the draft of the vision model is the
-//! translation, if it has one for every line; when it has not, the page is translated the way it
-//! was before.
+//! What it writes is held to the notes: a line that uses other words for "I" and "you" than the
+//! note of the line decided is translated again with those words spelled out. When no model
+//! answers, the draft of the vision model is the translation, if it has one for every line; when
+//! it has not, the page is translated the way it was before, by the model the user chose.
 
-use std::{fmt::Write as _, sync::Arc};
+use std::{collections::HashSet, fmt::Write as _, sync::Arc};
 
 use image::DynamicImage;
 
 use crate::{
-    GenerationConfig, Language, ModelSelection, PageAnalysis, TranslationRequest, Translator,
+    Error, GenerationConfig, Language, ModelSelection, PageAnalysis, Provider, TranslationRequest,
+    Translator,
+    address::{self, Declared},
     analysis::analysis_config,
 };
 
@@ -32,6 +33,8 @@ pub(crate) struct Story {
     pub summaries: Vec<String>,
     /// One line for every character: names, who they are, what they call the others.
     pub cast: Vec<String>,
+    /// The models of the final translation that the server refused for the rest of the run.
+    pub dead: HashSet<String>,
 }
 
 /// The pages after the one translated whose summary is sent.
@@ -149,22 +152,21 @@ pub(crate) fn polish_request(
 }
 
 impl Translator {
-    /// Whether the pages the analysis read are translated again by the model of the translation.
+    /// Whether the pages the analysis read are translated again by the models of
+    /// `analysis.translate_models`.
     #[must_use]
     pub fn polish_enabled(&self) -> bool {
-        analysis_config().is_ok_and(|config| config.enabled && config.translate)
+        analysis_config().is_ok_and(|config| {
+            config.enabled && config.translate && !config.translate_models.is_empty()
+        })
     }
 
-    /// Translates a page the analysis read with `selection` (the model of the translation).
-    /// `sources` are the lines of the page as OCR read them, `image` the whole page (cleaned,
-    /// with the numbered boxes of the lines), which a model without vision does not get.
-    /// Returns `None` when the page has to be translated the old way: the notes are not those of
-    /// this page, the model did not answer, and the vision model left a line without a draft.
-    #[allow(clippy::too_many_arguments)]
+    /// Translates a page the analysis read. `sources` are the lines of the page as OCR read them,
+    /// `image` the whole page with the numbered boxes of the lines. Returns `None` when the page
+    /// has to be translated the old way: the notes are not those of this page, no model
+    /// answered, and the vision model left a line without a draft.
     pub async fn polish_page(
         &self,
-        selection: &ModelSelection,
-        generation: GenerationConfig,
         language: Language,
         analysis: &PageAnalysis,
         sources: &[String],
@@ -183,33 +185,77 @@ impl Translator {
         let Some(request) = polish_request(analysis, sources, language, instructions, &story, image) else {
             return Ok(None);
         };
+        let expected: Vec<Option<Declared>> = request
+            .pairs
+            .iter()
+            .map(|pair| pair.as_ref().and_then(Declared::expected))
+            .collect();
         let wanted = request.segments.len();
-        let drafts = request.drafts.iter().filter(|draft| !draft.is_empty()).count();
-        let by = selection
-            .model
-            .clone()
-            .unwrap_or_else(|| Translator::model(selection).to_owned());
-        match self.translate(selection, generation, request).await {
-            Ok((_, translated)) if translated.len() == wanted => {
-                tracing::info!(model = %by, lines = wanted, drafts, "page translated by the final model");
-                return Ok(Some(Polished {
-                    translations: translated,
-                    by,
-                }));
+
+        for entry in &config.translate_models {
+            if self
+                .story
+                .lock()
+                .is_ok_and(|story| story.dead.contains(&entry.model))
+            {
+                continue;
             }
-            Ok((_, translated)) => tracing::warn!(
-                model = %by,
-                got = translated.len(),
-                wanted,
-                "final model returned the wrong number of translations"
-            ),
-            Err(error) => {
-                tracing::warn!(model = %by, error = %format!("{error:#}"), "final model could not translate the page");
+            let reasoning = entry.reasoning.unwrap_or(config.translate_reasoning);
+            let selection = ModelSelection {
+                provider: Provider::OpenAiCompatible,
+                model: Some(entry.model.clone()),
+                quantization: None,
+                vision: entry.vision,
+                reasoning,
+            };
+            let generation = GenerationConfig {
+                temperature: Some(config.translate_temperature),
+                top_p: Some(0.95),
+                max_tokens: Some(config.translate_max_tokens),
+                reasoning: Some(reasoning),
+                vision: Some(entry.vision),
+                ..GenerationConfig::default()
+            };
+            match self.translate(&selection, generation, request.clone()).await {
+                Ok((_, mut translated)) if translated.len() == wanted => {
+                    self.hold_to_the_notes(&selection, generation, &request, &expected, &mut translated)
+                        .await;
+                    tracing::info!(
+                        model = %entry.model,
+                        lines = wanted,
+                        drafts = request.drafts.iter().filter(|draft| !draft.is_empty()).count(),
+                        "page translated by the final model"
+                    );
+                    return Ok(Some(Polished {
+                        translations: translated,
+                        by: entry.model.clone(),
+                    }));
+                }
+                Ok((_, translated)) => {
+                    tracing::warn!(
+                        model = %entry.model,
+                        got = translated.len(),
+                        wanted,
+                        "final model returned the wrong number of translations"
+                    );
+                }
+                Err(error) => {
+                    let refused = error.chain().any(|cause| {
+                        matches!(
+                            cause.downcast_ref::<Error>(),
+                            Some(Error::Api { status, .. }) if matches!(*status, 401 | 403 | 404)
+                        )
+                    });
+                    if refused && let Ok(mut story) = self.story.lock() {
+                        story.dead.insert(entry.model.clone());
+                    }
+                    tracing::warn!(model = %entry.model, error = %format!("{error:#}"), "final model could not translate the page");
+                }
             }
         }
 
-        // The model did not translate the page: the first translation of the vision model stands
-        // in when it has one for every line.
+        // Nobody translated the page again: the first translation of the vision model stands in
+        // when it has one for every line.
         let drafts = analysis.drafts(sources);
         if drafts.len() == wanted && drafts.iter().all(|draft| !draft.is_empty()) {
             tracing::warn!("the draft of the vision model is the translation of this page");
@@ -219,6 +265,41 @@ impl Translator {
             }));
         }
         Ok(None)
+    }
+
+    /// Translates again the lines that use other words for "I" and "you" than their notes
+    /// decided, with those words spelled out. What is still wrong afterwards stays.
+    async fn hold_to_the_notes(
+        &self,
+        selection: &ModelSelection,
+        generation: GenerationConfig,
+        request: &TranslationRequest,
+        expected: &[Option<Declared>],
+        translated: &mut [String],
+    ) {
+        if !expected.iter().any(Option::is_some) {
+            return;
+        }
+        let flagged = address::conflicts_with_notes(expected, &[], translated);
+        if flagged.is_empty() {
+            return;
+        }
+        tracing::info!(lines = flagged.len(), "lines that contradict their notes are translated again");
+        let mut retry = request.select(&flagged);
+        let note = address::notes_note(expected, &flagged, &flagged);
+        retry.instructions = Some(match request.instructions.as_deref() {
+            Some(instructions) => format!("{instructions}\n\n{note}"),
+            None => note,
+        });
+        match self.translate(selection, generation, retry).await {
+            Ok((_, fresh)) if fresh.len() == flagged.len() => {
+                for (&index, text) in flagged.iter().zip(fresh) {
+                    translated[index] = text;
+                }
+            }
+            Ok(_) => tracing::warn!("the retry returned the wrong number of translations"),
+            Err(error) => tracing::warn!(error = %format!("{error:#}"), "the retry of the lines failed"),
+        }
     }
 }
 
@@ -233,6 +314,7 @@ mod tests {
                 "Sasaki / Sasaki-san: adult woman, teacher; speaks politely".to_owned(),
                 "Rio: teenage girl, twin tails; says to Sasaki \"em\" / \"cô\"".to_owned(),
             ],
+            dead: HashSet::new(),
         }
     }
 

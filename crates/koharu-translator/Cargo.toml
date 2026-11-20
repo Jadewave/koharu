@@ -33,4 +33,3 @@ tokio = { workspace = true }
 tokio-rayon = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-webp = { workspace = true }
