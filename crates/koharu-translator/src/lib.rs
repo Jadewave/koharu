@@ -270,6 +270,8 @@ pub struct Translator {
     glossary: Arc<std::sync::Mutex<Glossary>>,
     /// The pronoun pair of every direction (who speaks to whom) that the translations confirmed.
     pairs: Arc<std::sync::Mutex<address::PairBook>>,
+    /// The story of the work as the analysis told it, for the model that translates every page.
+    story: Arc<std::sync::Mutex<polish::Story>>,
     client: reqwest::Client,
     device: Device,
 }
@@ -311,6 +313,7 @@ impl Translator {
             memory: Arc::new(std::sync::Mutex::new(TranslationMemory::default())),
             glossary: Arc::new(std::sync::Mutex::new(Glossary::default())),
             pairs: Arc::new(std::sync::Mutex::new(address::PairBook::default())),
+            story: Arc::new(std::sync::Mutex::new(polish::Story::default())),
             client: koharu_runtime::http_client()?,
             device,
         })
@@ -398,14 +401,10 @@ impl Translator {
 
         let generation = generation.for_model(selection);
 
-        if request.context.is_empty() && !request.standalone {
+        if request.context.is_empty() {
             request.context = self.recall(request.target_language);
         }
-        if let Some(block) = self.glossary_block(
-            request.target_language,
-            &request.segments,
-            request.standalone,
-        ) {
+        if let Some(block) = self.glossary_block(request.target_language, &request.segments) {
             request.instructions = Some(
                 match request.instructions.as_deref().map(str::trim) {
                     Some(instructions) if !instructions.is_empty() => {
@@ -713,31 +712,20 @@ impl Translator {
     /// The part of the glossary that matters to this page, as a prompt block. The glossary
     /// holds everything decided for the work; a page only carries the entries about the
     /// names, terms and characters on it (or on the pages just before it).
-    /// The glossary entries a request is shown. A `standalone` request gets the names, the terms
-    /// and the pairs only: no character profiles, and the entries are picked from its own lines,
-    /// not from the pages before it.
-    fn glossary_block(
-        &self,
-        language: Language,
-        segments: &[String],
-        standalone: bool,
-    ) -> Option<String> {
+    fn glossary_block(&self, language: Language, segments: &[String]) -> Option<String> {
         let mut selected = Vec::new();
         if let Ok(glossary) = self.glossary.lock()
             && glossary.language == Some(language)
             && !glossary.entries.is_empty()
         {
             let mut corpus = segments.join("\n");
-            if !standalone && let Ok(memory) = self.memory.lock() {
+            if let Ok(memory) = self.memory.lock() {
                 for page in &memory.recent_pages {
                     corpus.push('\n');
                     corpus.push_str(page);
                 }
             }
             selected = relevant_entries(&glossary.entries, &corpus);
-            if standalone {
-                selected.retain(|entry| entry.kind != "character");
-            }
         }
         // The pairs the translations confirmed go to every page, whatever the glossary says.
         if language == Language::Vietnamese
@@ -965,6 +953,9 @@ impl Translator {
         }
         if let Ok(mut pairs) = self.pairs.lock() {
             pairs.clear();
+        }
+        if let Ok(mut story) = self.story.lock() {
+            *story = polish::Story::default();
         }
     }
 
