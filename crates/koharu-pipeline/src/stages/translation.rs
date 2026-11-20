@@ -8,12 +8,11 @@ use async_trait::async_trait;
 use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::{drawing::draw_filled_rect_mut, rect::Rect};
 use koharu_scene::{
-    Authored, EntityId, Geometry, LanguageTag, Origin, PanelRegion, RegionSpec, SourceText,
+    Authored, EntityId, Geometry, LanguageTag, Origin, RasterLayer, RasterLayerKind, SourceText,
     Translation,
 };
 use koharu_translator::{
-    AnalysisPage, PageAnalysis, PanelLayout, Provider, TranslationRequest, Translator,
-    needs_translation,
+    AnalysisPage, PageAnalysis, Provider, TranslationRequest, Translator, needs_translation,
 };
 
 use crate::TranslationConfig;
@@ -102,7 +101,7 @@ impl Processor {
             if translatable.is_empty() {
                 continue;
             }
-            let image = match input.images.get(&input.scene, input.page, "source").await {
+            let image = match cleaned_page(input).await {
                 Ok(Some(image)) => image,
                 Ok(None) => continue,
                 Err(error) => {
@@ -117,11 +116,7 @@ impl Processor {
                 .iter()
                 .map(|&target| texts.targets[target].1.clone())
                 .collect();
-            let layout = PanelLayout {
-                panels: page_panels(input),
-                boxes,
-            };
-            match AnalysisPage::new(&marked, segments, Some(&layout)) {
+            match AnalysisPage::new(&marked, segments) {
                 Ok(page) => {
                     order.push(input.page);
                     pages.push(page);
@@ -393,7 +388,11 @@ impl Processor {
         // The notes say which words every line uses for "I" and "you": the translation is held
         // to them, and a local model writes who speaks to whom so that it can be.
         if let Some(analysis) = analysis.as_ref().filter(|_| notes.is_some()) {
-            request = request.with_pairs(analysis.expected_pairs(&read));
+            // The rough translation of the vision model fixed the words of address; the model
+            // that writes the final translation improves on it and keeps those words.
+            request = request
+                .with_pairs(analysis.expected_pairs(&read))
+                .with_drafts(analysis.drafts(&read));
             if local {
                 request = request.with_speakers();
             }
@@ -520,21 +519,36 @@ fn silent_text(source: &str) -> Option<String> {
     (all_silence && (marks.len() >= 2 || single_ellipsis)).then(|| "\u{2026}".to_owned())
 }
 
-/// The panels the detection found on a page, as page-pixel boxes, in the order they were
-/// created (the detection reading order). The analysis orders them again by rows.
-fn page_panels(input: &StageInput) -> Vec<[f64; 4]> {
-    let Ok(children) = input.scene.children(input.page) else {
-        return Vec::new();
+/// The page as the analysis reads it: the source page with its cleanup layer (the inpainting)
+/// laid over it, so the balloons are empty and the boxes drawn on it mark where the lettering
+/// stood. The source page itself when the page was not cleaned.
+async fn cleaned_page(input: &StageInput) -> Result<Option<Arc<DynamicImage>>> {
+    let Some(source) = input.images.get(&input.scene, input.page, "source").await? else {
+        return Ok(None);
     };
-    children
-        .filter_map(|id| {
-            let region = input.scene.analysis_region(id).ok()?;
-            if region.region().ok()?.kind != PanelRegion::kind() {
-                return None;
-            }
-            bounds(&region.geometry().ok()?)
-        })
-        .collect()
+    let mut cleanup_entity = None;
+    for entity in input.scene.children(input.page)? {
+        let cleanup = input
+            .scene
+            .component::<RasterLayer>(entity)?
+            .is_some_and(|layer| layer.kind == RasterLayerKind::Cleanup);
+        if cleanup {
+            cleanup_entity = Some(entity);
+            break;
+        }
+    }
+    let Some(entity) = cleanup_entity else {
+        return Ok(Some(source));
+    };
+    let Some(cleanup) = input.images.get(&input.scene, entity, "source").await? else {
+        return Ok(Some(source));
+    };
+    if (cleanup.width(), cleanup.height()) != (source.width(), source.height()) {
+        return Ok(Some(source));
+    }
+    let mut page = source.to_rgba8();
+    image::imageops::overlay(&mut page, &cleanup.to_rgba8(), 0, 0);
+    Ok(Some(Arc::new(DynamicImage::ImageRgba8(page))))
 }
 
 /// The left, top, right and bottom of a geometry, in page pixels.

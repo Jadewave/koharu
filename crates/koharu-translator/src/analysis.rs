@@ -1,22 +1,25 @@
 //! Reading a work with a vision model before it is translated.
 //!
 //! A vision model on an OpenAI-compatible server (the one of `providers.openai_compatible`)
-//! looks at every page together with the text OCR read from it. It tells the translation model,
-//! which never sees the pictures, everything that depends on them: who speaks to whom, how
-//! old they are and how they talk, which words they use for themselves and for each other,
-//! and where OCR misread the text. The result is a glossary of the whole work (merged into the
-//! glossary every model follows) and, for every page, the notes the translation model reads
-//! with that page.
+//! looks at the pages together with the text OCR read from them. It tells the translation
+//! model, which never sees the pictures, everything that depends on them: who speaks to whom,
+//! how old they are and how they talk, which words they use for themselves and for each other,
+//! and where OCR misread the text. It also writes a rough translation of every line, which
+//! fixes those words before the final translation is made. The result is a glossary of the whole
+//! work (merged into the glossary every model follows) and, for every page, the notes and the
+//! drafts the translation model reads with that page.
 //!
-//! The models are tried in the order of `analysis.models`: when one fails or refuses a page,
-//! the next one reads it. A model that the server does not know or does not let the user call
-//! is skipped for the rest of the run. A page that no model could read is translated the way
-//! it was before, without notes.
+//! The pages go to the model in windows of `batch_pages` pages, one request each. A page is the
+//! cleaned page (the lettering erased, a red box with the number of the OCR line where each
+//! line stood), encoded as lossless WebP, followed in the prompt by its OCR text. The first
+//! `overlap_pages` pages of a window are the last pages of the window before it: they are sent
+//! again as context only, with what was read of them, so that a conversation that crosses the
+//! end of a window is not cut and a character keeps the same label.
 //!
-//! Every model is shown the page the way a reader sees it: the whole page first, for the layout
-//! and for where everyone stands, then, when the page has panels, every panel on its own in the
-//! order it is read, large enough to see faces and balloons. The page the story left off on and
-//! what is known of the characters go with it, so that a panel is never read alone.
+//! The models are tried in the order of `analysis.models`: when one fails or refuses a window,
+//! the next one reads the pages the first did not. A model that the server does not know or
+//! does not let the user call is skipped for the rest of the run. A page that no model could
+//! read is translated the way it was before, without notes.
 //!
 //! Once every page is read, the pairs of words of every direction are settled by the number of
 //! lines that used them (see `settle`), without another model.
@@ -31,8 +34,8 @@ use serde_json::{Value, json};
 mod settle;
 
 use crate::{
-    Error, GenerationConfig, Language, ProvidersConfig, Translator,
-    backend::{ExpectedPair, GlossaryEntry, encode_image, shrink_to},
+    Error, GenerationConfig, Language, Translator,
+    backend::{ExpectedPair, GlossaryEntry, encode_image_lossless, shrink_to},
     remote,
 };
 
@@ -58,11 +61,17 @@ pub struct AnalysisConfig {
     /// Reads the work with the vision models below when the OpenAI-compatible provider has
     /// a server of its own (not the local default). Set to false to turn it off.
     pub enabled: bool,
-    /// The models that read the pages, in the order they are tried for every page.
+    /// The models that read the pages, in the order they are tried for every window of pages.
     pub models: Vec<AnalysisModel>,
+    /// How many pages (pictures) one request carries, the pages repeated from the window before
+    /// it included.
+    pub batch_pages: usize,
+    /// How many of the last pages of a window are sent again with the next one, as context
+    /// only. The pages are never all context: a window has at least one page of its own.
+    pub overlap_pages: usize,
     /// Translates every page again after the analysis (see `polish`): the first model of
-    /// `translate_models` that answers writes the final translation. Off: the draft of the
-    /// vision model is the translation.
+    /// `translate_models` that answers writes the final translation. Off: the model the user
+    /// chose (the local one) writes it from the notes and the drafts of the vision model.
     pub translate: bool,
     /// The models that write the final translation of a page, in the order they are tried. They
     /// are sent the whole page picture, the notes, the draft and the story of the work.
@@ -80,19 +89,16 @@ pub struct AnalysisConfig {
     /// large. Off by default.
     pub reasoning: bool,
     pub max_tokens: u32,
-    /// The longest side of the page picture that is sent, in pixels.
+    /// The longest side of a page picture that is sent, in pixels.
     pub image_max_dimension: u32,
-    /// The longest side of a panel picture that is sent, in pixels.
-    pub panel_max_dimension: u32,
-    /// The order panels are read in: from the right of a row to its left (Japanese manga), or
-    /// from the left to the right.
-    pub right_to_left: bool,
 }
 
 /// The DeepSeek model of the analysis.
 const DEEPSEEK: &str = "deepseek-ai/deepseek-v4.1-flash";
 /// The vision model of the analysis.
 const NEMOTRON_VL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
+/// The small vision model that reads a window when the large one cannot.
+const NEMOTRON_BOLT: &str = "nvidia/nemotron-3.5-bolt-e4b";
 
 /// A model of the analysis chain.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -120,220 +126,47 @@ impl Default for AnalysisConfig {
         };
         Self {
             enabled: true,
-            models: vec![model(NEMOTRON_VL, None), model(DEEPSEEK, None)],
-            // DeepSeek writes the final translation of every page, without thinking, and sees
-            // the whole page.
-            translate: true,
+            models: vec![model(NEMOTRON_VL, None), model(NEMOTRON_BOLT, None)],
+            batch_pages: 12,
+            overlap_pages: 2,
+            // The vision models only read and draft: the model the user chose writes the final
+            // translation. DeepSeek does it, without thinking, when `translate` is turned on.
+            translate: false,
             translate_models: vec![model(DEEPSEEK, Some(false))],
             translate_reasoning: false,
             translate_max_tokens: 16384,
             translate_temperature: 0.4,
             story_chars: 4000,
             reasoning: false,
-            // A page is answered with the notes and the draft of every line, in about five
-            // thousand tokens: a model that loops (the log of one page wrote the same phrase
-            // until the limit) is cut off early.
-            max_tokens: 12288,
+            // A window of twelve pages is answered with the notes and the draft of every line:
+            // roughly one to two thousand tokens a page. A model that loops (it wrote the same
+            // phrase until the limit) is cut off at the limit.
+            max_tokens: 32768,
             image_max_dimension: 1600,
-            panel_max_dimension: 1024,
-            right_to_left: true,
         }
     }
 }
 
-/// A rectangle: left, top, right and bottom, in page pixels.
-pub type Rect = [f64; 4];
-
-/// The panels of a page and the boxes of its OCR lines, in page pixels.
-#[derive(Clone, Debug, Default)]
-pub struct PanelLayout {
-    /// The panels, in any order.
-    pub panels: Vec<Rect>,
-    /// The box of every OCR line, in the order of the lines.
-    pub boxes: Vec<Option<Rect>>,
-}
-
-/// The picture of one panel and the OCR lines in it.
-#[derive(Clone)]
-struct PanelPicture {
-    picture: String,
-    lines: Vec<usize>,
-}
-
-/// Panels beyond this many on one page are not sent one by one; only the whole page is sent.
-const MAX_PANELS: usize = 10;
-/// A panel smaller than this on a side is not sent.
-const MIN_PANEL_SIDE: f64 = 32.0;
-
 /// One page to read: its picture (with the boxes and numbers of the OCR lines drawn on it,
-/// scaled down and encoded once), its panels when it has at least two that hold text, and the
-/// OCR lines, in the order of the numbers.
+/// scaled down and encoded once, as a lossless WebP data URL) and the OCR lines, in the order
+/// of the numbers.
 #[derive(Clone)]
 pub struct AnalysisPage {
     picture: String,
-    panels: Vec<PanelPicture>,
     pub segments: Vec<String>,
 }
 
 impl AnalysisPage {
-    /// Prepares a page for the analysis. `image` carries the numbers of `segments`; `layout`
-    /// holds the panels when the page has any.
-    pub fn new(
-        image: &Arc<DynamicImage>,
-        segments: Vec<String>,
-        layout: Option<&PanelLayout>,
-    ) -> anyhow::Result<Self> {
+    /// Prepares a page for the analysis. `image` is the cleaned page and carries the numbers
+    /// of `segments`, which restart at 0 on every page.
+    pub fn new(image: &Arc<DynamicImage>, segments: Vec<String>) -> anyhow::Result<Self> {
         let config = analysis_config().unwrap_or_default();
         let scaled = shrink_to(image, config.image_max_dimension.max(256))?;
-        let wants_panels = config.models.iter().any(|model| model.vision);
-        let panels = match layout {
-            Some(layout) if wants_panels => {
-                panel_pictures(image, layout, segments.len(), &config).unwrap_or_else(|error| {
-                    tracing::warn!(%error, "could not cut the panels of a page; only the whole page is sent");
-                    Vec::new()
-                })
-            }
-            _ => Vec::new(),
-        };
         Ok(Self {
-            picture: encode_image(&scaled)?.data_url(),
-            panels,
+            picture: encode_image_lossless(&scaled)?,
             segments,
         })
     }
-}
-
-/// The order panels are read in: rows from the top to the bottom (panels that share more than
-/// half of the lower one's height are one row), and inside a row from the right to the left
-/// when `right_to_left`, else from the left to the right. Returns indexes of `panels`.
-#[must_use]
-pub fn reading_order(panels: &[Rect], right_to_left: bool) -> Vec<usize> {
-    let mut by_top: Vec<usize> = (0..panels.len()).collect();
-    by_top.sort_by(|&left, &right| panels[left][1].total_cmp(&panels[right][1]));
-    // A row: its vertical extent and the panels in it.
-    let mut rows: Vec<([f64; 2], Vec<usize>)> = Vec::new();
-    for index in by_top {
-        let [_, top, _, bottom] = panels[index];
-        let height = (bottom - top).max(1.0);
-        let same_row = rows.last_mut().filter(|(extent, _)| {
-            let overlap = bottom.min(extent[1]) - top.max(extent[0]);
-            overlap > 0.5 * height.min((extent[1] - extent[0]).max(1.0))
-        });
-        match same_row {
-            Some((extent, members)) => {
-                extent[0] = extent[0].min(top);
-                extent[1] = extent[1].max(bottom);
-                members.push(index);
-            }
-            None => rows.push(([top, bottom], vec![index])),
-        }
-    }
-    let mut order = Vec::with_capacity(panels.len());
-    for (_, mut members) in rows {
-        members.sort_by(|&left, &right| {
-            let (left, right) = (panels[left][0] + panels[left][2], panels[right][0] + panels[right][2]);
-            if right_to_left {
-                right.total_cmp(&left)
-            } else {
-                left.total_cmp(&right)
-            }
-        });
-        order.extend(members);
-    }
-    order
-}
-
-fn area(rect: Rect) -> f64 {
-    (rect[2] - rect[0]).max(0.0) * (rect[3] - rect[1]).max(0.0)
-}
-
-/// The panel (an index of `panels`) every OCR line belongs to: the smallest panel that holds
-/// the center of the line's box, else the nearest panel. A line without a box goes with the line
-/// before it (the first one with the first panel). `panels` must not be empty.
-#[must_use]
-pub fn assign_segments(panels: &[Rect], boxes: &[Option<Rect>]) -> Vec<usize> {
-    let mut owners: Vec<usize> = Vec::with_capacity(boxes.len());
-    for rect in boxes {
-        let owner = match rect {
-            Some(rect) => {
-                let (x, y) = ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
-                let holding = (0..panels.len())
-                    .filter(|&index| {
-                        let panel = panels[index];
-                        x >= panel[0] && x <= panel[2] && y >= panel[1] && y <= panel[3]
-                    })
-                    .min_by(|&left, &right| area(panels[left]).total_cmp(&area(panels[right])));
-                holding.unwrap_or_else(|| {
-                    let distance = |index: usize| {
-                        let panel = panels[index];
-                        let dx = (panel[0] - x).max(0.0).max(x - panel[2]);
-                        let dy = (panel[1] - y).max(0.0).max(y - panel[3]);
-                        dx * dx + dy * dy
-                    };
-                    (0..panels.len())
-                        .min_by(|&left, &right| distance(left).total_cmp(&distance(right)))
-                        .unwrap_or(0)
-                })
-            }
-            None => owners.last().copied().unwrap_or(0),
-        };
-        owners.push(owner);
-    }
-    owners
-}
-
-/// The crop of a panel: the panel with a margin, inside the page; `None` when it is too small.
-fn crop_rect(panel: Rect, width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
-    let margin = 8.0 + 0.01 * (panel[2] - panel[0]).max(panel[3] - panel[1]);
-    let left = (panel[0] - margin).max(0.0).floor();
-    let top = (panel[1] - margin).max(0.0).floor();
-    let right = (panel[2] + margin).min(f64::from(width)).ceil();
-    let bottom = (panel[3] + margin).min(f64::from(height)).ceil();
-    if right - left < MIN_PANEL_SIDE || bottom - top < MIN_PANEL_SIDE {
-        return None;
-    }
-    Some((left as u32, top as u32, (right - left) as u32, (bottom - top) as u32))
-}
-
-/// The pictures of the panels that hold OCR lines, in reading order. Empty when the panels are
-/// not worth sending: fewer than two such panels, more than `MAX_PANELS`, or an OCR line that no
-/// picture holds (the whole page is sent anyway).
-fn panel_pictures(
-    image: &Arc<DynamicImage>,
-    layout: &PanelLayout,
-    lines: usize,
-    config: &AnalysisConfig,
-) -> anyhow::Result<Vec<PanelPicture>> {
-    if layout.panels.len() < 2 || layout.boxes.len() != lines {
-        return Ok(Vec::new());
-    }
-    let owners = assign_segments(&layout.panels, &layout.boxes);
-    let mut pictures = Vec::new();
-    for panel in reading_order(&layout.panels, config.right_to_left) {
-        let held: Vec<usize> = owners
-            .iter()
-            .enumerate()
-            .filter_map(|(line, &owner)| (owner == panel).then_some(line))
-            .collect();
-        if held.is_empty() {
-            continue;
-        }
-        let Some((x, y, width, height)) = crop_rect(layout.panels[panel], image.width(), image.height())
-        else {
-            continue;
-        };
-        let crop = Arc::new(image.crop_imm(x, y, width, height));
-        let scaled = shrink_to(&crop, config.panel_max_dimension.max(256))?;
-        pictures.push(PanelPicture {
-            picture: encode_image(&scaled)?.data_url(),
-            lines: held,
-        });
-    }
-    let covered: usize = pictures.iter().map(|picture| picture.lines.len()).sum();
-    if pictures.len() < 2 || pictures.len() > MAX_PANELS || covered != lines {
-        return Ok(Vec::new());
-    }
-    Ok(pictures)
 }
 
 pub(crate) fn analysis_config() -> anyhow::Result<AnalysisConfig> {
@@ -539,20 +372,43 @@ struct PageOutput {
     summary: String,
 }
 
-/// The JSON schema of the answer for a page of `expected` lines.
-fn schema(expected: usize) -> Value {
+/// What the model answers for a window: what it learned about the people and the terms of all
+/// its pages, and the reading of every page it was asked about.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct BatchOutput {
+    characters: Vec<Character>,
+    terms: Vec<Term>,
+    pages: Vec<BatchPage>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct BatchPage {
+    /// The number of the page, from 1; 0 when the answer did not say.
+    #[serde(deserialize_with = "lenient_id")]
+    page: usize,
+    #[serde(flatten)]
+    output: PageOutput,
+}
+
+/// The JSON schema of the answer for the pages in `pages`: the number of each (from 1) and how
+/// many OCR lines it has.
+fn schema(pages: &[(usize, usize)]) -> Value {
     let text = |description: &str| json!({ "type": "string", "description": description });
+    let numbers: Vec<usize> = pages.iter().map(|&(number, _)| number).collect();
+    // The ids restart on every page: the bound is the longest page, a page's own count is
+    // checked when the answer is read.
+    let longest = pages.iter().map(|&(_, lines)| lines).max().unwrap_or(1);
     json!({
         "type": "object",
         "properties": {
-            "scene": text("One or two sentences: where, when and what happens on this page."),
-            "page_note": text("What the translator must remember on this page: who is who (by sex, age and look, not by name), what to avoid."),
             "characters": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "name": text("The label of the character (sex, age, look) until the page gives a real name; then that name."),
+                        "name": text("The label of the character (sex, age, look) until the pages give a real name; then that name."),
                         "aliases": { "type": "array", "items": { "type": "string" } },
                         "gender": text("man, woman, boy, girl, or unknown."),
                         "age": text("A number or a stage: child, teenager, young adult, adult, middle-aged, elderly."),
@@ -588,57 +444,74 @@ fn schema(expected: usize) -> Value {
                     "required": ["source", "target"]
                 }
             },
-            "lines": {
+            "pages": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {
+                        "page": {
                             "type": "integer",
-                            "minimum": 0,
-                            "maximum": expected.saturating_sub(1),
-                            "description": "The number of the OCR line."
+                            "enum": numbers,
+                            "description": "The number of the page, as listed."
                         },
-                        "kind": { "type": "string", "enum": ["speech", "thought", "narration", "sfx", "sign", "other"] },
-                        "text": text("The line, corrected when OCR misread it; otherwise copied unchanged."),
-                        "speaker": text("The label of the character who says or thinks it; 'narrator', or 'unknown' when nobody can be told."),
-                        "speaker_desc": text("What identifies the speaker here: look, or the voice of one who is not seen."),
-                        "speaker_basis": { "type": "string", "enum": ["seen", "inferred", "unknown"] },
-                        "listener": text("The label of the character spoken to; 'self' for a thought, 'everyone' for a group, 'unknown'."),
-                        "listener_desc": text("What identifies the listener, or who the group is (ages, sexes, relation to the speaker)."),
-                        "listener_basis": { "type": "string", "enum": ["seen", "inferred", "unknown"] },
-                        "audience": { "type": "string", "enum": ["one", "group", "self", "unknown"] },
-                        "self": text("The word the speaker uses for themselves."),
-                        "you": text("The word the speaker uses for the listener (the plural for a group)."),
-                        "tone": text("Two or three words."),
-                        "cues": text("What in the text shows the register: I/you words, endings, honorifics."),
-                        "exception": text("Why this line needs other words than the usual pair of its direction; empty otherwise."),
-                        "draft": text("The translation of `text` into the target language, written with the words chosen in self and you; empty for a line with nothing to translate.")
+                        "scene": text("One or two sentences: where, when and what happens on this page."),
+                        "page_note": text("What the translator must remember on this page: who is who (by sex, age and look, not by name), what to avoid."),
+                        "lines": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": longest.saturating_sub(1),
+                                        "description": "The number of the OCR line on this page."
+                                    },
+                                    "kind": { "type": "string", "enum": ["speech", "thought", "narration", "sfx", "sign", "other"] },
+                                    "text": text("The line, corrected when OCR misread it; otherwise copied unchanged."),
+                                    "speaker": text("The label of the character who says or thinks it; 'narrator', or 'unknown' when nobody can be told."),
+                                    "speaker_desc": text("What identifies the speaker here: look, or the voice of one who is not seen."),
+                                    "speaker_basis": { "type": "string", "enum": ["seen", "inferred", "unknown"] },
+                                    "listener": text("The label of the character spoken to; 'self' for a thought, 'everyone' for a group, 'unknown'."),
+                                    "listener_desc": text("What identifies the listener, or who the group is (ages, sexes, relation to the speaker)."),
+                                    "listener_basis": { "type": "string", "enum": ["seen", "inferred", "unknown"] },
+                                    "audience": { "type": "string", "enum": ["one", "group", "self", "unknown"] },
+                                    "self": text("The word the speaker uses for themselves."),
+                                    "you": text("The word the speaker uses for the listener (the plural for a group)."),
+                                    "tone": text("Two or three words."),
+                                    "cues": text("What in the text shows the register: I/you words, endings, honorifics."),
+                                    "exception": text("Why this line needs other words than the usual pair of its direction; empty otherwise."),
+                                    "draft": text("The translation of `text` into the target language, written with the words chosen in self and you; empty for a line with nothing to translate.")
+                                },
+                                "required": ["id", "speaker", "listener", "draft"]
+                            }
+                        },
+                        "summary": text("One to three sentences: what happens on this page, who does what to whom and why, so that the story can be followed from the summaries alone.")
                     },
-                    "required": ["id", "speaker", "listener", "draft"]
+                    "required": ["page", "lines", "summary"]
                 }
-            },
-            "summary": text("One to three sentences: what happens on this page, who does what to whom and why, so that the story can be followed from the summaries alone.")
+            }
         },
-        "required": ["lines", "summary"]
+        "required": ["pages"]
     })
 }
 
 fn system_prompt(target: Language) -> String {
     let mut prompt = format!(
-        "You read a manga page that is going to be translated into {target}. You see the page \
-picture (when one is attached) and the text OCR read from it, as numbered lines; the red boxes \
-on the picture carry the same numbers. You are the first translator: you translate every line \
-as you read it. Your answer then goes to a second translator, who sees the whole page, reads \
-your notes and your draft and writes the final translation, so everything that depends on the \
-picture must be in it: who speaks, to whom, how old they are, how they talk.
+        "You read pages of a manga that is going to be translated into {target}. You get the pictures \
+of several consecutive pages (when pictures are attached) and the text OCR read from every page, \
+as numbered lines that start at 0 on every page. The pages were cleaned: the lettering may be \
+erased from a picture, and a red box on it marks where the line of the same number stood. You are \
+the first translator: you translate every line as you read it. Your answer then goes to a second \
+translator, who reads your notes and your draft and writes the final translation, so everything \
+that depends on the pictures must be in it: who speaks, to whom, how old they are, how they talk.
 
 For every OCR line:
 - id: the number of the line.
 - kind: speech, thought (an inner voice, often in a cloud or a box without a tail), narration, \
 sfx, sign or other.
 - text: the line, corrected when OCR misread it (wrong, missing or extra characters, kana read \
-as kanji, noise from the drawing). Check it against the picture and the story. Copy the line \
+as kanji, noise from the drawing). Check it against the story and the other lines (the lettering may be erased from the picture). Copy the line \
 unchanged when it is right. This is the source: do not translate or reword it here (that is \
 draft) and never add words that are not on the page.
 - speaker: who says or thinks it ('narrator' for narration, 'unknown' when nobody can be told). \
@@ -679,12 +552,12 @@ term on every page. A sound effect gets the word a {target} reader expects, a si
 translated too. No notes, no explanations, no brackets, no quotation marks around the line. \
 Empty for a line with nothing to translate.
 
-Also answer: scene, page_note (what the translator must remember on this page), summary (one to \
+For every page also answer: scene, page_note (what the translator must remember on this page), summary (one to \
 three sentences: what happens on this page, who does what to whom and why; someone who reads \
-only the summaries has to be able to follow the story), characters \
-(new ones, or what you learned about known ones: name, aliases, gender, age, look, role, \
-speech_style, relationships with the pronouns they use) and terms (names of people, places, organizations, \
-titles and recurring words, with the {target} rendering to use).
+only the summaries has to be able to follow the story). Once for all the pages also answer: \
+characters (new ones, or what you learned about known ones: name, aliases, gender, age, look, \
+role, speech_style, relationships with the pronouns they use) and terms (names of people, \
+places, organizations, titles and recurring words, with the {target} rendering to use).
 
 Rules:
 - Recognize a person by the look; decide their gender, age and manner from how they speak first \
@@ -706,7 +579,10 @@ tender. Take the register from the tone, the cues and the scene, not from the na
 shows otherwise. Report only what is new or changed.
 - A character has one name everywhere; other ways of calling them go in aliases. Honorifics \
 (さん, くん, ちゃん) show the relationship and do not belong to the name.
-- Write the lines in the order of their numbers and answer for every number you were given.
+- Answer for every page you are asked about, with its number in `page`, and for every line of \
+the page, in the order of the numbers. A page marked as read already is context: it tells you \
+how the story reaches the next page and who is who, and you do not answer for it. The same \
+person gets the same label on every page.
 - Answer with the JSON object only."
     );
     prompt.push_str(pronoun_rules(target));
@@ -756,58 +632,79 @@ needed, 'bạn' (neutral or polite), 'cậu' (casual, peers) and 'mày' only for
     }
 }
 
-/// What the vision model is shown of a page.
-enum View<'a> {
-    /// No picture: the text only.
-    Text,
-    /// The whole page in one picture.
-    Page,
-    /// The whole page, then one picture for every panel, in reading order.
-    PageAndPanels(&'a [PanelPicture]),
+/// The pages of the window that starts at the page `next`: its context (the last `overlap`
+/// pages of the window before it, read already) and the pages of its own. A window never has
+/// more than `batch` pages and always has at least one of its own.
+fn window(
+    next: usize,
+    total: usize,
+    batch: usize,
+    overlap: usize,
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let batch = batch.max(1);
+    let overlap = overlap.min(batch - 1);
+    let context = next.saturating_sub(overlap)..next;
+    let own = next..(next + batch - context.len()).min(total);
+    (context, own)
 }
 
-fn user_prompt(
+/// A page of a window as the prompt lists it.
+struct Listed<'a> {
+    /// The number of the page, from 1.
     number: usize,
-    total: usize,
-    segments: &[String],
-    bible: &Bible,
-    previous: Option<&str>,
-    view: &View<'_>,
-) -> String {
-    let mut prompt = format!("Page {} of {total}. ", number + 1);
-    match view {
-        View::Page => prompt.push_str("The picture of the page is attached.\n"),
-        View::Text => prompt.push_str(
-            "No picture is attached: decide from the text only, and answer 'unknown' where a \
-speaker cannot be told.\n",
-        ),
-        View::PageAndPanels(panels) => {
-            let _ = writeln!(
-                prompt,
-                "{} pictures are attached. Picture 1 is the whole page: use it for the layout, for \
-who stands where and for which balloon points at whom. The next {} pictures are the panels of the \
-page in the order they are read, each one enlarged: panel 1 is the first one and the story goes on \
-in the next panel. A panel is part of the whole page, never a page of its own: read it in the \
-light of the pictures before it. The same character in different panels is the same person. The \
-red boxes carry the same numbers of the OCR lines in every picture.",
-                panels.len() + 1,
-                panels.len()
-            );
-            for (position, panel) in panels.iter().enumerate() {
-                let lines: Vec<String> = panel.lines.iter().map(ToString::to_string).collect();
-                let _ = writeln!(prompt, "Panel {}: lines {}", position + 1, lines.join(", "));
+    page: &'a AnalysisPage,
+    /// What was read of the page: only for a page that is context, read in an earlier window.
+    read: Option<&'a PageAnalysis>,
+}
+
+/// One OCR line of a page that is context, with who said it to whom when that was read.
+fn context_line(read: Option<&PageAnalysis>, id: usize, text: &str) -> String {
+    let quoted = serde_json::to_string(&clip(text, 400)).unwrap_or_default();
+    let mut line = format!("{id}: {quoted}");
+    if let Some(analyzed) = read.and_then(|read| read.lines.get(id)) {
+        let (speaker, listener) = (analyzed.speaker.trim(), analyzed.listener.trim());
+        if !is_generic(speaker) {
+            let _ = write!(line, " [{speaker}");
+            if !is_generic(listener) {
+                let _ = write!(line, " -> {listener}");
             }
+            line.push(']');
         }
     }
-    match previous.map(str::trim).filter(|scene| !scene.is_empty()) {
-        Some(scene) => {
-            let _ = writeln!(
-                prompt,
-                "The previous page ended like this (the story goes on from it): {}",
-                clip(scene, 400)
-            );
-        }
-        None => {}
+    line
+}
+
+/// The request for a window: the pages that are only context come first, then the pages to
+/// answer for; with `pictures` their pictures are attached in the same order.
+fn user_prompt(
+    total: usize,
+    context: &[Listed<'_>],
+    fresh: &[Listed<'_>],
+    bible: &Bible,
+    pictures: bool,
+) -> String {
+    let mut prompt = format!("The work has {total} pages. ");
+    if pictures {
+        let _ = writeln!(
+            prompt,
+            "Pictures are attached, one for every page listed below ({} in all), in the same order: \
+picture 1 is the first page listed. Use them for the layout, for who stands where and for which \
+balloon points at whom. The red boxes carry the numbers of the OCR lines of their own page. The \
+same character on different pages is the same person.",
+            context.len() + fresh.len()
+        );
+    } else {
+        prompt.push_str(
+            "No picture is attached: decide from the text only, and answer 'unknown' where a \
+speaker cannot be told.\n",
+        );
+    }
+    if !context.is_empty() {
+        let _ = writeln!(
+            prompt,
+            "The pages marked as read already are context only: they show how the story reaches \
+the pages you answer for. Do not answer for them."
+        );
     }
     let known = bible.prompt_json();
     if known.is_empty() {
@@ -815,21 +712,48 @@ red boxes carry the same numbers of the OCR lines in every picture.",
     } else {
         let _ = writeln!(prompt, "Known so far (keep it consistent): {known}");
     }
-    prompt.push_str("OCR lines:\n");
-    for (id, segment) in segments.iter().enumerate() {
-        let quoted = serde_json::to_string(&clip(segment, 400)).unwrap_or_default();
-        let _ = writeln!(prompt, "{id}: {quoted}");
+    let place = |position: usize| {
+        if pictures {
+            format!(" (picture {})", position + 1)
+        } else {
+            String::new()
+        }
+    };
+    for (position, entry) in context.iter().enumerate() {
+        let _ = write!(prompt, "\nPage {}{}: read already.", entry.number, place(position));
+        if let Some(summary) = entry.read.map(PageAnalysis::summary).filter(|text| !text.is_empty()) {
+            let _ = write!(prompt, " What happened: {}", clip(summary, 400));
+        }
+        prompt.push_str("\nOCR lines:\n");
+        for (id, segment) in entry.page.segments.iter().enumerate() {
+            let _ = writeln!(prompt, "{}", context_line(entry.read, id, segment));
+        }
     }
+    for (position, entry) in fresh.iter().enumerate() {
+        let count = entry.page.segments.len();
+        let _ = writeln!(
+            prompt,
+            "\nPage {}{}: answer for it. OCR lines (ids 0 to {}):",
+            entry.number,
+            place(context.len() + position),
+            count.saturating_sub(1)
+        );
+        for (id, segment) in entry.page.segments.iter().enumerate() {
+            let quoted = serde_json::to_string(&clip(segment, 400)).unwrap_or_default();
+            let _ = writeln!(prompt, "{id}: {quoted}");
+        }
+    }
+    let numbers: Vec<String> = fresh.iter().map(|entry| entry.number.to_string()).collect();
     let _ = write!(
         prompt,
-        "Answer for these {} lines (ids 0 to {}).",
-        segments.len(),
-        segments.len().saturating_sub(1)
+        "\nAnswer for page{} {}: one entry of `pages` for each, with its number in `page`, and in \
+`lines` one entry for every OCR line of the page (the ids restart at 0 on every page).",
+        if fresh.len() == 1 { "" } else { "s" },
+        numbers.join(", ")
     );
     prompt
 }
 
-/// The JSON object in an answer, also when a model wrote something around it.
 fn json_object(text: &str) -> Option<&str> {
     let text = text.trim();
     if text.starts_with('{') && serde_json::from_str::<Value>(text).is_ok() {
@@ -840,9 +764,9 @@ fn json_object(text: &str) -> Option<&str> {
     serde_json::from_str::<Value>(object).is_ok().then_some(object)
 }
 
-fn parse_page(text: &str, count: usize) -> anyhow::Result<PageOutput> {
-    let json = json_object(text).ok_or_else(|| anyhow!("the answer holds no JSON object"))?;
-    let mut output: PageOutput = serde_json::from_str(json).context("invalid analysis JSON")?;
+/// Drops the lines of a page that are not its own (an id beyond its lines, a repeated id) and
+/// normalizes the others. Whether anything is left of the page.
+fn tidy(output: &mut PageOutput, count: usize) -> bool {
     let mut seen = HashSet::new();
     output
         .lines
@@ -850,11 +774,42 @@ fn parse_page(text: &str, count: usize) -> anyhow::Result<PageOutput> {
     for line in &mut output.lines {
         line.normalize();
     }
+    !output.lines.is_empty()
+}
+
+/// Reads the answer of a window. `expected` lists the pages that were asked for, as their
+/// number (from 1) and their count of OCR lines. A page the answer leaves out, repeats, did not
+/// ask for or gives no usable line for is not in the result; the others are, in the order of
+/// their numbers. Fails when no page is left.
+fn parse_batch(text: &str, expected: &[(usize, usize)]) -> anyhow::Result<Vec<(usize, PageOutput)>> {
+    let json = json_object(text).ok_or_else(|| anyhow!("the answer holds no JSON object"))?;
+    let batch: BatchOutput = serde_json::from_str(json).context("invalid analysis JSON")?;
+    let mut seen = HashSet::new();
+    let mut pages: Vec<(usize, PageOutput)> = Vec::new();
+    for entry in batch.pages {
+        let Some(&(_, count)) = expected.iter().find(|&&(number, _)| number == entry.page) else {
+            continue;
+        };
+        if !seen.insert(entry.page) {
+            continue;
+        }
+        let mut output = entry.output;
+        if tidy(&mut output, count) {
+            pages.push((entry.page, output));
+        }
+    }
     ensure!(
-        !output.lines.is_empty(),
-        "the answer has no line for any of the {count} OCR lines"
+        !pages.is_empty(),
+        "the answer has no line for any of the {} pages asked for",
+        expected.len()
     );
-    Ok(output)
+    pages.sort_by_key(|&(number, _)| number);
+    // What the answer learned about the people and the terms of all its pages is merged before
+    // the lines of the first one, so that the lines find their characters.
+    let first = &mut pages[0].1;
+    first.characters.splice(0..0, batch.characters);
+    first.terms.splice(0..0, batch.terms);
+    Ok(pages)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1679,59 +1634,80 @@ impl Translator {
         let system = system_prompt(language);
         let mut bible = Bible::default();
         let mut dead: HashSet<String> = HashSet::new();
-        let mut results: Vec<Option<PageAnalysis>> = Vec::with_capacity(pages.len());
-        // The scene of the page read last: the next page goes on from it.
-        let mut previous = String::new();
+        let mut results: Vec<Option<PageAnalysis>> = (0..pages.len()).map(|_| None).collect();
         let usage_before = remote::token_usage();
 
-        for (number, page) in pages.iter().enumerate() {
+        // A window is `batch_pages` pages: the last `overlap_pages` pages of the window before
+        // it, read already and sent as context, then pages of its own. There is always at least
+        // one page of its own.
+        let mut next = 0;
+        while next < pages.len() {
             if stop() {
-                results.resize(pages.len(), None);
                 break;
             }
-            let count = page.segments.len();
-            let mut result = None;
+            let (context, own) =
+                window(next, pages.len(), config.batch_pages, config.overlap_pages);
+            let context: Vec<usize> = context.collect();
+            next = own.end;
+            // The pages of the window no model has read yet.
+            let mut pending: Vec<usize> = own.collect();
             for entry in &config.models {
+                if pending.is_empty() {
+                    break;
+                }
                 if dead.contains(&entry.model) {
                     continue;
                 }
-                // The whole page comes first, so that the panels that follow are read in its context.
-                let (images, view) = if !entry.vision {
-                    (Vec::new(), View::Text)
-                } else if page.panels.is_empty() {
-                    (vec![page.picture.clone()], View::Page)
-                } else {
-                    let mut images = vec![page.picture.clone()];
-                    images.extend(page.panels.iter().map(|panel| panel.picture.clone()));
-                    (images, View::PageAndPanels(&page.panels))
+                let expected: Vec<(usize, usize)> = pending
+                    .iter()
+                    .map(|&index| (index + 1, pages[index].segments.len()))
+                    .collect();
+                let user = {
+                    let listed = |indexes: &[usize], read: bool| -> Vec<Listed<'_>> {
+                        indexes
+                            .iter()
+                            .map(|&index| Listed {
+                                number: index + 1,
+                                page: &pages[index],
+                                read: if read { results[index].as_ref() } else { None },
+                            })
+                            .collect()
+                    };
+                    user_prompt(
+                        pages.len(),
+                        &listed(&context, true),
+                        &listed(&pending, false),
+                        &bible,
+                        entry.vision,
+                    )
                 };
-                // Shows in the log what the model is really sent: with `vision` off it is no
-                // picture at all, with panels it is the page and one picture for every panel.
+                // The pictures go in the order the pages are listed; with `vision` off there is
+                // none and the model reads the text only.
+                let images: Vec<String> = if entry.vision {
+                    context
+                        .iter()
+                        .chain(&pending)
+                        .map(|&index| pages[index].picture.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let (first, last) = (pending[0] + 1, pending[pending.len() - 1] + 1);
                 tracing::info!(
-                    page = number + 1,
-                    model = %entry.model,
+                    first,
+                    last,
+                    pages = pending.len(),
+                    context = context.len(),
                     images = images.len(),
-                    panels = page.panels.len(),
-                    view = match &view {
-                        View::Text => "text only",
-                        View::Page => "whole page",
-                        View::PageAndPanels(_) => "whole page and panels",
-                    },
-                    "sending the page to the analysis model"
+                    model = %entry.model,
+                    "sending pages to the analysis model"
                 );
                 let chat = remote::Chat {
                     system: system.clone(),
-                    user: user_prompt(
-                        number,
-                        pages.len(),
-                        &page.segments,
-                        &bible,
-                        Some(&previous),
-                        &view,
-                    ),
+                    user,
                     images,
-                    schema_name: "manga_page_analysis",
-                    schema: schema(count),
+                    schema_name: "manga_pages_analysis",
+                    schema: schema(&expected),
                 };
                 let generation = GenerationConfig {
                     reasoning: Some(entry.reasoning.unwrap_or(config.reasoning)),
@@ -1745,37 +1721,41 @@ impl Translator {
                         }
                         anyhow::Error::from(error)
                     })
-                    .and_then(|text| parse_page(&text, count));
+                    .and_then(|text| parse_batch(&text, &expected));
                 match attempt {
-                    Ok(output) => {
-                        result = Some((entry.model.clone(), output));
-                        break;
+                    Ok(outputs) => {
+                        for (number, output) in outputs {
+                            let index = number - 1;
+                            bible.merge_output(&output);
+                            let analysis = PageAnalysis::new(&output, &pages[index].segments, &bible);
+                            tracing::info!(
+                                page = number,
+                                model = %entry.model,
+                                corrections = analysis.corrections(),
+                                "page analysed"
+                            );
+                            results[index] = Some(analysis);
+                            pending.retain(|&page| page != index);
+                        }
+                        if !pending.is_empty() {
+                            tracing::warn!(
+                                model = %entry.model,
+                                unread = pending.len(),
+                                "analysis model left pages unread; trying the next one"
+                            );
+                        }
                     }
                     Err(error) => tracing::warn!(
-                        page = number + 1,
+                        first,
+                        last,
                         model = %entry.model,
                         error = %format!("{error:#}"),
-                        "analysis model could not read the page; trying the next one"
+                        "analysis model could not read the pages; trying the next one"
                     ),
                 }
             }
-            match result {
-                Some((model, output)) => {
-                    previous = clip(&output.scene, 400);
-                    bible.merge_output(&output);
-                    let analysis = PageAnalysis::new(&output, &page.segments, &bible);
-                    tracing::info!(
-                        page = number + 1,
-                        %model,
-                        corrections = analysis.corrections(),
-                        "page analysed"
-                    );
-                    results.push(Some(analysis));
-                }
-                None => {
-                    tracing::warn!(page = number + 1, "no analysis model could read the page");
-                    results.push(None);
-                }
+            for index in pending {
+                tracing::warn!(page = index + 1, "no analysis model could read the page");
             }
         }
 
@@ -1841,12 +1821,32 @@ impl Translator {
     }
 }
 
+/// One page as a model would answer for it alone: the tests read the pages this way.
+#[cfg(test)]
+fn parse_page(text: &str, count: usize) -> anyhow::Result<PageOutput> {
+    let json = json_object(text).ok_or_else(|| anyhow!("the answer holds no JSON object"))?;
+    let mut output: PageOutput = serde_json::from_str(json).context("invalid analysis JSON")?;
+    ensure!(
+        tidy(&mut output, count),
+        "the answer has no line for any of the {count} OCR lines"
+    );
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn sources(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    fn listed(number: usize, page: &AnalysisPage) -> Listed<'_> {
+        Listed {
+            number,
+            page,
+            read: None,
+        }
     }
 
     const ANSWER: &str = r#"{
@@ -1988,95 +1988,133 @@ mod tests {
         assert!(system.contains("for men and boys only"), "a word of one sex is not for the other");
         assert!(system.contains("The two directions of a pair fit each other"));
         assert!(!system_prompt(Language::English).contains("Vietnamese pronouns"));
-        let mut bible = Bible::default();
-        assert!(user_prompt(0, 2, &sources(&["a"]), &bible, None, &View::Page).contains("Known so far: nothing yet."));
-        bible.merge_output(&parse_page(ANSWER, 3).unwrap());
-        let user = user_prompt(1, 2, &sources(&["おい", "ゆう"]), &bible, Some("A hospital room."), &View::Text);
-        assert!(user.starts_with("Page 2 of 2. No picture is attached"));
-        assert!(user.contains("\"Sasaki\""));
-        assert!(user.contains("The previous page ended like this (the story goes on from it): A hospital room."));
-        assert!(user.contains("1: \"ゆう\""));
-        assert!(user.ends_with("(ids 0 to 1)."));
-    }
-
-    #[test]
-    fn panels_are_read_in_rows_from_top_to_bottom() {
-        // Two panels side by side (the left one starts a little higher), one below them.
-        let panels = [[0.0, 0.0, 95.0, 100.0], [100.0, 4.0, 200.0, 100.0], [0.0, 110.0, 200.0, 200.0]];
-        assert_eq!(reading_order(&panels, true), [1, 0, 2], "right to left");
-        assert_eq!(reading_order(&panels, false), [0, 1, 2], "left to right");
-        // Three tiers of different heights: the tall one on the right is read first.
-        let tiers = [
-            [100.0, 0.0, 200.0, 200.0],
-            [0.0, 0.0, 95.0, 90.0],
-            [0.0, 100.0, 95.0, 200.0],
-        ];
-        assert_eq!(reading_order(&tiers, true), [0, 1, 2]);
-        assert!(reading_order(&[], true).is_empty());
-    }
-
-    #[test]
-    fn a_line_goes_with_the_smallest_panel_that_holds_it_or_the_nearest_one() {
-        let panels = [[0.0, 0.0, 200.0, 200.0], [10.0, 10.0, 60.0, 60.0], [300.0, 0.0, 400.0, 100.0]];
-        let boxes = [
-            Some([20.0, 20.0, 40.0, 40.0]),   // inside the small panel too: the small one
-            Some([100.0, 100.0, 120.0, 120.0]), // only in the large one
-            Some([250.0, 40.0, 270.0, 60.0]), // in none: the nearest, the third
-            None,                             // no box: with the line before it
-        ];
-        assert_eq!(assign_segments(&panels, &boxes), [1, 0, 2, 2]);
-        assert_eq!(assign_segments(&panels, &[None]), [0]);
-    }
-
-    #[test]
-    fn a_panel_is_cut_with_a_margin_inside_the_page() {
-        assert_eq!(crop_rect([50.0, 50.0, 150.0, 150.0], 1000, 1000), Some((41, 41, 118, 118)));
-        assert_eq!(crop_rect([0.0, 0.0, 100.0, 100.0], 105, 1000), Some((0, 0, 105, 109)));
-        assert_eq!(crop_rect([10.0, 10.0, 20.0, 20.0], 1000, 1000), None, "too small");
-    }
-
-    #[test]
-    fn the_panels_are_listed_in_the_prompt() {
-        let panel = |lines: Vec<usize>| PanelPicture {
+        let page = |lines: &[&str]| AnalysisPage {
             picture: String::new(),
-            lines,
+            segments: sources(lines),
         };
-        let panels = [panel(vec![0, 1]), panel(vec![2])];
-        let user = user_prompt(0, 3, &sources(&["a", "b", "c"]), &Bible::default(), None, &View::PageAndPanels(&panels));
-        assert!(user.contains("3 pictures are attached. Picture 1 is the whole page"));
-        assert!(user.contains("The next 2 pictures are the panels"));
-        assert!(user.contains("Panel 1: lines 0, 1\nPanel 2: lines 2\n"));
-        assert!(!user.contains("The previous page"), "the first page has none");
-        assert!(user.contains("2: \"c\""));
+        let (one, two) = (page(&["a"]), page(&["おい", "ゆう"]));
+        let mut bible = Bible::default();
+        let first = user_prompt(2, &[], &[listed(1, &one)], &bible, true);
+        assert!(first.starts_with("The work has 2 pages. Pictures are attached"), "{first}");
+        assert!(first.contains("Known so far: nothing yet."));
+        assert!(first.contains("Page 1 (picture 1): answer for it. OCR lines (ids 0 to 0):\n0: \"a\"\n"));
+        assert!(!first.contains("read already"), "the first window has no context");
+
+        // A window of three pages: page 1 was read before (context), pages 2 and 3 are its own.
+        let output = parse_page(ANSWER, 3).unwrap();
+        bible.merge_output(&output);
+        let read_lines = page(&["おい ゆう", "りおさん さみしがつてるぞ", "…"]);
+        let read = PageAnalysis::new(&output, &read_lines.segments, &bible);
+        let context = Listed { number: 1, page: &read_lines, read: Some(&read) };
+        let three = page(&["x"]);
+        let user = user_prompt(3, &[context], &[listed(2, &two), listed(3, &three)], &bible, true);
+        assert!(user.contains("\"Sasaki\""), "what is known goes with the request");
+        assert!(user.contains("The pages marked as read already are context only"));
+        assert!(user.contains("Page 1 (picture 1): read already. What happened: A hospital room."), "{user}");
+        assert!(user.contains("0: \"おい ゆう\" [Sasaki -> Yuu]"), "{user}");
+        assert!(user.contains("Page 2 (picture 2): answer for it. OCR lines (ids 0 to 1):\n0: \"おい\"\n1: \"ゆう\"\n"));
+        assert!(user.contains("Page 3 (picture 3): answer for it."));
+        assert!(user.contains("Answer for pages 2, 3: one entry of `pages` for each"));
+        assert!(user.ends_with("(the ids restart at 0 on every page)."));
+        // Context comes before the pages to answer for, in the order of the pictures.
+        assert!(user.find("Page 1").unwrap() < user.find("Page 2").unwrap());
+
+        // Without pictures the pages are not numbered by picture.
+        let text = user_prompt(1, &[], &[listed(1, &two)], &bible, false);
+        assert!(text.starts_with("The work has 1 pages. No picture is attached"));
+        assert!(!text.contains("picture 1"));
+        assert!(text.contains("Answer for page 1:"));
     }
 
     #[test]
-    fn the_schema_bounds_the_ids() {
-        let value = schema(5);
-        assert_eq!(value["properties"]["lines"]["items"]["properties"]["id"]["maximum"], 4);
-        assert_eq!(value["required"][0], "lines");
+    fn windows_carry_the_last_pages_of_the_window_before() {
+        // 25 pages, twelve to a request, two repeated: twelve of its own, then ten, then three.
+        let (mut next, mut seen) = (0, Vec::new());
+        while next < 25 {
+            let (context, own) = window(next, 25, 12, 2);
+            next = own.end;
+            seen.push((context, own));
+        }
+        assert_eq!(seen, [(0..0, 0..12), (10..12, 12..22), (20..22, 22..25)]);
+        // The overlap never takes the whole window, and a batch of nothing is a batch of one.
+        assert_eq!(window(5, 20, 3, 9), (3..5, 5..6));
+        assert_eq!(window(4, 20, 0, 2), (4..4, 4..5));
+        assert_eq!(window(0, 0, 12, 2), (0..0, 0..0));
     }
 
     #[test]
-    fn the_default_chain_is_the_vision_model_then_deepseek() {
+    fn the_answer_of_a_window_is_read_page_by_page() {
+        let answer = r#"{
+            "characters": [{"name": "Sasaki", "gender": "man", "age": "adult"}, {"name": null}],
+            "terms": [{"kind": "name", "source": "りお", "target": "Rio"}],
+            "pages": [
+                {"page": "14", "summary": "Second.", "lines": [
+                    {"id": 0, "speaker": "Sasaki", "listener": "Rio", "self": "tôi", "you": "cô", "draft": "Chào."},
+                    {"id": 5, "speaker": "x", "listener": "y"}]},
+                {"page": 13, "scene": "First.", "lines": [
+                    {"id": 1, "speaker": "Sasaki", "listener": "Rio", "self": "tôi", "you": "cô"},
+                    {"id": 1, "speaker": "x", "listener": "y"}]},
+                {"page": 13, "lines": [{"id": 0, "speaker": "again", "listener": "y"}]},
+                {"page": 15, "lines": [{"id": 0, "speaker": "a", "listener": "b"}]},
+                {"page": 16, "lines": []},
+                {"lines": [{"id": 0, "speaker": "a", "listener": "b"}]}
+            ]
+        }"#;
+        // Pages 13 and 14 were asked for (3 and 1 lines), and 16 (2 lines).
+        let pages = parse_batch(answer, &[(13, 3), (14, 1), (16, 2)]).unwrap();
+        let numbers: Vec<usize> = pages.iter().map(|(number, _)| *number).collect();
+        assert_eq!(numbers, [13, 14], "in the order of the numbers; no repeats, strangers or empty pages");
+        assert_eq!(pages[0].1.lines.len(), 1, "the repeated id is dropped");
+        assert_eq!(pages[0].1.lines[0].speaker, "Sasaki");
+        assert_eq!(pages[1].1.lines.len(), 1, "line 5 is beyond the one line of page 14");
+        assert_eq!(pages[1].1.lines[0].draft, "Chào.");
+        // The people and the terms of the whole answer go with the first page.
+        assert_eq!(pages[0].1.characters.len(), 2);
+        assert_eq!(pages[0].1.terms.len(), 1);
+        assert!(pages[1].1.characters.is_empty());
+        let mut bible = Bible::default();
+        for (_, output) in &pages {
+            bible.merge_output(output);
+        }
+        assert_eq!(bible.characters.len(), 1, "an unnamed character is not kept");
+        assert_eq!(bible.terms.len(), 1);
+
+        let wrapped = format!("Here you go:\n```json\n{answer}\n```");
+        assert!(parse_batch(&wrapped, &[(13, 3)]).is_ok());
+        assert!(parse_batch("I cannot help with that.", &[(13, 3)]).is_err());
+        assert!(parse_batch(r#"{"pages": []}"#, &[(13, 3)]).is_err());
+        assert!(parse_batch(answer, &[(20, 3)]).is_err(), "no page that was asked for");
+    }
+
+    #[test]
+    fn the_schema_bounds_the_pages_and_the_ids() {
+        let value = schema(&[(3, 5), (4, 2)]);
+        let page = &value["properties"]["pages"]["items"]["properties"];
+        assert_eq!(page["lines"]["items"]["properties"]["id"]["maximum"], 4, "the longest page");
+        assert_eq!(page["page"]["enum"], json!([3, 4]));
+        assert_eq!(value["required"][0], "pages");
+    }
+
+    #[test]
+    fn the_default_chain_is_the_large_vision_model_then_the_small_one() {
         let config = AnalysisConfig::default();
         assert!(config.models.iter().all(|model| model.vision));
-        assert_eq!(config.models.len(), 2, "the nano omni model is gone");
+        assert_eq!(config.models.len(), 2);
         assert_eq!(config.models[0].model, NEMOTRON_VL);
-        assert_eq!(config.models[1].model, DEEPSEEK);
-        assert!(config.right_to_left);
-        assert!(config.models.iter().all(|model| !model.model.contains("nano")));
-        // DeepSeek translates every page after the vision model, without thinking.
-        assert!(config.translate && config.translate_models.len() == 1);
+        assert_eq!(config.models[1].model, NEMOTRON_BOLT);
+        assert_eq!((config.batch_pages, config.overlap_pages), (12, 2));
+        // The vision models only draft: the model the user chose translates, and DeepSeek takes
+        // over only when `translate` is turned on.
+        assert!(!config.translate);
         assert_eq!(config.translate_models[0].model, DEEPSEEK);
         assert_eq!(config.translate_models[0].reasoning, Some(false));
-        // An old file that names the panels of a model or the settings of the second reading
-        // is still read; those settings are gone.
+        // A file written for the panels of a page is still read; those settings are gone.
         let parsed: AnalysisConfig = serde_json::from_str(
-            r#"{"models": [{"model": "a/b", "panels": true}], "review": true, "review_models": []}"#,
+            r#"{"models": [{"model": "a/b", "panels": true}], "panel_max_dimension": 800, "right_to_left": false}"#,
         )
         .unwrap();
         assert!(parsed.enabled && parsed.models.len() == 1 && parsed.models[0].vision);
+        assert_eq!(parsed.batch_pages, 12);
     }
 
     #[test]
@@ -2310,12 +2348,13 @@ mod tests {
         assert!(system.contains("You are the first translator"));
         assert!(system.contains("- draft: the translation of `text` into Vietnamese"));
         assert!(system.contains("summary (one to three sentences"));
-        let schema = schema(2);
-        let line = &schema["properties"]["lines"]["items"];
+        let schema = schema(&[(1, 2)]);
+        let page = &schema["properties"]["pages"]["items"];
+        let line = &page["properties"]["lines"]["items"];
         assert!(line["required"].as_array().unwrap().iter().any(|name| name == "draft"));
         assert!(line["properties"]["draft"].is_object());
-        assert!(schema["properties"]["summary"].is_object());
-        assert!(schema["required"].as_array().unwrap().iter().any(|name| name == "summary"));
+        assert!(page["properties"]["summary"].is_object());
+        assert!(page["required"].as_array().unwrap().iter().any(|name| name == "summary"));
     }
 
     #[test]

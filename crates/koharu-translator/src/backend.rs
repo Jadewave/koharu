@@ -255,6 +255,16 @@ pub(crate) fn encode_image(image: &DynamicImage) -> anyhow::Result<EncodedImage>
     })
 }
 
+/// The picture of a page for the vision models of the analysis, as a data URL: lossless WebP.
+/// An inpainted page is mostly flat colour, which WebP stores in a small part of its size, and
+/// nothing is blurred: the numbers and the boxes drawn on the page and the small lettering of
+/// the balloons stay sharp. The pages of one request travel in one body, so their size adds up.
+pub(crate) fn encode_image_lossless(image: &DynamicImage) -> anyhow::Result<String> {
+    let rgb = image.to_rgb8();
+    let encoded = webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height()).encode_lossless();
+    Ok(format!("data:image/webp;base64,{}", STANDARD.encode(&*encoded)))
+}
+
 /// One entry of the glossary built while translating: a name, a recurring term, a
 /// character profile, or how one character addresses another. It is replayed to every model that translates later pages.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -281,3 +291,26 @@ impl TranslationContext {
         }
     }
             }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_analysis_picture_is_lossless_webp() {
+        // Flat areas with thin coloured lines, like a cleaned page with numbered boxes.
+        let mut page = RgbImage::from_pixel(120, 80, image::Rgb([255, 255, 255]));
+        for x in 10..110 {
+            page.put_pixel(x, 20, image::Rgb([220, 30, 30]));
+            page.put_pixel(x, 21, image::Rgb([17, 99, 201]));
+        }
+        let page = DynamicImage::ImageRgb8(page);
+        let url = encode_image_lossless(&page).unwrap();
+        let encoded = url.strip_prefix("data:image/webp;base64,").expect("a WebP data URL");
+        let bytes = STANDARD.decode(encoded).unwrap();
+        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(decoded, page.to_rgb8(), "no pixel changes");
+    }
+}

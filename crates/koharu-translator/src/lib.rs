@@ -24,7 +24,7 @@ use koharu_ml::Device;
 use error::{Error, Result};
 use local::LocalTranslator;
 
-pub use analysis::{AnalysisConfig, AnalysisModel, AnalysisPage, PageAnalysis, PanelLayout};
+pub use analysis::{AnalysisConfig, AnalysisModel, AnalysisPage, PageAnalysis};
 pub use remote::{TokenUsage, Tokens};
 pub use backend::{ExpectedPair, GlossaryEntry, TranslationContext, TranslationRequest};
 pub use polish::Polished;
