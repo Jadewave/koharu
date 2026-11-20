@@ -1,11 +1,14 @@
 //! Translation through local and hosted providers.
 
+mod address;
+mod analysis;
 mod backend;
 mod error;
 mod language;
 mod local;
 mod loop_guard;
 mod model;
+mod polish;
 mod prompt;
 mod provider;
 mod remote;
@@ -21,7 +24,17 @@ use koharu_ml::Device;
 use error::{Error, Result};
 use local::LocalTranslator;
 
-pub use backend::{GlossaryEntry, TranslationContext, TranslationRequest};
+pub use analysis::{AnalysisConfig, AnalysisModel, AnalysisPage, PageAnalysis};
+pub use remote::{TokenUsage, Tokens};
+pub use backend::{ExpectedPair, GlossaryEntry, TranslationContext, TranslationRequest};
+pub use polish::Polished;
+
+/// Whether a segment has anything to translate: sound effects made only of punctuation or
+/// placeholder glyphs do not, and are not sent to the model.
+#[must_use]
+pub fn needs_translation(text: &str) -> bool {
+    loop_guard::needs_translation(text)
+}
 pub use language::Language;
 pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
@@ -35,8 +48,6 @@ const GLOSSARY_MODEL: &str = "gemma4-26b-a4b-uncensored";
 const MEMORY_PAIRS: usize = 10;
 /// Each remembered line is cut to this many characters to keep the prompt short.
 const MEMORY_SEGMENT_CHARS: usize = 80;
-/// Remembered lines are dropped after this long without a translation (a new chapter).
-const MEMORY_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// The glossary is written once per run, after OCR has read every page and before the first
 /// page is translated. The glossary model reads this many source lines at a time...
@@ -47,21 +58,23 @@ const GLOSSARY_MAX_CHUNKS: usize = 200;
 /// Entries kept in the glossary; the oldest are dropped first.
 const GLOSSARY_MAX_ENTRIES: usize = 600;
 /// Each glossary field and each shown line is cut to this many characters.
-const GLOSSARY_FIELD_CHARS: usize = 120;
+const GLOSSARY_FIELD_CHARS: usize = 240;
 const GLOSSARY_LINE_CHARS: usize = 120;
 /// The glossary is complete, but a page is translated with only the entries that matter to
 /// it: at most this many, most useful kinds first.
 const GLOSSARY_BLOCK_MAX_ENTRIES: usize = 50;
-/// Character profiles carry the visual identities and relationships used to resolve the
-/// speakers on a page. Prefer profiles whose names occur in the current/recent dialogue.
+/// Character profiles carry the ages and relationships that decide how people address each
+/// other, so every page gets them, not only the pages that happen to repeat a name. At most
+/// this many.
 const GLOSSARY_CHARACTER_MAX_ENTRIES: usize = 16;
-/// Address pairs are useful even when a page never spells either character's name: the page
-/// image lets the translator match the visible speakers to the character profiles.
-const GLOSSARY_ADDRESS_MAX_ENTRIES: usize = 16;
+/// Address pairs that were given (not guessed) go to every page. At most this many.
+const GLOSSARY_ADDRESS_MAX_ENTRIES: usize = 24;
+/// Asked of the model when a translation opened with a subject its source line does not have.
+const NO_SUBJECT_NOTE: &str = "Strict retry: each of these lines was translated before with a wrong subject: either one (a pronoun or a name) that the source line does not contain, or 'con' / 'cháu' for a speaker who is not shown to be a child or a younger relative of the listener. Translate them again and start no line with a pronoun or a name unless the source line itself contains that subject or form of address. When the source states the speaker (I, 私, 我, 나), use a neutral 'tôi' (or the pronoun that fits the speaker's age and relationship), never 'con' or 'cháu' unless the line shows a family tie. Keep the speaker and the pronoun pair of every line as decided before.";
 /// Source text of this many previous pages also counts when picking a page's entries, so
 /// characters who are only implied on the page keep their pronouns.
 const MEMORY_PAGES: usize = 3;
-const MEMORY_PAGE_CHARS: usize = 1500;
+const MEMORY_PAGE_CHARS: usize = 4500;
 
 /// Names, terms and address pairs decided by the glossary model for one work.
 #[derive(Default)]
@@ -74,12 +87,34 @@ struct Glossary {
 impl Glossary {
     /// Starts over for another work or another target language; the same work keeps what it
     /// has, so a later run extends the glossary instead of rebuilding it.
-    fn begin(&mut self, project: &str, language: Language) {
-        if self.language != Some(language) || self.project.as_deref() != Some(project) {
+    /// Returns whether it started over.
+    fn begin(&mut self, project: &str, language: Language) -> bool {
+        let restart = self.language != Some(language) || self.project.as_deref() != Some(project);
+        if restart {
             self.entries.clear();
         }
         self.language = Some(language);
         self.project = Some(project.to_owned());
+        restart
+    }
+
+    /// Writes entries that were decided on purpose, by the analysis that read the whole work:
+    /// an entry of the same kind and source takes the new target, the others are added. A
+    /// later run of the same work thus replaces what an earlier one wrote.
+    fn replace(&mut self, entries: Vec<GlossaryEntry>) {
+        for entry in entries.into_iter().filter_map(clean_entry) {
+            let source = entry.source.to_lowercase();
+            match self
+                .entries
+                .iter_mut()
+                .find(|known| known.kind == entry.kind && known.source.to_lowercase() == source)
+            {
+                Some(known) => known.target = entry.target,
+                None => self.entries.push(entry),
+            }
+        }
+        let excess = self.entries.len().saturating_sub(GLOSSARY_MAX_ENTRIES);
+        self.entries.drain(..excess);
     }
 
     /// Adds entries that are not known yet. Existing entries win, so a rendering never
@@ -100,89 +135,37 @@ impl Glossary {
     }
 }
 
-/// `style` entries always apply; character profiles and address pairs are selected together
-/// so the translator can match visible speakers to the right directional pronoun pair.
-const GLOSSARY_KINDS: [&str; 5] = ["style", "character", "address", "name", "term"];
+/// `style` entries always apply; the others are ordered by how much they help a page.
+const GLOSSARY_KINDS: [&str; 5] = ["style", "address", "character", "name", "term"];
 
-fn address_names(source: &str) -> Option<(&str, &str)> {
-    source
-        .split_once("->")
-        .or_else(|| source.split_once('→'))
-        .map(|(speaker, listener)| (speaker.trim(), listener.trim()))
-}
-
-/// Treat common Japanese/Korean honorific suffixes as part of a name variant, not as a
-/// different character. Do not deduplicate by profile text: unrelated characters often share
-/// the same age, gender, and role.
-fn character_key(source: &str) -> String {
-    let source = source.trim().to_lowercase();
-    for suffix in [
-        "さん", "さま", "様", "ちゃん", "くん", "君", "先生", "先輩", "씨", "님",
-    ] {
-        if let Some(name) = source.strip_suffix(suffix) {
-            let name = name.trim();
-            if !name.is_empty() {
-                return name.to_owned();
-            }
-        }
-    }
-    source
-}
-
-/// Selects a compact page-specific glossary. Address pairs are included not only when a
-/// character name appears in OCR, but also when both endpoints have selected character
-/// profiles: speech bubbles normally contain dialogue, not the speakers' names.
+/// The entries that matter to a page, most useful kinds first: those whose source text
+/// appears in `corpus`, plus every `style`, `character` and `address` entry (a pair the model
+/// chose earlier applies to the next pages even when neither name is spoken on them).
 fn relevant_entries(entries: &[GlossaryEntry], corpus: &str) -> Vec<GlossaryEntry> {
     let corpus = corpus.to_lowercase();
     let mentioned = |text: &str| {
         let text = text.trim().to_lowercase();
         !text.is_empty() && corpus.contains(&text)
     };
-
-    // Put explicitly mentioned characters first, then fill the remaining slots with the
-    // work's other known profiles. The image can identify them even when their names are
-    // absent from OCR.
-    let mut seen_characters = std::collections::HashSet::new();
-    let mut characters: Vec<&GlossaryEntry> = entries
-        .iter()
-        .filter(|entry| {
-            entry.kind == "character" && seen_characters.insert(character_key(&entry.source))
-        })
-        .collect();
-    characters.sort_by_key(|entry| !mentioned(&entry.source));
-    characters.truncate(GLOSSARY_CHARACTER_MAX_ENTRIES);
-    let character_names: std::collections::HashSet<String> = characters
-        .iter()
-        .map(|entry| character_key(&entry.source))
-        .collect();
-
-    // Prefer pairs grounded by a name on this page/recent context. Also include pairs for
-    // two profiled characters, because the page image—not OCR text—identifies the speakers.
-    let mut addresses: Vec<(&GlossaryEntry, u8)> = entries
-        .iter()
-        .filter(|entry| entry.kind == "address")
-        .filter_map(|entry| {
-            let (speaker, listener) = address_names(&entry.source)?;
-            let name_mentioned = mentioned(speaker) || mentioned(listener);
-            let both_profiled = character_names.contains(&character_key(speaker))
-                && character_names.contains(&character_key(listener));
-            (name_mentioned || both_profiled)
-                .then_some((entry, if name_mentioned { 0 } else { 1 }))
-        })
-        .collect();
-    addresses.sort_by_key(|(_, priority)| *priority);
-    addresses.truncate(GLOSSARY_ADDRESS_MAX_ENTRIES);
-
     let mut selected: Vec<&GlossaryEntry> = entries
         .iter()
-        .filter(|entry| entry.kind == "style")
+        .filter(|entry| match entry.kind.as_str() {
+            "style" | "character" | "address" => true,
+            _ => mentioned(&entry.source),
+        })
         .collect();
-    selected.extend(characters);
-    selected.extend(addresses.into_iter().map(|(entry, _)| entry));
-    selected.extend(entries.iter().filter(|entry| {
-        matches!(entry.kind.as_str(), "name" | "term") && mentioned(&entry.source)
-    }));
-
+    let (mut characters, mut addresses) = (0, 0);
+    selected.retain(|entry| match entry.kind.as_str() {
+        "character" => {
+            characters += 1;
+            characters <= GLOSSARY_CHARACTER_MAX_ENTRIES
+        }
+        "address" => {
+            addresses += 1;
+            addresses <= GLOSSARY_ADDRESS_MAX_ENTRIES
+        }
+        _ => true,
+    });
     selected.sort_by_key(|entry| {
         GLOSSARY_KINDS
             .iter()
@@ -238,13 +221,13 @@ fn glossary_chunks(lines: &[String]) -> Vec<&[String]> {
         .collect()
 }
 
-/// The character profiles for the address pass: one per normalized name, so honorific
-/// variants do not become separate characters while different people with similar profiles do.
+/// The character profiles for the address pass: one per distinct profile, so a character the
+/// lines name in several ways is not counted twice, and no more than a page carries.
 fn distinct_characters(entries: &[GlossaryEntry]) -> Vec<GlossaryEntry> {
     let mut seen = std::collections::HashSet::new();
     entries
         .iter()
-        .filter(|entry| entry.kind == "character" && seen.insert(character_key(&entry.source)))
+        .filter(|entry| entry.kind == "character" && seen.insert(entry.target.clone()))
         .take(GLOSSARY_CHARACTER_MAX_ENTRIES)
         .cloned()
         .collect()
@@ -265,7 +248,6 @@ struct TranslationMemory {
     recent: VecDeque<TranslationContext>,
     /// Source text of the last few pages, to pick the glossary entries of implied characters.
     recent_pages: VecDeque<String>,
-    updated: Instant,
 }
 
 impl Default for TranslationMemory {
@@ -274,7 +256,6 @@ impl Default for TranslationMemory {
             language: None,
             recent: VecDeque::new(),
             recent_pages: VecDeque::new(),
-            updated: Instant::now(),
         }
     }
 }
@@ -287,6 +268,10 @@ pub struct Translator {
     glossary_model: Arc<tokio::sync::Mutex<Option<LoadedLocal>>>,
     memory: Arc<std::sync::Mutex<TranslationMemory>>,
     glossary: Arc<std::sync::Mutex<Glossary>>,
+    /// The pronoun pair of every direction (who speaks to whom) that the translations confirmed.
+    pairs: Arc<std::sync::Mutex<address::PairBook>>,
+    /// The story of the work as the analysis told it, for the model that translates every page.
+    story: Arc<std::sync::Mutex<polish::Story>>,
     client: reqwest::Client,
     device: Device,
 }
@@ -304,6 +289,19 @@ impl LoadedLocal {
 }
 
 impl Translator {
+    /// The tokens the models of the providers have used (by provider and model) since the last
+    /// `reset_token_usage`: the analysis, the translations and the glossary included. The local
+    /// model uses no provider and is not counted.
+    #[must_use]
+    pub fn token_usage(&self) -> TokenUsage {
+        remote::token_usage()
+    }
+
+    /// Starts counting the tokens from zero (a new run of a work).
+    pub fn reset_token_usage(&self) {
+        remote::reset_token_usage();
+    }
+
     pub fn from_config(
         device: Device,
         providers: koharu_config::Config<ProvidersConfig>,
@@ -314,6 +312,8 @@ impl Translator {
             glossary_model: Arc::new(tokio::sync::Mutex::new(None)),
             memory: Arc::new(std::sync::Mutex::new(TranslationMemory::default())),
             glossary: Arc::new(std::sync::Mutex::new(Glossary::default())),
+            pairs: Arc::new(std::sync::Mutex::new(address::PairBook::default())),
+            story: Arc::new(std::sync::Mutex::new(polish::Story::default())),
             client: koharu_runtime::http_client()?,
             device,
         })
@@ -435,11 +435,7 @@ impl Translator {
         } else if translatable.is_empty() {
             request.segments.clone()
         } else {
-            let mut subset = request.clone();
-            subset.segments = translatable
-                .iter()
-                .map(|&index| request.segments[index].clone())
-                .collect();
+            let subset = request.select(&translatable);
             let partial = self
                 .translate_segments(selection, generation, &subset)
                 .await?;
@@ -465,27 +461,289 @@ impl Translator {
             }
             .into());
         }
+        let translated = if request.target_language == Language::Vietnamese
+            && selection.provider == Provider::Local
+        {
+            self.with_consistent_pairs(selection, generation, &request, translated)
+                .await
+        } else {
+            translated
+        };
+        let translated = if request.target_language == Language::Vietnamese {
+            self.without_invented_subjects(selection, generation, &request, translated)
+                .await
+        } else {
+            translated
+        };
         self.remember(request.target_language, &request.segments, &translated);
         tracing::Span::current().record("outcome", "completed");
         Ok((provider_id, translated))
+    }
+
+    /// Keeps the pronoun pairs of the work consistent. For every line the model wrote who
+    /// speaks to whom and the pair of pronouns. A line whose pair (or self pronoun) differs from
+    /// the pair of its direction is translated again with that pair spelled out. A page the
+    /// analysis read has a pair for every line in its notes: its lines are held to those instead
+    /// of to the rest of their direction. The pairs the final translations show are remembered,
+    /// and a pair with enough evidence is locked: it goes to every later page as a glossary
+    /// `address` entry.
+    async fn with_consistent_pairs(
+        &self,
+        selection: &ModelSelection,
+        generation: GenerationConfig,
+        request: &TranslationRequest,
+        mut translated: Vec<String>,
+    ) -> Vec<String> {
+        let Ok(local) = self.local(selection).await else {
+            return translated;
+        };
+        let speakers = local.take_speakers();
+        let declare = |speakers: &std::collections::HashMap<String, String>, index: usize| {
+            speakers
+                .get(&request.segments[index])
+                .and_then(|speaker| address::parse_declared(speaker))
+        };
+        let think = |speakers: &std::collections::HashMap<String, String>, index: usize| {
+            speakers
+                .get(&request.segments[index])
+                .and_then(|speaker| address::parse_thought(speaker))
+        };
+        let mut declared: Vec<Option<address::Declared>> = (0..translated.len())
+            .map(|index| declare(&speakers, index))
+            .collect();
+        let mut thoughts: Vec<Option<address::Thought>> = (0..translated.len())
+            .map(|index| think(&speakers, index))
+            .collect();
+        // What the notes of the page decided for each line, when the analysis read the page.
+        let expected: Vec<Option<address::Declared>> = request
+            .pairs
+            .iter()
+            .map(|pair| pair.as_ref().and_then(address::Declared::expected))
+            .collect();
+        let noted = expected.iter().any(Option::is_some);
+        if declared.iter().all(Option::is_none) && !noted {
+            return translated;
+        }
+        let (pair_flagged, thought_flagged) = self
+            .pairs
+            .lock()
+            .map(|book| {
+                let pairs = if noted {
+                    address::conflicts_with_notes(&expected, &declared, &translated)
+                } else {
+                    book.conflicts(&declared, &translated)
+                };
+                (
+                    pairs,
+                    book.thought_conflicts(&thoughts, &declared, &translated),
+                )
+            })
+            .unwrap_or_default();
+        let mut flagged: Vec<usize> = pair_flagged
+            .iter()
+            .chain(&thought_flagged)
+            .copied()
+            .collect();
+        flagged.sort_unstable();
+        flagged.dedup();
+        if !flagged.is_empty() {
+            let note = self
+                .pairs
+                .lock()
+                .map(|book| {
+                    let mut notes: Vec<String> = Vec::new();
+                    if !pair_flagged.is_empty() {
+                        notes.push(if noted {
+                            address::notes_note(&expected, &flagged, &pair_flagged)
+                        } else {
+                            book.note(&declared, &pair_flagged)
+                        });
+                    }
+                    if !thought_flagged.is_empty() {
+                        notes.push(book.thought_note(&thoughts, &declared, &thought_flagged));
+                    }
+                    notes.join("\n")
+                })
+                .unwrap_or_default();
+            tracing::warn!(
+                count = flagged.len(),
+                sources = ?preview(&request.segments, &flagged),
+                "lines use another pair of pronouns than the rest of their direction; translating them again"
+            );
+            let mut retry = request.select(&flagged);
+            retry.drop_images();
+            retry.instructions = Some(match retry.instructions.take() {
+                Some(instructions) if !instructions.trim().is_empty() => {
+                    format!("{instructions}\n\n{note}")
+                }
+                _ => note,
+            });
+            match self.translate_segments(selection, generation, &retry).await {
+                Ok(retried) if retried.len() == flagged.len() => {
+                    let fresh = local.take_speakers();
+                    for (&index, text) in flagged.iter().zip(retried) {
+                        translated[index] = text;
+                        declared[index] = declare(&fresh, index);
+                        thoughts[index] = think(&fresh, index);
+                    }
+                }
+                Ok(_) => tracing::warn!(
+                    "the pronoun retry returned the wrong number of lines; keeping the first"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "the pronoun retry failed; keeping the first translation");
+                }
+            }
+            // A line that still disagrees is no evidence for any pair.
+            let still = self
+                .pairs
+                .lock()
+                .map(|book| {
+                    if noted {
+                        address::conflicts_with_notes(&expected, &declared, &translated)
+                    } else {
+                        book.conflicts(&declared, &translated)
+                    }
+                })
+                .unwrap_or_default();
+            for index in still {
+                declared[index] = None;
+            }
+        }
+        // A page with notes names its people by what they look like, not by name, and the notes
+        // decide its words: what the model wrote for them is no evidence of a pair between two
+        // characters, so nothing is learned from it.
+        if noted {
+            return translated;
+        }
+        if let Ok(mut book) = self.pairs.lock() {
+            let locked = book.learn(&declared, &translated);
+            if locked > 0 {
+                tracing::info!(locked, pairs = ?book.entries(), "pronoun pairs locked for this work");
+            }
+        }
+        translated
+    }
+
+    /// The names of the glossary: a line that holds one of them may rightly start with it.
+    fn glossary_names(&self) -> Vec<String> {
+        self.glossary
+            .lock()
+            .map(|glossary| {
+                glossary
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.kind == "name" || entry.kind == "character")
+                    .map(|entry| entry.source.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Translates again the lines that open with a subject their source does not have, with
+    /// the rule spelled out. A line that still has one afterwards keeps the new translation
+    /// and is reported.
+    async fn without_invented_subjects(
+        &self,
+        selection: &ModelSelection,
+        generation: GenerationConfig,
+        request: &TranslationRequest,
+        mut translated: Vec<String>,
+    ) -> Vec<String> {
+        let names = self.glossary_names();
+        let flagged: Vec<usize> = (0..translated.len())
+            .filter(|&index| {
+                loop_guard::needs_translation(&request.segments[index])
+                    && prompt::invented_subject(
+                        &request.segments[index],
+                        &translated[index],
+                        &names,
+                    )
+            })
+            .collect();
+        if flagged.is_empty() {
+            return translated;
+        }
+        tracing::warn!(
+            count = flagged.len(),
+            sources = ?preview(&request.segments, &flagged),
+            "translations open with a subject the source does not have; translating them again"
+        );
+        let mut retry = request.select(&flagged);
+        if selection.provider == Provider::Local {
+            retry.drop_images();
+        }
+        retry.instructions = Some(match retry.instructions.take() {
+            Some(instructions) if !instructions.trim().is_empty() => {
+                format!("{instructions}\n\n{NO_SUBJECT_NOTE}")
+            }
+            _ => NO_SUBJECT_NOTE.to_owned(),
+        });
+        match self.translate_segments(selection, generation, &retry).await {
+            Ok(retried) if retried.len() == flagged.len() => {
+                for (&index, text) in flagged.iter().zip(retried) {
+                    translated[index] = text;
+                }
+                let still: Vec<usize> = flagged
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        prompt::invented_subject(
+                            &request.segments[index],
+                            &translated[index],
+                            &names,
+                        )
+                    })
+                    .collect();
+                if !still.is_empty() {
+                    tracing::warn!(
+                        count = still.len(),
+                        sources = ?preview(&request.segments, &still),
+                        "lines still open with a subject the source does not have"
+                    );
+                }
+            }
+            Ok(_) => tracing::warn!("the second pass returned the wrong number of lines; keeping the first"),
+            Err(error) => tracing::warn!(%error, "the second pass failed; keeping the first translation"),
+        }
+        translated
     }
 
     /// The part of the glossary that matters to this page, as a prompt block. The glossary
     /// holds everything decided for the work; a page only carries the entries about the
     /// names, terms and characters on it (or on the pages just before it).
     fn glossary_block(&self, language: Language, segments: &[String]) -> Option<String> {
-        let glossary = self.glossary.lock().ok()?;
-        if glossary.language != Some(language) || glossary.entries.is_empty() {
-            return None;
+        let mut selected = Vec::new();
+        if let Ok(glossary) = self.glossary.lock()
+            && glossary.language == Some(language)
+            && !glossary.entries.is_empty()
+        {
+            let mut corpus = segments.join("\n");
+            if let Ok(memory) = self.memory.lock() {
+                for page in &memory.recent_pages {
+                    corpus.push('\n');
+                    corpus.push_str(page);
+                }
+            }
+            selected = relevant_entries(&glossary.entries, &corpus);
         }
-        let mut corpus = segments.join("\n");
-        if let Ok(memory) = self.memory.lock() {
-            for page in &memory.recent_pages {
-                corpus.push('\n');
-                corpus.push_str(page);
+        // The pairs the translations confirmed go to every page, whatever the glossary says.
+        if language == Language::Vietnamese
+            && let Ok(pairs) = self.pairs.lock()
+        {
+            for (source, target) in pairs.entries().into_iter().take(GLOSSARY_ADDRESS_MAX_ENTRIES) {
+                let known = selected.iter().any(|entry| {
+                    entry.kind == "address" && entry.source.eq_ignore_ascii_case(&source)
+                });
+                if !known {
+                    selected.push(GlossaryEntry {
+                        kind: "address".to_owned(),
+                        source,
+                        target,
+                    });
+                }
             }
         }
-        let selected = relevant_entries(&glossary.entries, &corpus);
         if selected.is_empty() {
             return None;
         }
@@ -507,8 +765,18 @@ impl Translator {
         lines: Vec<String>,
         stop: impl Fn() -> bool + Send + Sync,
     ) -> anyhow::Result<()> {
-        if let Ok(mut glossary) = self.glossary.lock() {
-            glossary.begin(project, language);
+        let restarted = self
+            .glossary
+            .lock()
+            .map(|mut glossary| glossary.begin(project, language))
+            .unwrap_or(false);
+        if restarted && let Ok(mut memory) = self.memory.lock() {
+            // Another work (or language): its first page must not see the lines of the last.
+            memory.recent.clear();
+            memory.recent_pages.clear();
+        }
+        if restarted && let Ok(mut pairs) = self.pairs.lock() {
+            pairs.clear();
         }
         if selection.provider != Provider::Local {
             return Ok(());
@@ -597,7 +865,7 @@ impl Translator {
         }
         // A line of OCR text does not say who speaks it, so the pairs are decided from the
         // character profiles the chunks wrote, once the whole work has been read.
-        if prompt::decides_address(language) && !stop() {
+        if prompt::PROFILES && prompt::decides_address(language) && !stop() {
             let characters = self
                 .glossary
                 .lock()
@@ -620,12 +888,13 @@ impl Translator {
         Ok(())
     }
 
-    /// Lines remembered from the previous pages, if they are still fresh.
+    /// Lines remembered from the previous pages of the same work and target language. They do
+    /// not expire: a work can take hours, and another work clears them when it begins.
     fn recall(&self, language: Language) -> Vec<TranslationContext> {
         let Ok(mut memory) = self.memory.lock() else {
             return Vec::new();
         };
-        if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
+        if memory.language != Some(language) {
             memory.recent.clear();
             memory.recent_pages.clear();
             return Vec::new();
@@ -638,7 +907,7 @@ impl Translator {
         let Ok(mut memory) = self.memory.lock() else {
             return;
         };
-        if memory.language != Some(language) || memory.updated.elapsed() > MEMORY_TTL {
+        if memory.language != Some(language) {
             memory.recent.clear();
             memory.recent_pages.clear();
         }
@@ -671,7 +940,6 @@ impl Translator {
         while memory.recent_pages.len() > MEMORY_PAGES {
             memory.recent_pages.pop_front();
         }
-        memory.updated = Instant::now();
     }
 
     /// Forgets the remembered lines and the glossary, e.g. when another work begins.
@@ -682,6 +950,12 @@ impl Translator {
         }
         if let Ok(mut glossary) = self.glossary.lock() {
             glossary.entries.clear();
+        }
+        if let Ok(mut pairs) = self.pairs.lock() {
+            pairs.clear();
+        }
+        if let Ok(mut story) = self.story.lock() {
+            *story = polish::Story::default();
         }
     }
 
@@ -772,16 +1046,12 @@ impl Translator {
             sources = ?preview(&request.segments, &redo),
             "reasoning pass produced looping segments; translating them again without reasoning"
         );
-        let mut retry = request.clone();
+        let mut retry = request.select(&redo);
         if selection.provider == Provider::Local {
-            // Encoding the page image on CPU takes minutes per call, so the local retry is
+            // Encoding the page images on CPU takes minutes per call, so the local retry is
             // text only.
-            retry.image = None;
+            retry.drop_images();
         }
-        retry.segments = redo
-            .iter()
-            .map(|&index| request.segments[index].clone())
-            .collect();
         let mut failed: Vec<usize> = Vec::new();
         let without_reasoning = GenerationConfig {
             reasoning: Some(false),
@@ -987,77 +1257,33 @@ mod tests {
         ];
         let selected = relevant_entries(&entries, "田中: おはよう\n霊力が足りない");
         let kinds: Vec<&str> = selected.iter().map(|e| e.kind.as_str()).collect();
-        // Character profiles precede their directional address pairs. A pair is included
-        // when one endpoint is mentioned in the recent dialogue, even if the other is not.
-        assert_eq!(kinds, ["style", "character", "address", "name", "term"]);
-        assert!(selected.iter().all(|entry| entry.source != "山田 → 佐藤"));
-        assert!(relevant_entries(&entries, "")
-            .iter()
-            .all(|entry| entry.kind == "style" || entry.kind == "character"));
+        // Character profiles and address pairs apply to every page, even when the names are
+        // not on it.
+        assert_eq!(
+            kinds,
+            ["style", "address", "address", "character", "name", "term"]
+        );
+        assert!(relevant_entries(&entries, "").iter().all(|entry| {
+            matches!(entry.kind.as_str(), "style" | "character" | "address")
+        }));
     }
 
     #[test]
-    fn address_pass_keeps_distinct_characters_with_identical_profiles() {
+    fn a_character_named_in_several_ways_is_counted_once_for_the_address_pass() {
         let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
             kind: kind.to_owned(),
             source: source.to_owned(),
             target: target.to_owned(),
         };
         let entries = vec![
-            entry("character", "りお", "Nữ, 27 tuổi"),
-            entry("character", "りおさん", "Nữ, 27 tuổi, nói nhỏ"),
-            entry("character", "常連", "Nữ, 27 tuổi"),
-            entry("name", "りお", "Rio"),
+            entry("character", "田中", "Nữ, 27 tuổi"),
+            entry("character", "田中さん", "Nữ, 27 tuổi"),
+            entry("name", "田中", "Tanaka"),
+            entry("character", "店主", "Nam, 56 tuổi"),
         ];
         let characters = distinct_characters(&entries);
         let names: Vec<&str> = characters.iter().map(|entry| entry.source.as_str()).collect();
-        assert_eq!(names, ["りお", "常連"]);
-    }
-
-    #[test]
-    fn address_pairs_are_available_when_names_are_absent_from_page_ocr() {
-        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
-            kind: kind.to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-        };
-        let entries = vec![
-            entry("character", "田中", "nam, 17 tuổi, học sinh"),
-            entry("character", "鈴木", "nữ, 17 tuổi, học sinh"),
-            entry("character", "山田", "nam, 30 tuổi"),
-            entry("character", "佐藤", "nữ, 30 tuổi"),
-            entry("address", "田中さん -> 鈴木くん", "tớ - cậu"),
-            entry("address", "山田 -> 佐藤", "tôi - cô"),
-        ];
-
-        let selected = relevant_entries(&entries, "本当に？");
-        let address_sources: Vec<&str> = selected
-            .iter()
-            .filter(|entry| entry.kind == "address")
-            .map(|entry| entry.source.as_str())
-            .collect();
-
-        assert_eq!(address_sources, ["田中さん -> 鈴木くん", "山田 -> 佐藤"]);
-    }
-
-    #[test]
-    fn address_pairs_outside_the_selected_cast_are_not_added_without_a_name_hit() {
-        let entry = |kind: &str, source: &str, target: &str| GlossaryEntry {
-            kind: kind.to_owned(),
-            source: source.to_owned(),
-            target: target.to_owned(),
-        };
-        let entries = vec![
-            entry("character", "田中", "nam, 17 tuổi"),
-            entry("character", "鈴木", "nữ, 17 tuổi"),
-            entry("character", "山田", "nam, 30 tuổi"),
-            entry("address", "田中 -> 鈴木", "tớ - cậu"),
-            entry("address", "山田 -> 佐藤", "tôi - cô"),
-        ];
-
-        let selected = relevant_entries(&entries, "本当に？");
-        assert!(selected.iter().any(|entry| entry.source == "田中 -> 鈴木"));
-        assert!(!selected.iter().any(|entry| entry.source == "山田 -> 佐藤"));
+        assert_eq!(names, ["田中", "店主"]);
     }
 
     #[test]
@@ -1073,6 +1299,26 @@ mod tests {
             entry("address", "田中 -> 鈴木", "anh - em"),
         ]);
         assert_eq!(glossary.entries, [entry("address", "田中 -> 鈴木", "tớ - cậu")]);
+    }
+
+    #[test]
+    fn a_decided_address_pair_replaces_the_one_of_an_earlier_run() {
+        let entry = |source: &str, target: &str| GlossaryEntry {
+            kind: "address".to_owned(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+        };
+        let mut glossary = Glossary::default();
+        glossary.merge(vec![entry("Sasaki -> Rio", "anh - em"), entry("Rio -> Sasaki", "em - anh")]);
+        glossary.replace(vec![entry("sasaki -> rio", "tôi - chị"), entry("Yuu -> Rio", "tớ - cậu")]);
+        assert_eq!(
+            glossary.entries,
+            [
+                entry("Sasaki -> Rio", "tôi - chị"),
+                entry("Rio -> Sasaki", "em - anh"),
+                entry("Yuu -> Rio", "tớ - cậu"),
+            ]
+        );
     }
 
     #[test]
@@ -1111,11 +1357,11 @@ mod tests {
             target: "Tanaka".to_owned(),
         };
         let mut glossary = Glossary::default();
-        glossary.begin("project-a", Language::Vietnamese);
+        assert!(glossary.begin("project-a", Language::Vietnamese));
         glossary.merge(vec![entry]);
-        glossary.begin("project-a", Language::Vietnamese);
+        assert!(!glossary.begin("project-a", Language::Vietnamese));
         assert_eq!(glossary.entries.len(), 1);
-        glossary.begin("project-b", Language::Vietnamese);
+        assert!(glossary.begin("project-b", Language::Vietnamese));
         assert!(glossary.entries.is_empty());
     }
 
