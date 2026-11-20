@@ -45,10 +45,6 @@ pub struct TranslationRequest {
     /// made none). The translator reads it as a draft to improve, not as the answer. Empty when
     /// there are no drafts.
     pub drafts: Vec<String>,
-    /// The request carries everything the model is given: the lines of the pages translated
-    /// before and the profiles of the characters are not added to it. The glossary still adds
-    /// the names and terms of the work.
-    pub standalone: bool,
 }
 
 impl TranslationRequest {
@@ -69,7 +65,6 @@ impl TranslationRequest {
             pairs: Vec::new(),
             speakers: false,
             drafts: Vec::new(),
-            standalone: false,
         }
     }
 
@@ -122,13 +117,6 @@ impl TranslationRequest {
         if drafts.len() == self.segments.len() && drafts.iter().any(|draft| !draft.trim().is_empty()) {
             self.drafts = drafts;
         }
-        self
-    }
-
-    /// Marks the request as complete in itself (see `standalone`).
-    #[must_use]
-    pub fn standalone(mut self) -> Self {
-        self.standalone = true;
         self
     }
 

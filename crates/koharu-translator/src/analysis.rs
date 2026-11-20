@@ -19,13 +19,8 @@
 //! pages. Every later one carries the last `analysis.overlap_pages` pages of the request before
 //! (two by default: read already, only there to show where the story left off, with what was
 //! decided for their lines), the story so far, what is known of the characters, and new pages
-//! for the rest. The model thinks before it answers and decides, for every line, who speaks,
-//! who listens and which words they use for "I" and "you". Pages that a model leaves out of its
-//! answer go to the next model of the chain, and a single page may be read with its panels (see
-//! `pages_per_request`).
-//!
-//! The model that translates afterwards (see `polish`) is not told the story: it follows the
-//! decisions for every line and the draft.
+//! for the rest. Pages that a model leaves out of its answer go to the next model of the chain,
+//! and a single page may be read with its panels (see `pages_per_request`).
 
 use std::{collections::HashSet, fmt::Write as _, sync::Arc};
 
@@ -71,7 +66,8 @@ pub struct AnalysisConfig {
     /// the vision model and the story of the work. Off: the draft of the vision model is the
     /// translation.
     pub translate: bool,
-    /// The size of the story so far sent with every request after the first, in characters.
+    /// The size of the story of the work, in characters: sent to the model of the translation
+    /// with every page, and to the vision model with every request after the first.
     pub story_chars: usize,
     /// How many pictures one request carries, one for each page. One page per request is the
     /// only way a page is sent with its panels.
@@ -80,8 +76,8 @@ pub struct AnalysisConfig {
     /// request before: they were read already and are only there for the model to see where
     /// the story left off. The rest of the request is new pages.
     pub overlap_pages: usize,
-    /// Lets the models think while they read, when the model does not say it itself. Slower
-    /// and it needs `max_tokens` to be large.
+    /// Lets the models think while they read a page. Slower and it needs `max_tokens` to be
+    /// large. Off by default.
     pub reasoning: bool,
     /// The most tokens the answer to one request may take: it holds the notes and the draft of
     /// every line of every page of the batch.
@@ -96,10 +92,10 @@ pub struct AnalysisConfig {
     pub right_to_left: bool,
 }
 
-/// The model that reads every batch first.
-const NEMOTRON_BOLT: &str = "nvidia/nemotron-3.5-bolt-e4b";
-/// The model that reads a batch when the first one fails or leaves pages out of its answer.
+/// The vision model of the analysis.
 const NEMOTRON_VL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
+/// The model that reads a batch when the vision model fails or leaves pages out of its answer.
+const NEMOTRON_BOLT: &str = "nvidia/nemotron-3.5-bolt-e4b";
 
 /// A model of the analysis chain.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -120,28 +116,25 @@ const fn yes() -> bool {
 
 impl Default for AnalysisConfig {
     fn default() -> Self {
-        // Both models think: who speaks to whom, and so which words they use for each other,
-        // is decided by reasoning over the pictures.
         let model = |name: &str| AnalysisModel {
             model: name.to_owned(),
             vision: true,
-            reasoning: Some(true),
+            reasoning: None,
         };
         Self {
             enabled: true,
-            models: vec![model(NEMOTRON_BOLT), model(NEMOTRON_VL)],
+            models: vec![model(NEMOTRON_VL), model(NEMOTRON_BOLT)],
             // The model the user chose for the translation (the local one) writes the final
             // translation of every page.
             translate: true,
             story_chars: 4000,
             pages_per_request: 12,
             overlap_pages: 2,
-            reasoning: true,
+            reasoning: false,
             // A page is answered with the notes and the draft of every line in about five
-            // thousand tokens, twelve pages share one answer and the thinking comes on top of
-            // it: a model that loops (the log of one page wrote the same phrase until the
-            // limit) is cut off at the limit.
-            max_tokens: 49152,
+            // thousand tokens, and twelve pages share one answer: a model that loops (the log
+            // of one page wrote the same phrase until the limit) is cut off at the limit.
+            max_tokens: 32768,
             image_max_dimension: 1600,
             panel_max_dimension: 1024,
             right_to_left: true,
@@ -557,6 +550,8 @@ impl Line {
 struct PageOutput {
     #[serde(deserialize_with = "lenient_string")]
     scene: String,
+    #[serde(deserialize_with = "lenient_string")]
+    page_note: String,
     characters: Vec<Character>,
     terms: Vec<Term>,
     lines: Vec<Line>,
@@ -572,6 +567,7 @@ fn schema(expected: usize) -> Value {
         "type": "object",
         "properties": {
             "scene": text("One or two sentences: where, when and what happens on this page."),
+            "page_note": text("What the translator must remember on this page: who is who (by sex, age and look, not by name), what to avoid."),
             "characters": {
                 "type": "array",
                 "items": {
@@ -640,8 +636,7 @@ fn schema(expected: usize) -> Value {
                         "exception": text("Why this line needs other words than the usual pair of its direction; empty otherwise."),
                         "draft": text("The translation of `text` into the target language, written with the words chosen in self and you; empty for a line with nothing to translate.")
                     },
-                    // Who speaks, to whom and with which words is decided for every line.
-                    "required": ["id", "kind", "speaker", "listener", "audience", "self", "you", "draft"]
+                    "required": ["id", "speaker", "listener", "draft"]
                 }
             },
             "summary": text("One to three sentences: what happens on this page, who does what to whom and why, so that the story can be followed from the summaries alone.")
@@ -723,11 +718,7 @@ group, 'unknown'. listener_desc and listener_basis work like speaker_desc and sp
 broadcast: say who they are in listener_desc: how old, which sex, how they stand to the speaker), \
 self (a thought or a talk to oneself) or unknown (it cannot be told, even from the context).
 - self and you: the words the speaker uses for themselves and for the listener in {target}, \
-chosen from age, sex, rank, closeness and manner of speaking. They are decided for every line, \
-speech and thought alike, and never left empty (a sound effect or a sign may have none). Decide \
-in this order: who speaks, who listens, how they stand to each other in this scene, then the \
-words. Name the speaker and the listener on every line, also when they are the same as on the \
-line before: the translator who comes after you has no picture and uses exactly your words.
+chosen from age, sex, rank, closeness and manner of speaking.
 - tone: two or three words (polite, rough, teasing, tender, scared, ...), read from the face, the \
 lettering, the punctuation and the story.
 - cues: what in the text of the line shows the register: the words for I and you (俺, 僕, 私, \
@@ -743,7 +734,7 @@ term on every page. A sound effect gets the word a {target} reader expects, a si
 translated too. No notes, no explanations, no brackets, no quotation marks around the line. \
 Empty for a line with nothing to translate.
 
-Also answer: scene, summary (one to \
+Also answer: scene, page_note (what the translator must remember on this page), summary (one to \
 three sentences: what happens on this page, who does what to whom and why; someone who reads \
 only the summaries has to be able to follow the story), characters \
 (new ones, or what you learned about known ones: name, aliases, gender, age, look, role, \
@@ -1379,6 +1370,46 @@ impl Bible {
         profile
     }
 
+    /// The cast of the whole work, one line for each character: the names (the translator reads
+    /// them in the lines), who they are, how they talk and what they call the others.
+    fn cast_lines(&self) -> Vec<String> {
+        self.characters
+            .iter()
+            .map(|character| {
+                let mut names = vec![character.name.trim().to_owned()];
+                names.extend(character.aliases.iter().take(3).map(|alias| alias.trim().to_owned()));
+                let mut line = names.join(" / ");
+                let who = Self::describe(character);
+                if !who.is_empty() {
+                    let _ = write!(line, ": {who}");
+                }
+                if !character.speech_style.trim().is_empty() {
+                    let _ = write!(line, "; speaks {}", clip(&character.speech_style, 60));
+                }
+                let calls: Vec<String> = character
+                    .relationships
+                    .iter()
+                    .filter(|relationship| {
+                        !relationship.self_word.trim().is_empty() && !relationship.you.trim().is_empty()
+                    })
+                    .take(6)
+                    .map(|relationship| {
+                        format!(
+                            "to {} \"{}\" / \"{}\"",
+                            clip(&relationship.with, 30),
+                            relationship.self_word.trim(),
+                            relationship.you.trim()
+                        )
+                    })
+                    .collect();
+                if !calls.is_empty() {
+                    let _ = write!(line, "; says {}", calls.join(", "));
+                }
+                clip(&line, 320)
+            })
+            .collect()
+    }
+
     /// A character as a reader sees them, without the name: sex, age, look and role
     /// ('young adult man, black hair and glasses, colleague'). Empty when nothing is known.
     fn describe(character: &Character) -> String {
@@ -1547,8 +1578,16 @@ pub struct PageAnalysis {
     /// The OCR lines the page was read with; the notes only apply while the page still has them.
     sources: Vec<String>,
     lines: Vec<AnalyzedLine>,
+    scene: String,
+    note: String,
     /// What happens on the page (the scene when the model wrote no summary).
     summary: String,
+    /// The profiles of the characters that speak or are spoken to on the page.
+    cast: Vec<String>,
+    /// The place of the page among the pages the work was read from, and their number: the
+    /// story of the work is told page by page in the same order.
+    position: usize,
+    total: usize,
 }
 
 impl PageAnalysis {
@@ -1591,18 +1630,23 @@ impl PageAnalysis {
         let mut page = Self {
             sources: sources.to_vec(),
             lines,
+            scene: clip(&output.scene, 400),
+            note: clip(&output.page_note, 600),
             summary: if output.summary.trim().is_empty() {
                 clip(&output.scene, 400)
             } else {
                 clip(&output.summary, 400)
             },
+            cast: Vec::new(),
+            position: 0,
+            total: 0,
         };
         page.refresh_who(bible);
         page
     }
 
     /// Writes who speaks and who listens on every line the way the notes describe people (sex,
-    /// age, look; never a name). Two people of the page that the
+    /// age, look; never a name), and the cast of the page. Two people of the page that the
     /// description does not tell apart get a letter, so that a description is one person.
     fn refresh_who(&mut self, bible: &Bible) {
         for line in &mut self.lines {
@@ -1657,6 +1701,13 @@ impl PageAnalysis {
                 }
             }
         }
+        self.cast = labels
+            .iter()
+            .map(|(index, label)| {
+                let style = bible.characters[*index].speech_style.trim();
+                if style.is_empty() { label.clone() } else { format!("{label}; speaks: {style}") }
+            })
+            .collect();
     }
 
     fn same_page(&self, current: &[String]) -> bool {
@@ -1713,6 +1764,12 @@ impl PageAnalysis {
         self.lines.iter().map(|line| line.draft.trim().to_owned()).collect()
     }
 
+    /// The place of the page among the pages the work was read from (0 until the work is read).
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
     /// What was decided for every line of the page, one line each, for the pages that go with
     /// the next request: who speaks to whom and the words for "I" and "you".
     fn decisions(&self) -> String {
@@ -1756,12 +1813,24 @@ impl PageAnalysis {
             return String::new();
         }
         let mut notes = String::from(
-            "Decisions of a vision model that read the pictures of this page, one for every \
-segment (the numbers are the ids of the segments): who speaks, to whom, the words the speaker \
-uses for themselves and for the listener, and the tone. People are described by their sex, age \
-and look, never by name: match every description to the person who speaks or listens. Use \
-exactly these words for \"I\" and \"you\" in every line.",
+            "Notes on this page from a vision model that read the picture and its panels. \
+People are described by their sex, age and look, never by name: match every description to the \
+person who speaks or listens. Follow the notes for who speaks to whom, for the words each \
+speaker uses for themselves and for the listener, and for the tone; the numbers are the ids of \
+the segments.",
         );
+        if !self.scene.is_empty() {
+            let _ = write!(notes, "\nScene: {}", self.scene);
+        }
+        if !self.note.is_empty() {
+            let _ = write!(notes, "\nNote: {}", self.note);
+        }
+        if !self.cast.is_empty() {
+            notes.push_str("\nPeople on this page:");
+            for entry in &self.cast {
+                let _ = write!(notes, "\n- {entry}");
+            }
+        }
         notes.push_str("\nSegments:");
         for (id, line) in self.lines.iter().enumerate() {
             // A line the vision model said nothing about gets no note, instead of a made-up one.
@@ -1970,6 +2039,24 @@ impl Translator {
             book.clear();
             let seeded = settle::seed_pairs(&mut book, &bible, &results);
             tracing::info!(seeded, "pronoun pairs of the analysis given to the translation");
+        }
+        // The story of the work, for the model that translates every page: what happens on each
+        // page, and who is who.
+        let total = results.len();
+        for (position, page) in results.iter_mut().enumerate() {
+            if let Some(page) = page {
+                page.position = position;
+                page.total = total;
+            }
+        }
+        if let Ok(mut story) = self.story.lock() {
+            *story = crate::polish::Story {
+                summaries: results
+                    .iter()
+                    .map(|page| page.as_ref().map(|page| page.summary.clone()).unwrap_or_default())
+                    .collect(),
+                cast: bible.cast_lines(),
+            };
         }
         tracing::info!(
             characters = bible.characters.len(),
@@ -2264,11 +2351,9 @@ mod tests {
         assert_eq!(texts[1], "りおさん、さみしがってるぞ");
         assert_eq!(texts[2], "…");
         let notes = analysis.instructions(&lines);
+        assert!(notes.contains("Scene: A hospital room."));
+        assert!(notes.contains("- young adult man, Rio's colleague; speaks: rough but kind"));
         assert!(notes.contains("never by name"));
-        // The decisions for the lines go to the model of the translation, the story does not.
-        assert!(!notes.contains("Scene:") && !notes.contains("Note:"), "{notes}");
-        assert!(!notes.contains("People on this page"), "{notes}");
-        assert!(!notes.contains("A hospital room"), "{notes}");
         // The speaker is described, not named; Yuu is nobody the work knows, so the label stays.
         assert!(notes.contains(
             "- 0 speech: young adult man, Rio's colleague -> Yuu; calls self \"tôi\", calls the listener \"cậu\"; tone: teasing"
@@ -2366,21 +2451,19 @@ mod tests {
     }
 
     #[test]
-    fn the_default_chain_is_the_small_model_then_the_large_one() {
+    fn the_default_chain_is_the_vision_model_then_the_small_one() {
         let config = AnalysisConfig::default();
         assert!(config.models.iter().all(|model| model.vision));
         assert_eq!(config.models.len(), 2);
-        assert_eq!(config.models[0].model, NEMOTRON_BOLT);
-        assert_eq!(config.models[1].model, NEMOTRON_VL);
+        assert_eq!(config.models[0].model, NEMOTRON_VL);
+        assert_eq!(config.models[1].model, NEMOTRON_BOLT);
         assert!(config.right_to_left);
         // Twelve pictures go in one request, two of them the last pages of the request before,
         // and the model of the translation writes the final text.
         assert_eq!(config.pages_per_request, 12);
         assert_eq!(config.overlap_pages, 2);
         assert!(config.translate);
-        // Both models think.
-        assert!(config.reasoning);
-        assert!(config.models.iter().all(|model| model.reasoning == Some(true)));
+        assert!(!config.reasoning);
         // An old file that names the panels of a model or the settings of the second reading
         // is still read; those settings are gone.
         let parsed: AnalysisConfig = serde_json::from_str(
@@ -2654,27 +2737,30 @@ mod tests {
         let analysis_scene = PageAnalysis::new(&scene, &sources(&["a"]), &Bible::default());
         assert_eq!(analysis_scene.summary(), "A hospital room.");
 
+        let image = std::sync::Arc::new(image::DynamicImage::new_rgb8(8, 8));
         let request = crate::polish::polish_request(
             &analysis,
             &lines,
             Language::Vietnamese,
             Some("Keep it light."),
+            "Story of the work, told by the vision model.",
+            Some(image),
         )
         .unwrap();
         let instructions = request.instructions.clone().unwrap();
-        // The user's words come first, then the decisions for the lines. No story.
+        // The user's words come first, then the story, then the notes of the page.
         let user = instructions.find("Keep it light.").unwrap();
-        let notes = instructions.find("Decisions of a vision model").unwrap();
-        assert!(user < notes, "{instructions}");
-        assert!(!instructions.contains("Story of the work"), "{instructions}");
-        assert!(request.standalone, "no remembered lines and no profiles are added");
+        let story = instructions.find("Story of the work").unwrap();
+        let notes = instructions.find("Notes on this page").unwrap();
+        assert!(user < story && story < notes, "{instructions}");
+        assert!(!instructions.contains("you do not see it"), "the translator sees the page");
                 assert_eq!(request.drafts, ["Này, Yuu.", "", "Rio-san kìa."]);
-        assert!(request.has_notes() && request.has_drafts() && request.image.is_none());
+        assert!(request.has_notes() && request.has_drafts() && request.image.is_some());
         assert_eq!(request.pairs.len(), 3);
         assert!(request.pairs[1].is_none(), "a sound effect has no pair");
         // Notes of another page are no notes for this one.
         assert!(
-            crate::polish::polish_request(&analysis, &sources(&["x"]), Language::Vietnamese, None).is_none()
+            crate::polish::polish_request(&analysis, &sources(&["x"]), Language::Vietnamese, None, "", None).is_none()
         );
     }
 
