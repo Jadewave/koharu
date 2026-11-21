@@ -36,7 +36,7 @@ mod settle;
 use crate::{
     Error, GenerationConfig, Language, Translator,
     backend::{ExpectedPair, GlossaryEntry, encode_image_lossless, shrink_to},
-    remote,
+    remote, script_guard,
 };
 
 /// The configuration section: `[analysis]`.
@@ -370,6 +370,45 @@ struct PageOutput {
     /// What happens on the page, for whoever reads only the summaries of the story.
     #[serde(deserialize_with = "lenient_string")]
     summary: String,
+}
+
+impl PageOutput {
+    /// Makes what the model wrote fit a target language that does not use Han, kana or hangul.
+    ///
+    /// A model that reads a Japanese page copies what it sees into the words it picks for "I"
+    /// and "you" (`yuu君`, `rioちゃん`), into its drafts and into the renderings of its terms.
+    /// The translation is held to those words, so they would reach the text of the balloons,
+    /// and a balloon with kana in it is laid out as vertical Japanese. The honorifics after a
+    /// Latin name become `-kun`, `-chan`, ...; a word of address that still holds such a
+    /// character is dropped (the translation then chooses the words) and so is a term whose
+    /// rendering does. What the model quoted from the page (`text`, `cues`) is not touched.
+    /// Returns how many fields were rewritten.
+    fn scrub_foreign_script(&mut self) -> usize {
+        fn rewrite(field: &mut String, fixed: impl FnOnce(&str) -> String) -> usize {
+            if !script_guard::has_cjk(field) {
+                return 0;
+            }
+            let fixed = fixed(field.as_str());
+            *field = fixed;
+            1
+        }
+        let mut changed = 0;
+        for line in &mut self.lines {
+            changed += rewrite(&mut line.self_word, script_guard::address_word);
+            changed += rewrite(&mut line.you, script_guard::address_word);
+            changed += rewrite(&mut line.draft, script_guard::latinize_honorifics);
+        }
+        for character in &mut self.characters {
+            for relationship in &mut character.relationships {
+                changed += rewrite(&mut relationship.self_word, script_guard::address_word);
+                changed += rewrite(&mut relationship.you, script_guard::address_word);
+            }
+        }
+        for term in &mut self.terms {
+            changed += rewrite(&mut term.target, script_guard::address_word);
+        }
+        changed
+    }
 }
 
 /// What the model answers for a window: what it learned about the people and the terms of all
@@ -1724,8 +1763,19 @@ impl Translator {
                     .and_then(|text| parse_batch(&text, &expected));
                 match attempt {
                     Ok(outputs) => {
-                        for (number, output) in outputs {
+                        for (number, mut output) in outputs {
                             let index = number - 1;
+                            if !language.uses_cjk() {
+                                let scrubbed = output.scrub_foreign_script();
+                                if scrubbed > 0 {
+                                    tracing::warn!(
+                                        page = number,
+                                        model = %entry.model,
+                                        scrubbed,
+                                        "the analysis wrote Han, kana or hangul into the words of address, the drafts or the terms; they were rewritten for the target language"
+                                    );
+                                }
+                            }
                             bible.merge_output(&output);
                             let analysis = PageAnalysis::new(&output, &pages[index].segments, &bible);
                             tracing::info!(
@@ -2407,5 +2457,37 @@ mod tests {
         assert!(
             crate::polish::polish_request(&analysis, &sources(&["x"]), Language::Vietnamese, None, "", None).is_none()
         );
+    }
+
+    #[test]
+    fn japanese_honorifics_in_the_words_of_the_model_are_written_for_the_target_language() {
+        let answer = r#"{
+            "characters": [{"name": "Sasaki", "relationships": [{"with": "Rio", "self": "tôi", "you": "rioさん"}]}],
+            "terms": [
+                {"kind": "name", "source": "りお", "target": "Rioちゃん"},
+                {"kind": "term", "source": "客", "target": "客"}
+            ],
+            "lines": [
+                {"id": 0, "kind": "speech", "text": "りおちゃん", "speaker": "Customer", "listener": "Rio",
+                 "self": "tôi", "you": "riocちゃん", "cues": "ちゃん", "draft": "Rioちゃん, đừng mà"},
+                {"id": 1, "kind": "speech", "text": "お前", "speaker": "Customer", "listener": "Rio",
+                 "self": "お前", "you": "yuu君"}
+            ]
+        }"#;
+        let mut output = parse_page(answer, 2).unwrap();
+        // you + draft, self + you, the relationship, the two terms.
+        assert_eq!(output.scrub_foreign_script(), 7);
+        assert_eq!(output.lines[0].you, "rioc-chan");
+        assert_eq!(output.lines[0].draft, "Rio-chan, đừng mà");
+        assert_eq!(output.lines[0].self_word, "tôi");
+        assert_eq!(output.lines[1].self_word, "", "a Japanese pronoun is no word of Vietnamese");
+        assert_eq!(output.lines[1].you, "yuu-kun");
+        assert_eq!(output.characters[0].relationships[0].you, "rio-san");
+        assert_eq!(output.terms[0].target, "Rio-chan");
+        assert_eq!(output.terms[1].target, "", "a term rendered in kanji is dropped");
+        // What the model quoted from the page stays as it was read.
+        assert_eq!(output.lines[0].text, "りおちゃん");
+        assert_eq!(output.lines[0].cues, "ちゃん");
+        assert_eq!(output.scrub_foreign_script(), 0, "nothing is left to rewrite");
     }
 }

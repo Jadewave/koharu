@@ -12,6 +12,7 @@ mod polish;
 mod prompt;
 mod provider;
 mod remote;
+mod script_guard;
 
 use std::{
     collections::VecDeque,
@@ -71,6 +72,12 @@ const GLOSSARY_CHARACTER_MAX_ENTRIES: usize = 16;
 const GLOSSARY_ADDRESS_MAX_ENTRIES: usize = 24;
 /// Asked of the model when a translation opened with a subject its source line does not have.
 const NO_SUBJECT_NOTE: &str = "Strict retry: each of these lines was translated before with a wrong subject: either one (a pronoun or a name) that the source line does not contain, or 'con' / 'cháu' for a speaker who is not shown to be a child or a younger relative of the listener. Translate them again and start no line with a pronoun or a name unless the source line itself contains that subject or form of address. When the source states the speaker (I, 私, 我, 나), use a neutral 'tôi' (or the pronoun that fits the speaker's age and relationship), never 'con' or 'cháu' unless the line shows a family tie. Keep the speaker and the pronoun pair of every line as decided before.";
+/// Asked of the model when a translation kept Han, kana or hangul that its language does not use.
+fn foreign_script_note(language: Language) -> String {
+    format!(
+        "Strict retry: each of these lines was translated before with Japanese, Chinese or Korean characters (kana, kanji, hangul) left in it, and {language} does not use them. Translate the lines again entirely in {language}: write every name and every honorific in Latin letters (Yuu-kun, Rio-chan, Sasaki-san), turn every other word into {language}, and keep no character of those scripts. Keep the speaker, the pronoun pair and the tone of every line as decided before."
+    )
+}
 /// Source text of this many previous pages also counts when picking a page's entries, so
 /// characters who are only implied on the page keep their pronouns.
 const MEMORY_PAGES: usize = 3;
@@ -461,6 +468,13 @@ impl Translator {
             }
             .into());
         }
+        // A name that keeps its Japanese honorific (`Yuu君`) is written the way the language
+        // does (`Yuu-kun`) before anything compares the lines with the pairs of the notes.
+        let translated = if request.target_language.uses_cjk() {
+            translated
+        } else {
+            script_guard::latinize_all(translated)
+        };
         let translated = if request.target_language == Language::Vietnamese
             && selection.provider == Provider::Local
         {
@@ -474,6 +488,12 @@ impl Translator {
                 .await
         } else {
             translated
+        };
+        let translated = if request.target_language.uses_cjk() {
+            translated
+        } else {
+            self.without_foreign_script(selection, generation, &request, translated)
+                .await
         };
         self.remember(request.target_language, &request.segments, &translated);
         tracing::Span::current().record("outcome", "completed");
@@ -705,6 +725,69 @@ impl Translator {
             }
             Ok(_) => tracing::warn!("the second pass returned the wrong number of lines; keeping the first"),
             Err(error) => tracing::warn!(%error, "the second pass failed; keeping the first translation"),
+        }
+        translated
+    }
+
+    /// Translates again the lines that kept some Han, kana or hangul in a language that does not
+    /// use them (a name copied with its Japanese honorific that `latinize_all` could not read, a
+    /// word left in the source language). Such a line is laid out as vertical Japanese by the
+    /// renderer. A line that is mostly of those scripts, or the source itself, is a sound or a
+    /// sign the model chose to leave and is not translated again. A line that still holds a
+    /// character afterwards keeps the new translation and is reported.
+    async fn without_foreign_script(
+        &self,
+        selection: &ModelSelection,
+        generation: GenerationConfig,
+        request: &TranslationRequest,
+        mut translated: Vec<String>,
+    ) -> Vec<String> {
+        let leaks = |index: usize, translated: &[String]| {
+            loop_guard::needs_translation(&request.segments[index])
+                && script_guard::leaks_foreign_script(&request.segments[index], &translated[index])
+        };
+        let flagged: Vec<usize> = (0..translated.len())
+            .filter(|&index| leaks(index, &translated))
+            .collect();
+        if flagged.is_empty() {
+            return translated;
+        }
+        tracing::warn!(
+            count = flagged.len(),
+            sources = ?preview(&request.segments, &flagged),
+            "translations keep Han, kana or hangul their language does not use; translating them again"
+        );
+        let note = foreign_script_note(request.target_language);
+        let mut retry = request.select(&flagged);
+        if selection.provider == Provider::Local {
+            retry.drop_images();
+        }
+        retry.instructions = Some(match retry.instructions.take() {
+            Some(instructions) if !instructions.trim().is_empty() => {
+                format!("{instructions}\n\n{note}")
+            }
+            _ => note,
+        });
+        match self.translate_segments(selection, generation, &retry).await {
+            Ok(retried) if retried.len() == flagged.len() => {
+                for (&index, text) in flagged.iter().zip(retried) {
+                    translated[index] = script_guard::latinize_honorifics(&text);
+                }
+                let still: Vec<usize> = flagged
+                    .iter()
+                    .copied()
+                    .filter(|&index| leaks(index, &translated))
+                    .collect();
+                if !still.is_empty() {
+                    tracing::warn!(
+                        count = still.len(),
+                        sources = ?preview(&request.segments, &still),
+                        "lines still keep Han, kana or hangul their language does not use"
+                    );
+                }
+            }
+            Ok(_) => tracing::warn!("the script retry returned the wrong number of lines; keeping the first"),
+            Err(error) => tracing::warn!(%error, "the script retry failed; keeping the first translation"),
         }
         translated
     }

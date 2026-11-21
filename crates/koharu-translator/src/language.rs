@@ -322,6 +322,16 @@ impl Language {
     pub fn tag(self) -> &'static str {
         self.get_str("tag").expect("every language has a tag")
     }
+
+    /// Whether the language is written with Han, kana or hangul. For every other language a
+    /// character of those scripts in a translation, or in the words chosen for it, is a mistake.
+    #[must_use]
+    pub const fn uses_cjk(self) -> bool {
+        matches!(
+            self,
+            Self::ChineseSimplified | Self::ChineseTraditional | Self::Japanese | Self::Korean
+        )
+    }
 }
 
 impl Serialize for Language {
@@ -357,6 +367,21 @@ mod tests {
         );
         assert_eq!("TL".parse(), Ok(Language::Filipino));
         assert!("not-a-language".parse::<Language>().is_err());
+    }
+
+    #[test]
+    fn only_the_cjk_languages_use_cjk_scripts() {
+        for language in [
+            Language::ChineseSimplified,
+            Language::ChineseTraditional,
+            Language::Japanese,
+            Language::Korean,
+        ] {
+            assert!(language.uses_cjk(), "{language}");
+        }
+        for language in [Language::Vietnamese, Language::English, Language::Thai, Language::Russian] {
+            assert!(!language.uses_cjk(), "{language}");
+        }
     }
 
     #[test]
