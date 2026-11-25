@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1
+#
+# koharu-server's image when the binary was already built outside Docker (by
+# .github/workflows/docker.yml, on an ubuntu-24.04 runner). It holds no compiler
+# and builds in minutes; the `Dockerfile` next to it builds everything from source
+# and is the one to use on a machine of your own.
+#
+# The context is a folder holding `koharu-server` (the release binary) and this
+# file as `Dockerfile`; the workflow stages it as `docker-ctx/`.
+
+FROM ubuntu:24.04 AS ort
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl python3-pip unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# ONNX Runtime for PP-OCRv6 manga, loaded at run time (`ort` `load-dynamic`).
+# Keep the version in step with the `ort` release pinned in Cargo.toml
+# (rc.10 expects ONNX Runtime 1.22.x).
+ARG ORT_VERSION=1.22.0
+RUN set -eux; \
+    mkdir -p /opt/ort /tmp/ort; \
+    if curl -fsSL --retry 3 --retry-delay 2 \
+        -o /tmp/ort/ort.tgz \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \
+       && tar -xzf /tmp/ort/ort.tgz -C /tmp/ort; then \
+        cp -L "/tmp/ort/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION}" /opt/ort/libonnxruntime.so; \
+    else \
+        echo "GitHub download failed, falling back to the PyPI wheel"; \
+        pip3 download "onnxruntime==${ORT_VERSION}" --no-deps --only-binary=:all: \
+            --break-system-packages -d /tmp/ort/whl; \
+        unzip -p /tmp/ort/whl/onnxruntime-*.whl "onnxruntime/capi/libonnxruntime.so.${ORT_VERSION}" \
+            > /opt/ort/libonnxruntime.so; \
+    fi; \
+    test -s /opt/ort/libonnxruntime.so; \
+    rm -rf /tmp/ort
+
+FROM ubuntu:24.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# libvulkan1 and mesa-vulkan-drivers (lavapipe) give the renderer a Vulkan
+# device on a machine with no GPU; the fonts are for lettering the page.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libfontconfig1 libfreetype6 libgomp1 libssl3 \
+    libvulkan1 mesa-vulkan-drivers fonts-dejavu-core fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+# Hugging Face runs a Space as user 1000.
+RUN mkdir -p /home/user/.koharu /home/user/.cache && chown -R 1000:1000 /home/user
+ENV HOME=/home/user
+ENV XDG_CACHE_HOME=/home/user/.cache
+
+WORKDIR /app
+COPY --chown=1000:1000 --chmod=755 koharu-server /app/koharu-server
+COPY --from=ort --chown=1000:1000 /opt/ort/libonnxruntime.so /app/libonnxruntime.so
+
+ENV LD_LIBRARY_PATH=/app
+ENV ORT_DYLIB_PATH=/app/libonnxruntime.so
+ENV WGPU_BACKEND=vulkan
+USER 1000
+
+EXPOSE 7860
+ENTRYPOINT ["/app/koharu-server"]
+CMD ["--host", "0.0.0.0", "--port", "7860"]
