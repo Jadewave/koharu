@@ -485,7 +485,9 @@ fn images(uploads: Vec<Upload>) -> Result<Vec<Vec<u8>>> {
                 .with_context(|| format!("{} isn't a ZIP or CBZ", upload.name))?;
             for index in 0..archive.len() {
                 let mut entry = archive.by_index(index)?;
-                let entry_name = entry.name().to_owned();
+                let Ok(entry_name) = entry.name().map(|name| name.into_owned()) else {
+                    continue;
+                };
                 if entry.is_dir() || ImageFormat::from_path(&entry_name).is_err() {
                     continue;
                 }
