@@ -149,7 +149,9 @@ jobs:
           image=koharu-server:candidate
 
           echo '::group::Shared libraries the binary can not find'
-          missing=$(docker run --rm --entrypoint ldd "$image" /app/koharu-server | grep 'not found' || true)
+          # ONNX Runtime is opened at run time, so check it as well as the binary.
+          missing=$(docker run --rm --entrypoint sh "$image" -c \
+            'ldd /app/koharu-server /app/libonnxruntime.so' | grep 'not found' || true)
           if [ -n "$missing" ]; then
             echo "$missing"
             echo '::error::the image lacks shared libraries the binary needs'
