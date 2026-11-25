@@ -1,0 +1,336 @@
+# Build, test and publish koharu-server to GHCR.
+#
+# GitHub does the heavy part (compiling the workspace, running the tests, building
+# the image). A Hugging Face Space then only pulls the finished image and runs it:
+# the last job rewrites the Space's one-line Dockerfile to `FROM <this image>@sha256:...`.
+#
+# One-time setup (see the notes at the bottom of this file):
+#   * make the GHCR package public after the first push;
+#   * for the Space: repository variable HF_SPACE (e.g. `you/koharu`) and secret HF_TOKEN.
+
+name: Build, test and publish Koharu server
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run the Rust tests (turn off to get an image out while tests are being fixed)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  # Cache-friendly and small: no incremental data, no debug info or symbols in the
+  # server binary (the workspace's own release profile keeps debug info for Sentry,
+  # which the server doesn't use).
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_DEBUG: '0'
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  # bindgen (koharu-bindgen) needs libclang.
+  LIBCLANG_PATH: /usr/lib/llvm-18/lib
+
+jobs:
+  build:
+    name: Build, test, smoke-test and push the image
+    # Pinned to 24.04, the same Ubuntu as the image's base: the binary is built here
+    # and copied in, so the glibc and the shared libraries have to match.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Name the image
+        id: name
+        run: |
+          # GHCR wants lower case; a repository name may not be.
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL"
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake curl git \
+            libclang-dev libclang-18-dev libssl-dev libfontconfig1-dev libfreetype-dev \
+            llvm-dev pkg-config
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: koharu-server
+          # Pull requests read the cache but don't write it.
+          save-if: ${{ github.event_name != 'pull_request' }}
+          # A failed build still leaves its compiled dependencies for the next run,
+          # which matters while the code is still being made to compile.
+          cache-on-failure: true
+
+      # The binary comes first: it's the quickest answer to "does it compile".
+      - name: Build koharu-server
+        run: cargo build --release --locked -p koharu-server
+
+      # --release, so the tests reuse the dependencies just compiled instead of
+      # building a second, debug copy of everything.
+      - name: Test
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
+        run: |
+          cargo test --release --locked --tests \
+            -p koharu-config \
+            -p koharu-runtime \
+            -p koharu-scene \
+            -p koharu-ml \
+            -p koharu-pipeline \
+            -p koharu-server
+
+      # The image holds only the finished binary, so building it takes minutes.
+      - name: Stage the image's build context
+        run: |
+          mkdir docker-ctx
+          cp target/release/koharu-server docker-ctx/koharu-server
+          cp Dockerfile.prebuilt docker-ctx/Dockerfile
+          ls -lh docker-ctx
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+
+      - name: Build the image (not pushed yet)
+        uses: docker/build-push-action@v7
+        with:
+          context: docker-ctx
+          push: false
+          load: true
+          tags: koharu-server:candidate
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+          image=koharu-server:candidate
+
+          echo '::group::Shared libraries the binary can not find'
+          missing=$(docker run --rm --entrypoint ldd "$image" /app/koharu-server | grep 'not found' || true)
+          if [ -n "$missing" ]; then
+            echo "$missing"
+            echo '::error::the image lacks shared libraries the binary needs'
+            exit 1
+          fi
+          echo none
+          echo '::endgroup::'
+
+          echo '::group::ONNX Runtime is there and the home folder is writable by the Space user'
+          # shellcheck disable=SC2016  # expanded by the shell inside the container
+          docker run --rm --entrypoint sh "$image" -c '
+            test -s "$ORT_DYLIB_PATH" && touch "$HOME/.koharu/.write-test" && id -u'
+          echo '::endgroup::'
+
+          docker run --detach --name koharu --publish 7860:7860 "$image"
+
+          up=
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:7860/api/health > /dev/null 2>&1; then
+              up=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$up" ]; then
+            echo '::error::the server never answered /api/health'
+            docker logs koharu || true
+            exit 1
+          fi
+
+          curl -fsS http://127.0.0.1:7860/api/health; echo
+          curl -fsS http://127.0.0.1:7860/api/config | head -c 600; echo
+          curl -fsS http://127.0.0.1:7860/ | grep -qi '<html'
+          curl -fsS http://127.0.0.1:7860/editor | grep -qi '<html'
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:7860/api/jobs/00000000-0000-0000-0000-000000000000)
+          test "$code" = 404 || { echo "an unknown job answered $code, not 404"; exit 1; }
+
+      # Informational: it needs the software Vulkan device (lavapipe) to draw the
+      # page, which nobody has run yet. It doesn't hold the image back.
+      - name: Render check (informational)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import struct, zlib
+          w = h = 96
+          raw = b''.join(b'\x00' + b'\xff\xff\xff' * w for _ in range(h))
+          def chunk(kind, data):
+              body = kind + data
+              return struct.pack('>I', len(data)) + body + struct.pack('>I', zlib.crc32(body) & 0xffffffff)
+          png = (b'\x89PNG\r\n\x1a\n'
+                 + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                 + chunk(b'IDAT', zlib.compress(raw))
+                 + chunk(b'IEND', b''))
+          open('/tmp/page.png', 'wb').write(png)
+          PY
+          reply=$(curl -fsS -F files=@/tmp/page.png -F stages=translate -F analyzer=off \
+            http://127.0.0.1:7860/api/jobs)
+          echo "$reply"
+          id=$(echo "$reply" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          # Don't let the run go on downloading models while the page is drawn.
+          curl -fsS -X POST http://127.0.0.1:7860/api/stop > /dev/null || true
+          curl -fsS -o /tmp/out.png "http://127.0.0.1:7860/api/jobs/$id/pages/1/image"
+          head -c 8 /tmp/out.png | grep -q PNG
+          echo "rendered $(stat -c %s /tmp/out.png) bytes"
+
+      - name: Container logs
+        if: always()
+        run: |
+          docker logs koharu 2>&1 | tail -n 200 || true
+          docker rm -f koharu > /dev/null 2>&1 || true
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The layers are already in the builder, so this only tags and uploads.
+      - name: Push the image
+        id: push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: docker-ctx
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Summary
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### Image published"
+            echo
+            echo '```'
+            echo "${{ steps.name.outputs.image }}@${{ steps.push.outputs.digest }}"
+            echo '```'
+            echo
+            echo "Tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Points the Hugging Face Space at the image that was just pushed. The Space's
+  # Dockerfile is one `FROM` line, so Hugging Face has nothing to compile; pinning
+  # the digest is what makes it rebuild (and so pull) on every new image.
+  deploy-space:
+    name: Point the Hugging Face Space at the new image
+    needs: build
+    if: >-
+      github.event_name != 'pull_request'
+      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      && vars.HF_SPACE != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout the Space's files
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: space
+          sparse-checkout-cone-mode: true
+
+      - name: Upload to the Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: ${{ vars.HF_SPACE }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HF_TOKEN" ]; then
+            echo '::error::the HF_TOKEN secret (a Hugging Face token with write access) is not set'
+            exit 1
+          fi
+          if [ -z "$DIGEST" ]; then
+            echo '::error::the build job gave no image digest'
+            exit 1
+          fi
+
+          mkdir out
+          cp space/README.md out/README.md
+          {
+            echo "# Generated by .github/workflows/docker.yml. Edit space/ in the GitHub repository."
+            echo "FROM ${IMAGE}@${DIGEST}"
+          } > out/Dockerfile
+          cat out/Dockerfile
+
+          pip install --quiet huggingface_hub
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          space = os.environ["HF_SPACE"]
+          api.create_repo(space, repo_type="space", space_sdk="docker", exist_ok=True)
+          api.upload_folder(
+              folder_path="out",
+              repo_id=space,
+              repo_type="space",
+              commit_message=f"Deploy {os.environ['GITHUB_SHA'][:7]}",
+          )
+          print(f"uploaded to https://huggingface.co/spaces/{space}")
+          PY
+
+# Notes
+#
+# GHCR package visibility
+#   Hugging Face pulls the image without credentials, so the package must be public:
+#   GitHub profile -> Packages -> koharu -> Package settings -> Change visibility.
+#   (A package pushed from a public repository by this workflow usually starts out
+#   public; check it after the first run.)
+#
+# Hugging Face Space
+#   Repository variable  HF_SPACE  = <user or org>/<space name>
+#   Repository secret    HF_TOKEN  = a Hugging Face token with write access
+#   The Space's own secrets and variables (KOHARU_SECRET_*, KOHARU_*) are set on
+#   Hugging Face, never in this repository.
+#
+# Without HF_SPACE the last job is skipped; the image is still pushed.
