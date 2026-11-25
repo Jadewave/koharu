@@ -1,0 +1,70 @@
+//! Unicode script detection and shaping direction.
+
+use harfrust::{Script, Tag};
+use icu_properties::{
+    CodePointMapData,
+    props::{NamedEnumeratedProperty, Script as IcuScript},
+};
+
+/// Returns the distinct ISO 15924 scripts Fontique should use for fallback.
+pub(crate) fn fontique_scripts(text: &str) -> Vec<fontique::Script> {
+    let script_map = CodePointMapData::<IcuScript>::new();
+    let mut scripts = Vec::new();
+    let mut has_emoji = false;
+    for character in text.chars() {
+        let script = script_map.get(character);
+        if script == IcuScript::Common || script == IcuScript::Inherited {
+            has_emoji |= character >= '\u{1F000}';
+            continue;
+        }
+        let script = fallback_script(script);
+        let Some(tag) = script_tag(script) else {
+            continue;
+        };
+        let script = fontique::Script::from_bytes(tag);
+        if !scripts.contains(&script) {
+            scripts.push(script);
+        }
+    }
+    if has_emoji {
+        let emoji = fontique::Script::from_bytes(*b"Zsye");
+        if !scripts.contains(&emoji) {
+            scripts.push(emoji);
+        }
+    }
+    if scripts.is_empty() {
+        scripts.push(fontique::Script::from_bytes(*b"Latn"));
+    }
+    scripts
+}
+
+/// The language of a text that names none, from scripts only one language
+/// writes: kana is Japanese and Hangul Korean. Han falls back to Chinese.
+pub(crate) fn implied_language(text: &str) -> Option<&'static str> {
+    let scripts = CodePointMapData::<IcuScript>::new();
+    let mut korean = false;
+    for character in text.chars() {
+        match scripts.get(character) {
+            IcuScript::Hiragana | IcuScript::Katakana => return Some("ja"),
+            IcuScript::Hangul => korean = true,
+            _ => {}
+        }
+    }
+    korean.then_some("ko")
+}
+
+pub(crate) fn harfrust_script(script: IcuScript) -> Option<Script> {
+    Script::from_iso15924_tag(Tag::new(&script_tag(fallback_script(script))?))
+}
+
+fn fallback_script(script: IcuScript) -> IcuScript {
+    match script {
+        IcuScript::Hiragana | IcuScript::Katakana | IcuScript::Bopomofo => IcuScript::Han,
+        other => other,
+    }
+}
+
+fn script_tag(script: IcuScript) -> Option<[u8; 4]> {
+    let bytes = script.short_name().as_bytes();
+    (bytes.len() == 4).then(|| [bytes[0], bytes[1], bytes[2], bytes[3]])
+}

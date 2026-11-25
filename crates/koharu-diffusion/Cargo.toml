@@ -1,0 +1,18 @@
+[package]
+name = "koharu-diffusion"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+publish.workspace = true
+
+[dependencies]
+image = { workspace = true }
+koharu-diffusion-sys = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

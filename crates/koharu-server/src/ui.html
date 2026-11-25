@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Koharu</title>
+<style>
+:root {
+  --paper: #f6f1e7; --card: #fffdf8; --ink: #1c1a17; --mute: #6f685d; --line: #ddd4c3;
+  --red: #c8321e; --red-ink: #fff; --ok: #2f7d4f; --dots: rgba(28,26,23,.09);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --paper: #15130f; --card: #1e1b16; --ink: #f1ebdd; --mute: #a39b8b; --line: #3a352c;
+    --red: #e2553f; --red-ink: #170d0a; --ok: #6cc08b; --dots: rgba(241,235,221,.07); color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+html { background: var(--paper); }
+body { margin: 0; color: var(--ink); font: 15px/1.5 "Hiragino Sans", "Noto Sans", system-ui, sans-serif;
+  background-image: radial-gradient(var(--dots) 1px, transparent 1.5px); background-size: 9px 9px;
+  min-height: 100vh; padding: env(safe-area-inset-top, 0) 0 env(safe-area-inset-bottom, 0); }
+main { max-width: 1100px; margin: 0 auto; padding: 28px 18px 60px; }
+header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
+h1 { margin: 0; font: 700 44px/1 "Hiragino Mincho ProN", "Noto Serif JP", Georgia, serif; letter-spacing: .02em; }
+h1 span { color: var(--red); }
+.tag { color: var(--mute); font-size: 13px; }
+.card { background: var(--card); border: 1.5px solid var(--ink); border-radius: 4px; padding: 18px;
+  box-shadow: 5px 5px 0 var(--ink); margin-bottom: 26px; }
+h2 { margin: 0 0 12px; font: 700 17px/1.2 "Hiragino Mincho ProN", "Noto Serif JP", Georgia, serif; }
+.drop { border: 2px dashed var(--mute); border-radius: 4px; padding: 26px; text-align: center; cursor: pointer; color: var(--mute); }
+.drop.over, .drop:focus-visible { border-color: var(--red); color: var(--ink); outline: none; }
+.drop b { color: var(--ink); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-top: 14px; }
+label { display: block; font-size: 12px; color: var(--mute); letter-spacing: .04em; text-transform: uppercase; }
+input, select, textarea { width: 100%; margin-top: 4px; padding: 8px 10px; font: inherit; color: var(--ink);
+  background: var(--paper); border: 1.5px solid var(--line); border-radius: 3px; }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--red); outline-offset: 1px; border-color: transparent; }
+textarea { resize: vertical; min-height: 40px; }
+button { font: inherit; font-weight: 600; cursor: pointer; padding: 9px 16px; border: 1.5px solid var(--ink);
+  border-radius: 3px; background: var(--card); color: var(--ink); }
+button.go { background: var(--red); color: var(--red-ink); border-color: var(--red); }
+button:disabled { opacity: .5; cursor: default; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+.grow { flex: 1; }
+.bars { display: grid; gap: 8px; margin: 10px 0; }
+.bar { display: grid; grid-template-columns: 90px 1fr 56px; gap: 10px; align-items: center; font-size: 13px; }
+.track { height: 10px; border: 1.5px solid var(--ink); border-radius: 2px; overflow: hidden; }
+.fill { height: 100%; width: 0; background: var(--red); transition: width .4s; }
+.bar.full .fill { background: var(--ok); }
+.note { color: var(--mute); font-size: 13px; }
+.err { color: var(--red); font-weight: 600; }
+.reader { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 20px; }
+@media (max-width: 800px) { .reader { grid-template-columns: 1fr; } }
+.page { border: 1.5px solid var(--ink); background: #fff; line-height: 0; }
+.page img { width: 100%; height: auto; display: block; }
+.blocks { max-height: 78vh; overflow: auto; display: grid; gap: 10px; align-content: start; padding-right: 4px; }
+.block { border-left: 4px solid var(--red); padding: 4px 0 4px 10px; }
+.block .src { font-size: 13px; color: var(--mute); margin: 0; }
+.block.fresh { border-left-color: var(--ok); }
+.lib { display: grid; gap: 8px; }
+.item { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; border-bottom: 1px dashed var(--line); padding-bottom: 8px; }
+.item:last-child { border-bottom: 0; padding-bottom: 0; }
+.item .t { font-weight: 600; overflow-wrap: anywhere; }
+.badge { display: inline-block; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; padding: 1px 7px;
+  border: 1.5px solid var(--mute); border-radius: 10px; color: var(--mute); margin-left: 6px; }
+.badge.done, .badge.saved { border-color: var(--ok); color: var(--ok); }
+.badge.failed, .badge.interrupted, .badge.stopped { border-color: var(--red); color: var(--red); }
+.item button { padding: 5px 10px; font-size: 13px; }
+.checks { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+.checks label { display: inline-flex; gap: 5px; align-items: center; text-transform: none; font-size: 13px; letter-spacing: 0; color: var(--ink); }
+.checks input { width: auto; margin: 0; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Koharu<span>.</span></h1>
+    <span class="tag" id="info">connecting…</span>
+  </header>
+
+  <section class="card" id="library" hidden>
+    <h2>Saved works</h2>
+    <div class="lib" id="lib"></div>
+  </section>
+
+  <section class="card" id="start">
+    <h2>Translate a chapter, or open a project</h2>
+    <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose pages">
+      <b>Drop pages here</b> or click to choose images, one ZIP/CBZ, or one <b>.khr</b> project<br>
+      <span id="picked" class="note">no files yet</span>
+    </div>
+    <input id="files" type="file" accept="image/*,.zip,.cbz,.khr" multiple hidden>
+    <div class="grid">
+      <label>Name<input id="name" placeholder="defaults to the first file’s name"></label>
+      <label>Target language<input id="target" list="languages" placeholder="English"></label>
+      <label>Translation model<input id="translator" placeholder="vendor/model"></label>
+      <label>Analyzer model<input id="analyzer" placeholder="openai-compatible/…  (off = none)"></label>
+      <label>Batch: pages per analyzer request<input id="analyzer_pages" type="number" min="1" max="32" placeholder="12 (1 = one page at a time)"></label>
+      <label>Batch overlap (context pages)<input id="analyzer_overlap" type="number" min="0" max="16" placeholder="2"></label>
+      <label>Analyzer image size (px) / WebP quality
+        <span style="display:flex;gap:6px"><input id="analyzer_size" type="number" min="256" max="4096" placeholder="1600"><input id="analyzer_quality" type="number" min="1" max="100" placeholder="90"></span>
+      </label>
+      <label>OCR
+        <select id="recognizer">
+          <option value="">server default</option>
+          <option value="hayai-ocr">Hayai OCR</option>
+          <option value="pp-ocr-v6-manga">PP-OCRv6 Manga</option>
+          <option value="baberu-ocr">Baberu OCR</option>
+          <option value="manga-ocr-ar">Manga OCR AR</option>
+        </select>
+      </label>
+    </div>
+    <label style="margin-top:12px">Instructions<textarea id="instructions" rows="2" placeholder="Names, tone, honorifics…"></textarea></label>
+    <div class="row">
+      <button class="go" id="run" disabled>Start</button>
+      <span class="note grow" id="startnote"></span>
+    </div>
+    <datalist id="languages">
+      <option>English</option><option>Vietnamese</option><option>Simplified Chinese</option>
+      <option>Traditional Chinese</option><option>Korean</option><option>Japanese</option>
+      <option>French</option><option>Spanish</option><option>German</option>
+      <option>Indonesian</option><option>Thai</option><option>Portuguese</option><option>Russian</option>
+    </datalist>
+  </section>
+
+  <section class="card" id="progress" hidden>
+    <h2>Progress</h2>
+    <div class="bars" id="bars"></div>
+    <div class="row">
+      <span class="note grow" id="activity"></span>
+      <button id="stop">Stop</button>
+    </div>
+    <p class="err" id="error" hidden></p>
+  </section>
+
+  <section class="card" id="result" hidden>
+    <h2>Result</h2>
+    <div class="row" style="margin-top:0">
+      <button id="prev" aria-label="Previous page">←</button>
+      <span id="where" class="note">page 1</span>
+      <button id="next" aria-label="Next page">→</button>
+      <button id="toggle">Show original</button>
+      <span class="grow"></span>
+      <a id="cbz"><button>Download CBZ</button></a>
+      <a id="psd"><button>Download PSD</button></a>
+      <a id="khr"><button>Download .khr</button></a>
+      <a id="edit"><button class="go">Open editor</button></a>
+    </div>
+    <div class="row checks" id="rerun">
+      <span class="note">Run again with the settings above:</span>
+      <label><input type="checkbox" value="detect">detect</label>
+      <label><input type="checkbox" value="recognize">recognize</label>
+      <label><input type="checkbox" value="inpaint">inpaint</label>
+      <label><input type="checkbox" value="translate" checked>translate</label>
+      <button id="again">Run</button>
+    </div>
+    <div class="reader" style="margin-top:14px">
+      <div class="page"><img id="img" alt="Translated page"></div>
+      <div class="blocks" id="blocks"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const STAGES = ['detect', 'recognize', 'inpaint', 'translate'];
+const SETTINGS = ['target', 'translator', 'analyzer', 'analyzer_pages', 'analyzer_overlap', 'analyzer_size', 'analyzer_quality', 'recognizer', 'instructions'];
+let files = [], job = null, pages = 0, page = 1, original = false, blocks = [], timer = null;
+
+const api = async (path, options) => {
+  const response = await fetch(path, options);
+  if (!response.ok) {
+    let message = response.statusText;
+    try { message = (await response.json()).error || message; } catch (_) {}
+    throw new Error(message);
+  }
+  return response;
+};
+
+fetch('/api/config').then((r) => r.json()).then((c) => {
+  $('info').textContent = `translator ${c.translator} · analyzer ${c.analyzer || 'off'} · OCR ${c.recognizer}`;
+  $('target').placeholder = c.target;
+  $('translator').placeholder = c.translator;
+}).catch(() => { $('info').textContent = 'server unreachable'; });
+
+const isProject = () => files.length === 1 && /\.khr$/i.test(files[0].name);
+const pick = (list) => {
+  files = [...list];
+  $('picked').textContent = files.length ? `${files.length} file${files.length > 1 ? 's' : ''} chosen` : 'no files yet';
+  $('run').disabled = !files.length;
+  $('run').textContent = isProject() ? 'Open project' : 'Start';
+};
+const drop = $('drop');
+drop.onclick = () => $('files').click();
+drop.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('files').click(); } };
+$('files').onchange = (e) => pick(e.target.files);
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); pick(e.dataTransfer.files); };
+
+$('run').onclick = async () => {
+  const form = new FormData();
+  files.forEach((f) => form.append('files', f, f.name));
+  for (const key of ['name', ...SETTINGS]) {
+    if ($(key).value.trim()) form.append(key, $(key).value.trim());
+  }
+  $('run').disabled = true;
+  $('startnote').textContent = 'uploading…';
+  try {
+    const made = await (await api('/api/jobs', { method: 'POST', body: form })).json();
+    $('startnote').textContent = '';
+    $('startnote').className = 'note grow';
+    follow(made.id, made.pages);
+    library();
+  } catch (error) {
+    $('startnote').textContent = error.message;
+    $('startnote').className = 'note grow err';
+    $('run').disabled = false;
+  }
+};
+
+function follow(id, count) {
+  job = id; pages = count; page = 1;
+  location.hash = id;
+  $('progress').hidden = false;
+  $('result').hidden = true;
+  $('error').hidden = true;
+  $('bars').replaceChildren(...STAGES.map((stage) => {
+    const row = document.createElement('div');
+    row.className = 'bar'; row.id = `bar-${stage}`;
+    row.innerHTML = `<span>${stage}</span><div class="track"><div class="fill"></div></div><span class="n">0/${count}</span>`;
+    return row;
+  }));
+  clearInterval(timer);
+  timer = setInterval(poll, 1500);
+  poll();
+}
+
+async function poll() {
+  try {
+    const { progress } = await (await api(`/api/jobs/${job}`)).json();
+    for (const stage of STAGES) {
+      const done = progress.stages[stage] || 0;
+      const row = $(`bar-${stage}`);
+      row.querySelector('.fill').style.width = `${Math.min(100, (100 * done) / pages)}%`;
+      row.querySelector('.n').textContent = `${done}/${pages}`;
+      row.classList.toggle('full', done >= pages);
+    }
+    $('activity').textContent = progress.activity;
+    if (progress.error) { $('error').textContent = progress.error; $('error').hidden = false; }
+    if (progress.state !== 'running') {
+      clearInterval(timer);
+      $('run').disabled = !files.length;
+      $('progress').hidden = progress.state === 'saved';
+      await show();
+      library();
+    }
+  } catch (error) {
+    clearInterval(timer);
+    $('activity').textContent = error.message;
+  }
+}
+
+$('stop').onclick = () => api('/api/stop', { method: 'POST' }).catch(() => {});
+
+async function show() {
+  blocks = await (await api(`/api/jobs/${job}/blocks`)).json();
+  $('result').hidden = false;
+  $('cbz').href = `/api/jobs/${job}/download?format=cbz`;
+  $('psd').href = `/api/jobs/${job}/download?format=psd`;
+  $('khr').href = `/api/jobs/${job}/download?format=khr`;
+  $('edit').href = `/editor?job=${job}&page=${page}`;
+  render();
+}
+
+function render() {
+  $('where').textContent = `page ${page} of ${pages}`;
+  const query = new URLSearchParams({ t: Date.now() });
+  if (original) query.set('view', 'original');
+  $('img').src = `/api/jobs/${job}/pages/${page}/image?${query}`;
+  $('toggle').textContent = original ? 'Show translated' : 'Show original';
+  $('edit').href = `/editor?job=${job}&page=${page}`;
+  $('prev').disabled = page <= 1;
+  $('next').disabled = page >= pages;
+  const list = $('blocks');
+  list.replaceChildren();
+  for (const block of blocks.filter((b) => b.page === page)) {
+    const box = document.createElement('div');
+    box.className = 'block';
+    const source = document.createElement('p');
+    source.className = 'src'; source.textContent = block.source;
+    box.append(source);
+    if (block.translation !== null) {
+      const area = document.createElement('textarea');
+      area.value = block.translation; area.rows = 2;
+      area.onchange = async () => {
+        try {
+          await api(`/api/jobs/${job}/blocks/${block.id}`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: area.value }),
+          });
+          block.translation = area.value;
+          box.classList.add('fresh');
+          $('img').src = `/api/jobs/${job}/pages/${page}/image?t=${Date.now()}`;
+        } catch (error) { alert(error.message); }
+      };
+      box.append(area);
+    }
+    list.append(box);
+  }
+  if (!list.children.length) list.innerHTML = '<p class="note">No text on this page.</p>';
+}
+
+const go = (delta) => { page = Math.min(pages, Math.max(1, page + delta)); render(); };
+$('prev').onclick = () => go(-1);
+$('next').onclick = () => go(1);
+$('toggle').onclick = () => { original = !original; render(); };
+document.addEventListener('keydown', (e) => {
+  if (!job || $('result').hidden || /^(TEXTAREA|INPUT|SELECT)$/.test(e.target.tagName)) return;
+  if (e.key === 'ArrowLeft') go(-1);
+  if (e.key === 'ArrowRight') go(1);
+});
+
+$('again').onclick = async () => {
+  const body = { stages: [...document.querySelectorAll('#rerun input:checked')].map((box) => box.value).join(',') };
+  if (!body.stages) return;
+  for (const key of SETTINGS) if ($(key).value.trim()) body[key] = $(key).value.trim();
+  try {
+    await api(`/api/jobs/${job}/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    follow(job, pages);
+  } catch (error) { alert(error.message); }
+};
+
+async function library() {
+  try {
+    const jobs = await (await api('/api/jobs')).json();
+    $('library').hidden = !jobs.length;
+    $('lib').replaceChildren(...jobs.map((meta) => {
+      const row = document.createElement('div');
+      row.className = 'item';
+      const label = document.createElement('div');
+      const title = document.createElement('span');
+      title.className = 't'; title.textContent = meta.name;
+      const badge = document.createElement('span');
+      badge.className = `badge ${meta.state}`; badge.textContent = meta.state;
+      const note = document.createElement('div');
+      note.className = 'note';
+      note.textContent = `${meta.pages} pages · ${meta.target} · ${new Date(meta.created * 1000).toLocaleString()}`;
+      label.append(title, badge, note);
+      const buttons = document.createElement('div');
+      buttons.className = 'row'; buttons.style.marginTop = '0';
+      const button = (text, action) => {
+        const b = document.createElement('button');
+        b.textContent = text; b.onclick = action; buttons.append(b);
+      };
+      button('Open', () => { follow(meta.id, meta.pages); window.scrollTo({ top: 0, behavior: 'smooth' }); });
+      button('Edit', () => { location.href = `/editor?job=${meta.id}`; });
+      button('Rename', async () => {
+        const name = prompt('Name', meta.name);
+        if (!name || !name.trim()) return;
+        await api(`/api/jobs/${meta.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+        library();
+      });
+      button('.khr', () => { location.href = `/api/jobs/${meta.id}/download?format=khr`; });
+      button('Delete', async () => {
+        if (!confirm(`Delete “${meta.name}” and its project?`)) return;
+        await api(`/api/jobs/${meta.id}`, { method: 'DELETE' });
+        if (job === meta.id) { job = null; $('result').hidden = true; $('progress').hidden = true; location.hash = ''; }
+        library();
+      });
+      row.append(label, buttons);
+      return row;
+    }));
+  } catch (_) { /* the library is a convenience */ }
+}
+library();
+
+// Back to a job after a reload.
+if (/^[0-9a-f-]{36}$/.test(location.hash.slice(1))) {
+  const id = location.hash.slice(1);
+  api(`/api/jobs/${id}`).then((r) => r.json()).then((s) => follow(id, s.pages)).catch(() => {});
+}
+</script>
+</body>
+</html>

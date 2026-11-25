@@ -1,0 +1,19 @@
+[package]
+name = "koharu-diffusion-sys"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+libloading = { workspace = true }
+
+[build-dependencies]
+koharu-bindgen = { workspace = true }

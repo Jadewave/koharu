@@ -1,0 +1,37 @@
+[package]
+name = "koharu"
+default-run = "koharu"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+authors.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+indoc = { workspace = true }
+koharu-desktop = { workspace = true }
+koharu-sentry = { workspace = true }
+machine-uid = { workspace = true }
+rfd = { workspace = true }
+sentry = { workspace = true }
+serde_json = { workspace = true }
+tauri = { workspace = true }
+tauri-plugin-opener = { workspace = true }
+tauri-plugin-process = { workspace = true }
+tauri-plugin-updater = { workspace = true }
+tauri-runtime-cef = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
+
+[build-dependencies]
+tauri-build = { workspace = true }
