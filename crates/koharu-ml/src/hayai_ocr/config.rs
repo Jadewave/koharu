@@ -1,14 +1,12 @@
 //! Hayai OCR configuration.
 //!
 //! Upstream configuration:
-//! https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2/blob/4a4ce477c9a8841f208b94e1d9ed5c0938965e05/configuration_hayai.py
+//! https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2.7-supernova/blob/b00317ed69fccee5f787187d913fcf8a96f37f65/configuration_hayai.py
 //! The vision encoder is the `Siglip2VisionModel` instantiated by
 //! `modeling_hayai.HayaiModel` from `google/siglip2-base-patch16-naflex`, whose
 //! released config only overrides the model type, so every value below is the
 //! transformers default:
-//! https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip2/configuration_siglip2.py
-
-use std::{fs, path::Path};
+//! https://github.com/huggingface/transformers/blob/598d8ba8baaec7fec5a22da0e2844c7bf4ea20e1/src/transformers/models/siglip2/configuration_siglip2.py
 
 use anyhow::{Result, ensure};
 use serde::Deserialize;
@@ -26,8 +24,6 @@ pub(super) mod siglip2 {
     /// interpolated per image instead of forcing a fixed input resolution.
     pub const POSITION_EMBEDDING_SIZE: i64 = 16;
     pub const LAYER_NORM_EPS: f64 = 1e-6;
-    /// Maximum number of 16x16 patches emitted by the SigLIP2 image processor.
-    pub const MAX_NUM_PATCHES: usize = 256;
 }
 
 /// Decoder constants of `VisualCausalOCRDecoder`; upstream hardcodes them in
@@ -37,24 +33,33 @@ pub(super) mod decoder {
     pub const KEY_VALUE_HEADS: i64 = 2;
     pub const HEAD_DIM: i64 = 64;
     pub const ROPE_THETA: f64 = 10_000.0;
+    /// `DSCProjector`'s `downscale_factor`: each 2x2 block of patches becomes
+    /// one decoder token.
+    pub const DOWNSCALE: i64 = 2;
+    /// `VisualCausalFlow`'s heads: half read the merged grid row by row,
+    /// half column by column from the right.
+    pub const FLOW_HEADS: i64 = 8;
+    /// `HayaiConfig`'s default `text_rope_offset`, which the released
+    /// `config.json` leaves out: text positions start here, past the visual
+    /// grid's.
+    pub const TEXT_ROPE_OFFSET: f64 = 64.0;
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct HayaiConfig {
-    pub(crate) vocab_size: i64,
-    pub(crate) d_model: i64,
-    pub(crate) d_vision: i64,
+pub(super) struct HayaiConfig {
+    pub(super) vocab_size: i64,
+    pub(super) d_model: i64,
+    pub(super) d_vision: i64,
     #[allow(dead_code)]
-    pub(crate) d_ffn: i64,
-    pub(crate) n_layers: usize,
+    pub(super) d_ffn: i64,
+    pub(super) n_layers: usize,
+    pub(super) n_vision_layers: usize,
+    pub(super) downscale_factor: i64,
+    pub(super) num_ids_classes: i64,
 }
 
 impl HayaiConfig {
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
-    }
-
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         ensure!(
             self.vocab_size > 0,
             "Hayai OCR vocabulary size must be positive"
@@ -73,6 +78,16 @@ impl HayaiConfig {
             "decoder query heads must be divisible by key/value heads"
         );
         ensure!(self.n_layers > 0, "decoder must have at least one layer");
+        ensure!(
+            self.n_vision_layers == siglip2::NUM_HIDDEN_LAYERS,
+            "Hayai OCR fuses all {} SigLIP2 encoder depths",
+            siglip2::NUM_HIDDEN_LAYERS
+        );
+        ensure!(
+            self.downscale_factor == decoder::DOWNSCALE,
+            "Hayai OCR's projector merges {0}x{0} patch blocks",
+            decoder::DOWNSCALE
+        );
         Ok(())
     }
 }

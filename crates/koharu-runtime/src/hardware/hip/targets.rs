@@ -13,6 +13,7 @@
     PartialEq,
     strum::Display,
     strum::EnumString,
+    strum::IntoStaticStr,
     strum::EnumIter,
     strum::EnumProperty,
 )]
@@ -75,16 +76,10 @@ pub(crate) enum Target {
 }
 
 impl Target {
-    pub(super) fn device_type(self) -> crate::DeviceType {
+    pub(super) fn integrated(self) -> bool {
         use strum::EnumProperty;
 
-        if self
-            .get_bool("integrated")
-            .expect("ROCm target has a device type")
-        {
-            crate::DeviceType::IntegratedGpu
-        } else {
-            crate::DeviceType::Gpu
-        }
+        self.get_bool("integrated")
+            .expect("every ROCm target says whether it's integrated")
     }
 }
