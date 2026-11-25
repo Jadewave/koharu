@@ -49,6 +49,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
+    # Pushing to GHCR with GITHUB_TOKEN needs packages: write.
+    permissions:
+      contents: read
+      packages: write
+
     outputs:
       image: ${{ steps.name.outputs.image }}
       digest: ${{ steps.push.outputs.digest }}
