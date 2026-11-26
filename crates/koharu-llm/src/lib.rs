@@ -88,6 +88,16 @@ pub async fn models() -> Vec<Model> {
     models.iter().map(Model::from).collect()
 }
 
+/// The models one vendor lists, with the failure [`models`] only logs, for a
+/// page that tells the user why a server they just gave lists none.
+pub async fn vendor_models(vendor: &str) -> Result<Vec<Model>> {
+    Ok(hosted::models(vendor)
+        .await?
+        .iter()
+        .map(Model::from)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use rig_core::{
