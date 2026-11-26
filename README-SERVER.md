@@ -111,6 +111,8 @@ they download again after a restart too.
 | Route | |
 |---|---|
 | `GET /api/health`, `GET /api/config` | liveness; the settings in force |
+| `GET /api/models` | every model the page may offer, as `{reference, name, vendor, images, tools}`: Koharu's own, and each vendor's that has a key; `images` says it reads page images (what the analyzer needs) |
+| `GET /api/provider`, `POST /api/provider` | the OpenAI-compatible server's address: `{"base_url", "context_window"}`. POST sets it (empty `base_url` forgets it; a missing `context_window` keeps the old one), then lists that server's models: `{"models": [...], "error"?}`. The address is kept even when the server can't be asked. Its key is the secret `KOHARU_SECRET_OPENAI_COMPATIBLE`; the page doesn't take one. |
 | `GET /api/jobs` | the library, newest first |
 | `POST /api/jobs` | multipart: `files` (images, ZIP/CBZ of them, or one `.khr`) and optional `name`, `translator`, `target`, `instructions`, `analyzer` (`off`), `recognizer`, `stages` |
 | `GET /api/jobs/{id}` | name and progress |
