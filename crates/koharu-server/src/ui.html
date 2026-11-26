@@ -69,6 +69,8 @@ button:disabled { opacity: .5; cursor: default; }
 .checks { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
 .checks label { display: inline-flex; gap: 5px; align-items: center; text-transform: none; font-size: 13px; letter-spacing: 0; color: var(--ink); }
 .checks input { width: auto; margin: 0; }
+.provider-go { display: flex; align-items: flex-end; }
+.provider-go button { width: 100%; }
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -92,10 +94,24 @@ button:disabled { opacity: .5; cursor: default; }
     </div>
     <input id="files" type="file" accept="image/*,.zip,.cbz,.khr" multiple hidden>
     <div class="grid">
+      <label>Provider URL (OpenAI-compatible)<input id="provider_url" type="url" inputmode="url" placeholder="https://example.com/v1"></label>
+      <label>Provider context window (tokens)<input id="provider_window" type="number" min="1" placeholder="the server’s real window"></label>
+      <div class="provider-go">
+        <button type="button" id="provider_load">Load models</button>
+      </div>
+    </div>
+    <p class="note" id="modelnote">Loading models…</p>
+    <div class="grid">
       <label>Name<input id="name" placeholder="defaults to the first file’s name"></label>
       <label>Target language<input id="target" list="languages" placeholder="English"></label>
-      <label>Translation model<input id="translator" placeholder="vendor/model"></label>
-      <label>Analyzer model<input id="analyzer" placeholder="openai-compatible/…  (off = none)"></label>
+      <label>Translation model
+        <select id="translator"></select>
+        <input id="translator_custom" placeholder="vendor/model" hidden>
+      </label>
+      <label>Image-reading model (analysis)
+        <select id="analyzer"></select>
+        <input id="analyzer_custom" placeholder="vendor/model" hidden>
+      </label>
       <label>Batch: pages per analyzer request<input id="analyzer_pages" type="number" min="1" max="32" placeholder="12 (1 = one page at a time)"></label>
       <label>Batch overlap (context pages)<input id="analyzer_overlap" type="number" min="0" max="16" placeholder="2"></label>
       <label>Analyzer image size (px) / WebP quality
@@ -167,6 +183,15 @@ const $ = (id) => document.getElementById(id);
 const STAGES = ['detect', 'recognize', 'inpaint', 'translate'];
 const SETTINGS = ['target', 'translator', 'analyzer', 'analyzer_pages', 'analyzer_overlap', 'analyzer_size', 'analyzer_quality', 'recognizer', 'instructions'];
 let files = [], job = null, pages = 0, page = 1, original = false, blocks = [], timer = null;
+let catalog = [], defaults = { translator: '', analyzer: '' };
+const CUSTOM = '__custom__';
+
+// A setting's value: a select's choice, or what was typed after “Other…”.
+const value = (key) => {
+  const el = $(key);
+  if (el.tagName === 'SELECT' && el.value === CUSTOM) return $(`${key}_custom`).value.trim();
+  return el.value.trim();
+};
 
 const api = async (path, options) => {
   const response = await fetch(path, options);
@@ -178,11 +203,109 @@ const api = async (path, options) => {
   return response;
 };
 
+// Fills a model list: the server's default first, then each vendor's models in
+// a group, then a way to type one the list doesn't have.
+function fill(select, models, first, extra = []) {
+  const kept = select.value;
+  select.replaceChildren();
+  const add = (parent, v, text) => {
+    const option = document.createElement('option');
+    option.value = v; option.textContent = text;
+    parent.append(option);
+    return option;
+  };
+  add(select, '', first);
+  for (const [v, text] of extra) add(select, v, text);
+  const vendors = new Map();
+  for (const model of models) {
+    if (!vendors.has(model.vendor)) vendors.set(model.vendor, []);
+    vendors.get(model.vendor).push(model);
+  }
+  for (const [vendor, list] of vendors) {
+    const group = document.createElement('optgroup');
+    group.label = vendor === 'openai-compatible' ? 'openai-compatible (your provider)'
+      : vendor === 'koharu' ? 'koharu (runs on this server)' : vendor;
+    list.sort((a, b) => a.name.localeCompare(b.name));
+    for (const model of list) {
+      const id = model.reference.slice(model.reference.indexOf('/') + 1);
+      add(group, model.reference, model.name === id ? id : `${model.name} (${id})`);
+    }
+    select.append(group);
+  }
+  add(select, CUSTOM, 'Other… (type vendor/model)');
+  if ([...select.options].some((o) => o.value === kept)) select.value = kept;
+  $(`${select.id}_custom`).hidden = select.value !== CUSTOM;
+}
+
+function fillModels() {
+  fill($('translator'), catalog, `Server default (${defaults.translator || 'none'})`);
+  // The analysis reads page images, so only models that read images.
+  fill($('analyzer'), catalog.filter((m) => m.images), `Server default (${defaults.analyzer || 'off'})`,
+    [['off', 'Off (no analysis)']]);
+}
+for (const key of ['translator', 'analyzer']) {
+  $(key).onchange = () => { $(`${key}_custom`).hidden = $(key).value !== CUSTOM; };
+}
+fillModels();
+
+const noteModels = (text, bad) => {
+  $('modelnote').textContent = text;
+  $('modelnote').className = bad ? 'note err' : 'note';
+};
+
+async function loadModels() {
+  noteModels('Loading models…');
+  try {
+    catalog = await (await api('/api/models')).json();
+    fillModels();
+    const mine = catalog.filter((m) => m.vendor === 'openai-compatible').length;
+    noteModels(`${catalog.length} models available${mine ? `, ${mine} from your provider` : ''}. `
+      + 'A provider’s models need its key: the secret KOHARU_SECRET_<VENDOR> on the server.');
+  } catch (error) {
+    noteModels(`Couldn’t load the model list: ${error.message}`, true);
+  }
+}
+
+$('provider_load').onclick = async () => {
+  const body = { base_url: $('provider_url').value.trim() };
+  const window_ = $('provider_window').value.trim();
+  if (window_) body.context_window = Number(window_);
+  $('provider_load').disabled = true;
+  noteModels('Asking the provider…');
+  try {
+    const reply = await (await api('/api/provider', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })).json();
+    // The provider's models replace the ones it listed before.
+    catalog = catalog.filter((m) => m.vendor !== 'openai-compatible').concat(reply.models);
+    fillModels();
+    if (reply.error) {
+      noteModels(`Saved the address, but the provider answered: ${reply.error}`, true);
+    } else if (!body.base_url) {
+      noteModels('Provider address cleared.');
+    } else {
+      noteModels(`${reply.models.length} models from your provider, in both lists. `
+        + 'It doesn’t say which read images: pick one that does for analysis.');
+    }
+  } catch (error) {
+    noteModels(error.message, true);
+  } finally {
+    $('provider_load').disabled = false;
+  }
+};
+
 fetch('/api/config').then((r) => r.json()).then((c) => {
   $('info').textContent = `translator ${c.translator} · analyzer ${c.analyzer || 'off'} · OCR ${c.recognizer}`;
   $('target').placeholder = c.target;
-  $('translator').placeholder = c.translator;
+  defaults = { translator: c.translator, analyzer: c.analyzer };
+  fillModels();
 }).catch(() => { $('info').textContent = 'server unreachable'; });
+
+fetch('/api/provider').then((r) => r.json()).then((p) => {
+  if (p.base_url) $('provider_url').value = p.base_url;
+  if (p.context_window) $('provider_window').value = p.context_window;
+}).catch(() => {});
+loadModels();
 
 const isProject = () => files.length === 1 && /\.khr$/i.test(files[0].name);
 const pick = (list) => {
@@ -203,7 +326,7 @@ $('run').onclick = async () => {
   const form = new FormData();
   files.forEach((f) => form.append('files', f, f.name));
   for (const key of ['name', ...SETTINGS]) {
-    if ($(key).value.trim()) form.append(key, $(key).value.trim());
+    if (value(key)) form.append(key, value(key));
   }
   $('run').disabled = true;
   $('startnote').textContent = 'uploading…';
@@ -325,7 +448,7 @@ document.addEventListener('keydown', (e) => {
 $('again').onclick = async () => {
   const body = { stages: [...document.querySelectorAll('#rerun input:checked')].map((box) => box.value).join(',') };
   if (!body.stages) return;
-  for (const key of SETTINGS) if ($(key).value.trim()) body[key] = $(key).value.trim();
+  for (const key of SETTINGS) if (value(key)) body[key] = value(key);
   try {
     await api(`/api/jobs/${job}/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     follow(job, pages);

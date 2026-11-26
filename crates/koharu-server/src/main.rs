@@ -15,6 +15,10 @@
 //! - `KOHARU_OPENAI_COMPATIBLE_BASE_URL` and
 //!   `KOHARU_OPENAI_COMPATIBLE_CONTEXT_WINDOW`, written to `[providers]`
 //!
+//! The page lists the models to pick from (`/api/models`) and takes the address of
+//! an OpenAI-compatible server (`/api/provider`), whose models then join the
+//! list; the address is written to `[providers]`, so it holds for every job.
+//!
 //! A vendor's API key is the secret `KOHARU_SECRET_<VENDOR>`, such as
 //! `KOHARU_SECRET_OPENAI_COMPATIBLE`, as a container has no credential store.
 
@@ -119,6 +123,8 @@ async fn main() -> Result<()> {
         .route("/", get(|| async { Html(include_str!("ui.html")) }))
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/config", get(settings))
+        .route("/api/models", get(list_models))
+        .route("/api/provider", get(provider).post(set_provider))
         .route("/api/jobs", get(list).post(create))
         .route("/api/jobs/{id}", get(status).patch(rename).delete(remove))
         .route("/api/jobs/{id}/run", post(run))
@@ -318,6 +324,80 @@ async fn settings(State(app): State<Shared>) -> Json<Value> {
         "recognizer": config.recognizer.model.to_string(),
         "analyzer_pages": config.analyzer.pages,
         "analyzer_overlap": config.analyzer.overlap,
+    }))
+}
+
+/// The vendor of the server the page's address box is for.
+const COMPATIBLE: &str = "openai-compatible";
+
+/// Every model the page may offer: Koharu's own, and each vendor's that has a
+/// key (or, for a server of your own, an address). Each says whether it reads
+/// images, which the analysis needs.
+async fn list_models() -> Json<Vec<koharu_llm::Model>> {
+    Json(koharu_llm::models().await)
+}
+
+/// The OpenAI-compatible server's address, and the context window it runs
+/// its models with, as `[providers]` holds them.
+async fn provider() -> Reply<Json<Value>> {
+    let providers: Providers = koharu_config::get()?;
+    let endpoint = providers.0.get(COMPATIBLE).cloned().unwrap_or_default();
+    Ok(Json(json!({
+        "base_url": endpoint.base_url.map(|url| url.to_string()),
+        "context_window": endpoint.context_window,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderForm {
+    /// Where the server's `/v1` is; empty forgets the address.
+    #[serde(default)]
+    base_url: String,
+    /// Tokens; left out, the window stays as it was.
+    #[serde(default)]
+    context_window: Option<u32>,
+}
+
+/// The address and context window a [`ProviderForm`] asks for.
+fn parse_provider(form: &ProviderForm) -> Result<(Option<url::Url>, Option<NonZeroU32>)> {
+    let base_url = form.base_url.trim();
+    let url = if base_url.is_empty() {
+        None
+    } else {
+        let url: url::Url = base_url
+            .parse()
+            .with_context(|| format!("`{base_url}` isn't a URL"))?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+            "the address starts with http:// or https://, such as https://example.com/v1"
+        );
+        Some(url)
+    };
+    let window = form
+        .context_window
+        .map(|tokens| {
+            NonZeroU32::new(tokens).context("the context window is a number of tokens above zero")
+        })
+        .transpose()?;
+    Ok((url, window))
+}
+
+/// Sets the OpenAI-compatible server's address (and context window), then asks
+/// it for its models. The settings are kept even when the server can't be
+/// asked, and `error` says why; the key is the secret
+/// `KOHARU_SECRET_OPENAI_COMPATIBLE`, which a page doesn't take.
+async fn set_provider(Json(form): Json<ProviderForm>) -> Reply<Json<Value>> {
+    let (url, window) = parse_provider(&form).map_err(ApiError::bad)?;
+    koharu_config::update::<Providers>(|providers| {
+        let endpoint = providers.0.entry(COMPATIBLE.to_owned()).or_default();
+        endpoint.base_url = url;
+        if window.is_some() {
+            endpoint.context_window = window;
+        }
+    })?;
+    Ok(Json(match koharu_llm::vendor_models(COMPATIBLE).await {
+        Ok(models) => json!({ "models": models }),
+        Err(error) => json!({ "models": [], "error": format!("{error:#}") }),
     }))
 }
 
@@ -589,4 +669,33 @@ fn percent(text: &str) -> String {
             _ => format!("%{byte:02X}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn form(base_url: &str, context_window: Option<u32>) -> ProviderForm {
+        ProviderForm {
+            base_url: base_url.to_owned(),
+            context_window,
+        }
+    }
+
+    #[test]
+    fn a_provider_address_is_an_http_url() {
+        let (url, window) = parse_provider(&form(" https://example.com/v1 ", Some(32768))).unwrap();
+        assert_eq!(url.unwrap().as_str(), "https://example.com/v1");
+        assert_eq!(window, NonZeroU32::new(32768));
+        assert!(parse_provider(&form("example.com/v1", None)).is_err());
+        assert!(parse_provider(&form("file:///etc/passwd", None)).is_err());
+        assert!(parse_provider(&form("ftp://example.com", None)).is_err());
+    }
+
+    #[test]
+    fn an_empty_provider_address_forgets_it() {
+        let (url, window) = parse_provider(&form("  ", None)).unwrap();
+        assert!(url.is_none() && window.is_none());
+        assert!(parse_provider(&form("", Some(0))).is_err());
+    }
 }
